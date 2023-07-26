@@ -38,6 +38,7 @@ mod sort_pushdown;
 pub mod topk_aggregation;
 mod utils;
 
+mod join_pipeline_selection;
 #[cfg(test)]
 pub mod test_utils;
 

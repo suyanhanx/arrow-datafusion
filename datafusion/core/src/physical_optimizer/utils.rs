@@ -22,6 +22,7 @@ use std::fmt::Formatter;
 use std::sync::Arc;
 
 use crate::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use crate::physical_plan::joins::HashJoinExec;
 use crate::physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use crate::physical_plan::repartition::RepartitionExec;
 use crate::physical_plan::sorts::sort::SortExec;
@@ -144,7 +145,6 @@ pub fn is_sort_preserving_merge(plan: &Arc<dyn ExecutionPlan>) -> bool {
 pub fn is_coalesce_partitions(plan: &Arc<dyn ExecutionPlan>) -> bool {
     plan.as_any().is::<CoalescePartitionsExec>()
 }
-
 /// Checks whether the given operator is a [`UnionExec`].
 pub fn is_union(plan: &Arc<dyn ExecutionPlan>) -> bool {
     plan.as_any().is::<UnionExec>()
@@ -153,4 +153,16 @@ pub fn is_union(plan: &Arc<dyn ExecutionPlan>) -> bool {
 /// Checks whether the given operator is a [`RepartitionExec`].
 pub fn is_repartition(plan: &Arc<dyn ExecutionPlan>) -> bool {
     plan.as_any().is::<RepartitionExec>()
+}
+
+/// Checks whether the given operator is a [`HashJoinExec`].
+pub fn is_hash_join(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    plan.as_any().is::<HashJoinExec>()
+}
+
+/// Utility function yielding a string representation of the given [`ExecutionPlan`].
+pub fn get_plan_string(plan: &Arc<dyn ExecutionPlan>) -> Vec<String> {
+    let formatted = displayable(plan.as_ref()).indent(true).to_string();
+    let actual: Vec<&str> = formatted.trim().lines().collect();
+    actual.iter().map(|elem| elem.to_string()).collect()
 }
