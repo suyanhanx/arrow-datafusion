@@ -350,6 +350,96 @@ pub fn scatter(mask: &BooleanArray, truthy: &dyn Array) -> Result<ArrayRef> {
     let data = mutable.freeze();
     Ok(make_array(data))
 }
+/// This function attempts to find a full match between required and provided
+/// sorts, returning the indices and sort options of the matches found.
+///
+/// First, it normalizes the sort requirements and then checks for matches.
+/// If no full match is found, it then checks against ordering equivalence properties.
+/// If still no full match is found, it returns `None`.
+pub fn get_indices_of_matching_sort_exprs_with_order_eq<
+    F: Fn() -> EquivalenceProperties,
+    F2: Fn() -> OrderingEquivalenceProperties,
+>(
+    provided_sorts: &[PhysicalSortExpr],
+    required_columns: &[Column],
+    equal_properties: F,
+    ordering_equal_properties: F2,
+) -> Option<(Vec<SortOptions>, Vec<usize>)> {
+    // Transform the required columns into a vector of Arc<PhysicalExpr>:
+    let required_exprs = required_columns
+        .iter()
+        .map(|required_column| Arc::new(required_column.clone()) as _)
+        .collect::<Vec<Arc<dyn PhysicalExpr>>>();
+
+    // Create a vector of `PhysicalSortRequirement`s from the required expressions:
+    let sort_requirement_on_requirements = required_exprs
+        .iter()
+        .map(|required_expr| PhysicalSortRequirement {
+            expr: required_expr.clone(),
+            options: None,
+        })
+        .collect::<Vec<_>>();
+
+    let order_eq_properties = ordering_equal_properties();
+    let eq_properties = equal_properties();
+
+    let normalized_required = normalize_sort_requirements(
+        &sort_requirement_on_requirements,
+        eq_properties.classes(),
+        &[],
+    );
+    let normalized_provided_requirements = normalize_sort_requirements(
+        &PhysicalSortRequirement::from_sort_exprs(provided_sorts.iter()),
+        eq_properties.classes(),
+        &[],
+    );
+
+    let provided_sorts = normalized_provided_requirements
+        .iter()
+        .map(|req| req.expr.clone())
+        .collect::<Vec<_>>();
+
+    let normalized_required_expr = normalized_required
+        .iter()
+        .map(|req| req.expr.clone())
+        .collect::<Vec<_>>();
+
+    let indices_of_equality =
+        get_indices_of_exprs_strict(&normalized_required_expr, &provided_sorts);
+    // If we found all the expressions, return early:
+    if indices_of_equality.len() == normalized_required_expr.len() {
+        return Some((
+            indices_of_equality
+                .iter()
+                .filter_map(|index| normalized_provided_requirements[*index].options)
+                .collect(),
+            indices_of_equality,
+        ));
+    }
+
+    // We did not find all the expressions, consult ordering equivalence properties:
+    for class in order_eq_properties.classes() {
+        let head = class.head();
+        for ordering in class.others().iter().chain(std::iter::once(head)) {
+            let order_eq_class_exprs = convert_to_expr(ordering);
+            let indices_of_equality = get_indices_of_exprs_strict(
+                &normalized_required_expr,
+                &order_eq_class_exprs,
+            );
+            if indices_of_equality.len() == normalized_required_expr.len() {
+                return Some((
+                    indices_of_equality
+                        .iter()
+                        .map(|index| ordering[*index].options)
+                        .collect::<Vec<_>>(),
+                    indices_of_equality,
+                ));
+            }
+        }
+    }
+    // If no match found, return `None`:
+    None
+}
 
 /// Merge left and right sort expressions, checking for duplicates.
 pub fn merge_vectors(
