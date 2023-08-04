@@ -559,7 +559,7 @@ impl Stream for SymmetricHashJoinStream {
 /// an error if
 /// - there is an issue evaluating the build side filter expression;
 /// - there is an issue converting the build side filter expression into an array
-fn determine_prune_length(
+pub(crate) fn determine_prune_length(
     buffer: &RecordBatch,
     build_side_filter_expr: &SortedFilterExpr,
 ) -> Result<usize> {
