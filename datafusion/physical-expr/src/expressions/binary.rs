@@ -672,14 +672,460 @@ pub fn binary(
 
 #[cfg(test)]
 mod tests {
+    use std::cmp::Ordering;
+    use std::collections::{HashMap, HashSet};
+    use std::ops::Neg;
+
     use super::*;
-    use crate::expressions::{col, lit, try_cast, Literal};
+    use crate::expressions::{col, lit, Column};
+    use crate::expressions::{try_cast, Literal};
     use arrow::datatypes::{
         ArrowNumericType, Decimal128Type, Field, Int32Type, SchemaRef,
     };
     use arrow_schema::ArrowError;
     use datafusion_common::Result;
     use datafusion_expr::type_coercion::binary::get_input_types;
+
+    /// Since the implementation is not actively used yet, it has been moved into the test module.
+    /// It will be moved back to the source module of the BinaryExpr as soon as it is put into use.
+    struct BinaryExprEquivalenceChecker<'a> {
+        column_types: &'a HashMap<Column, DataType>,
+        is_map_valid: bool,
+        mutable_order_of_floats: &'a bool,
+    }
+
+    #[derive(Eq, PartialEq, Hash, Clone, Debug, Copy)]
+    enum OperatorInfo {
+        Plus,
+        Minus,
+        Multiply,
+        Divide,
+    }
+
+    impl Neg for OperatorInfo {
+        type Output = Self;
+        fn neg(self) -> Self::Output {
+            match self {
+                OperatorInfo::Minus => OperatorInfo::Plus,
+                OperatorInfo::Plus => OperatorInfo::Minus,
+                OperatorInfo::Multiply => OperatorInfo::Divide,
+                OperatorInfo::Divide => OperatorInfo::Multiply,
+            }
+        }
+    }
+
+    impl<'a> BinaryExprEquivalenceChecker<'a> {
+        pub fn is_equal(
+            this: &BinaryExpr,
+            other: &BinaryExpr,
+            column_types: &'a Option<HashMap<Column, DataType>>,
+            mutable_order_of_floats: &'a bool,
+        ) -> Result<bool> {
+            let empty_map = HashMap::new();
+            let checker = if let Some(map) = column_types {
+                BinaryExprEquivalenceChecker {
+                    column_types: map,
+                    is_map_valid: true,
+                    mutable_order_of_floats,
+                }
+            } else {
+                BinaryExprEquivalenceChecker {
+                    column_types: &empty_map,
+                    is_map_valid: false,
+                    mutable_order_of_floats,
+                }
+            };
+
+            checker.compare(this, other)
+        }
+
+        /// This function takes two `BinaryExpr`s to determine whether they are equivalent.
+        /// The `column_types` map specifies data types of the columns. If this map is `None`,
+        /// we treat the expressions as mathematical formulas and check for equality of form.
+        /// If it is `Some`, we consider the impact of data types, meaning integers and floats
+        /// have their own rules.
+        fn compare(&self, this: &BinaryExpr, other: &BinaryExpr) -> Result<bool> {
+            if self.is_map_valid {
+                let this_float = self.contains_float_value(this);
+                let other_float = self.contains_float_value(other);
+                let possible_integers =
+                    !(this_float.unwrap_or(false) && other_float.unwrap_or(false));
+                let consider_float = !self.mutable_order_of_floats
+                    && (this_float.unwrap_or(true) || other_float.unwrap_or(true));
+                // When we are given column data types, we need to be careful when
+                // deciding whether we can consider equivalent term orderings. Due
+                // to how data types behave, we can not allow a change in the order
+                // of operations when:
+                // - There is a division between two integers, or
+                // - There are floating-point values in the expression unless we
+                //   are explicitly allowed to ignore floating-point intricacies.
+                if (((this.op == Operator::Divide) || (other.op == Operator::Divide))
+                    && possible_integers)
+                    || ((matches!(
+                        this.op,
+                        Operator::Plus
+                            | Operator::Minus
+                            | Operator::Multiply
+                            | Operator::Divide
+                    ) || matches!(
+                        other.op,
+                        Operator::Plus
+                            | Operator::Minus
+                            | Operator::Multiply
+                            | Operator::Divide
+                    )) && consider_float)
+                {
+                    return self.check_children_separately(this, other);
+                }
+            }
+            // At this point, we know we can consider various term ordering equivalences.
+            // First, check if the two expressions have the same operator at the root:
+            if this.op == other.op {
+                // These operators can swap their children, even in deeper levels.
+                // For example, (1 * (2 * 3)) = (2 * (3 * 1)).
+                if matches!(
+                    this.op,
+                    Operator::And | Operator::Or | Operator::Eq | Operator::Multiply
+                ) {
+                    // NOTE: The Plus operator is also in this category but it is handled
+                    //       differently, because there may be some Minus operators in between
+                    //       Plus operators.
+                    // NOTE: The reason Multiply appears here is that its behaviour changes for
+                    //       integers and floats -- consider the cases where we have a sequence
+                    //       of Multiply operators vs. the case where there Multiply and Divide
+                    //       operators appear in mixed order.
+                    Ok(self.resolve_interchangable_ops(&this.op, this, other))
+                } else if matches!(this.op, Operator::Plus | Operator::Minus) {
+                    self.resolve_reciprocal(this, other, Operator::Plus)
+                }
+                // Order of terms involving integers can be changed freely under the
+                // Multiply operator. However, the cases involving Divide should be
+                // handled like the Plus and Minus cases.
+                else if matches!(this.op, Operator::Divide)
+                    || matches!(other.op, Operator::Divide)
+                {
+                    self.resolve_reciprocal(this, other, Operator::Multiply)
+                }
+                // Base case, check whether corresponding sides are equal:
+                else {
+                    return self.check_children_separately(this, other);
+                }
+            }
+            // We have distinct operators at expression roots.
+            else {
+                // Comparison operators can be changed symmetrically.
+                if this.op.is_comparison_operator() && this.op.swap() == Some(other.op) {
+                    // Check whether swapped expressions are equal:
+                    let first_match = self.is_exprs_equal(&this.left, &other.right)?;
+                    let second_match = self.is_exprs_equal(&this.right, &other.left)?;
+                    Ok(first_match && second_match)
+                }
+                // One side is Plus, the other side is Minus:
+                else if matches!(this.op, Operator::Plus | Operator::Minus)
+                    && matches!(other.op, Operator::Plus | Operator::Minus)
+                {
+                    self.resolve_reciprocal(this, other, Operator::Plus)
+                }
+                // One side is Multiply, the other side is Divide:
+                else if matches!(this.op, Operator::Multiply | Operator::Divide)
+                    && matches!(other.op, Operator::Divide | Operator::Multiply)
+                {
+                    self.resolve_reciprocal(this, other, Operator::Multiply)
+                } else {
+                    Ok(false)
+                }
+            }
+        }
+
+        /// This function *separately* checks left and right children of the given
+        /// expressions for equality without considering any cross interactions.
+        fn check_children_separately(
+            &self,
+            this_expr: &BinaryExpr,
+            other_expr: &BinaryExpr,
+        ) -> Result<bool> {
+            let left_check = self.is_exprs_equal(this_expr.left(), other_expr.left())?;
+            let right_check =
+                self.is_exprs_equal(this_expr.right(), other_expr.right())?;
+
+            Ok(left_check && right_check)
+        }
+
+        /// This function determines whether the expression promotes a floating point
+        /// value eventually. If it does, it returns `Some(True)`. If there are
+        /// columns whose datatypes are not available in the `column_types` map,
+        /// and there is an uncertain possibility, it returns `None`. In such cases,
+        /// the decision is made at the outer scope according to the operation.
+        fn contains_float_value(&self, expr: &BinaryExpr) -> Option<bool> {
+            match (
+                self.expr_contains_float_value(&expr.left),
+                self.expr_contains_float_value(&expr.right),
+            ) {
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (Some(false), Some(false)) => Some(false),
+                _ => None,
+            }
+        }
+
+        /// Checks whether the given expression are equal. This function considers
+        /// various equivalent term orderings when making this decision. For example,
+        /// 1 * (2 * 3) is equal to 2 * (1 * 3) according to this function.
+        fn is_exprs_equal(
+            &self,
+            lhs: &Arc<dyn PhysicalExpr>,
+            rhs: &Arc<dyn PhysicalExpr>,
+        ) -> Result<bool> {
+            match (
+                lhs.as_any().downcast_ref::<BinaryExpr>(),
+                rhs.as_any().downcast_ref::<BinaryExpr>(),
+            ) {
+                (Some(lhs), Some(rhs)) => self.compare(lhs, rhs),
+                _ => Ok(lhs.eq(rhs)),
+            }
+        }
+
+        /// Finds whether one of the leaf expressions have a floating-point type.
+        /// A return value of `None` means unknown type.
+        fn expr_contains_float_value(
+            &self,
+            expr: &Arc<dyn PhysicalExpr>,
+        ) -> Option<bool> {
+            match (
+                expr.as_any().downcast_ref::<Literal>(),
+                expr.as_any().downcast_ref::<BinaryExpr>(),
+                expr.as_any().downcast_ref::<Column>(),
+            ) {
+                (Some(literal), _, _) => {
+                    Some(literal.value().get_datatype().is_floating())
+                }
+                (_, Some(binary), _) => self.contains_float_value(binary),
+                (_, _, Some(column)) => self
+                    .column_types
+                    .get(column)
+                    .map(|datatype| datatype.is_floating()),
+                _ => None,
+            }
+        }
+
+        /// This function searches for the expression `expr` in the given list of
+        /// expressions (`expr_list`) and returns its index. If the expression is
+        /// not present in the list, it returns `None`.
+        fn find_match_idx(
+            &self,
+            expr: &Arc<dyn PhysicalExpr>,
+            expr_list: &[Arc<dyn PhysicalExpr>],
+        ) -> Option<usize> {
+            if let Some(binary) = expr.as_any().downcast_ref::<BinaryExpr>() {
+                // Search the binary expression `binary` inside the `exprs` vector,
+                // find its index if it exists:
+                expr_list.iter().position(|expr| {
+                    expr.as_any()
+                        .downcast_ref::<BinaryExpr>()
+                        .map(|binary_other| self.compare(binary, binary_other))
+                        .unwrap_or(Ok(false))
+                        .unwrap_or(false)
+                })
+            } else {
+                // Search the PhysicalExpr `i_expr` inside `rhs_and_children`. Find its index if exists
+                expr_list.iter().position(|item| item.eq(expr))
+            }
+        }
+
+        /// This function checks the "equality" of PhysicalExpr arrays, ignoring the
+        /// order of elements. All elements must match one to one and none of the
+        /// elements can be left out.
+        fn check_match(
+            &self,
+            expr_vec1: &[Arc<dyn PhysicalExpr>],
+            expr_vec2: &[Arc<dyn PhysicalExpr>],
+        ) -> bool {
+            if expr_vec1.len() != expr_vec2.len() {
+                return false;
+            }
+            let mut matching_indexes = HashSet::new();
+            for i_expr in expr_vec1.iter() {
+                let match_idx = self.find_match_idx(i_expr, expr_vec2);
+                match_idx.map(|idx| matching_indexes.insert(idx));
+            }
+            expr_vec2.len() == matching_indexes.len()
+        }
+
+        /// This function collects all children of the expressions having
+        /// a sequence of the same operators, like And, Or, Equal, and Multiply.
+        /// If the content of these left and right collections are equal,
+        /// it returns true; otherwise, returns false.
+        fn resolve_interchangable_ops(
+            &self,
+            op: &Operator,
+            lhs: &BinaryExpr,
+            rhs: &BinaryExpr,
+        ) -> bool {
+            let mut lhs_children = Vec::<Arc<dyn PhysicalExpr>>::new();
+            let mut rhs_children = Vec::<Arc<dyn PhysicalExpr>>::new();
+
+            // Children of unified operations are collected.
+            collect_op_child(op, &mut lhs_children, lhs.left.clone());
+            collect_op_child(op, &mut lhs_children, lhs.right.clone());
+
+            collect_op_child(op, &mut rhs_children, rhs.left.clone());
+            collect_op_child(op, &mut rhs_children, rhs.right.clone());
+
+            // Their equalities are checked, ignoring the orders.
+            self.check_match(&lhs_children, &rhs_children)
+        }
+
+        /// This function determines all reciprocal posibilities of + and -, or * and /
+        /// operator orderings. + and - operators also consider the sign of the literal
+        /// in the expression.
+        pub fn resolve_reciprocal(
+            &self,
+            lhs_expr: &BinaryExpr,
+            rhs_expr: &BinaryExpr,
+            op: Operator,
+        ) -> Result<bool> {
+            // The "positive" vector holds the expressions with a plus sign in
+            // addition/subtraction mode, or the expressions in the numerator in
+            // multiplication/division mode.
+            let (mut lhs_positive_vec, mut lhs_negative_vec) = (Vec::new(), Vec::new());
+            // The "negative" vector holds the expressions with a minus sign in
+            // addition/subtraction mode, or the expressions in the denominator in
+            // multiplication/division mode.
+            let (mut rhs_positive_vec, mut rhs_negative_vec) = (Vec::new(), Vec::new());
+
+            let op_info = if op == Operator::Plus {
+                OperatorInfo::Plus
+            } else if op == Operator::Multiply {
+                OperatorInfo::Multiply
+            } else {
+                return Err(DataFusionError::Internal(
+                    "Undefined operator for binary equivalence".to_string(),
+                ));
+            };
+            get_reciprocal_vecs(
+                Arc::from(lhs_expr.clone()),
+                &mut lhs_positive_vec,
+                &mut lhs_negative_vec,
+                op_info,
+            )?;
+            get_reciprocal_vecs(
+                Arc::from(rhs_expr.clone()),
+                &mut rhs_positive_vec,
+                &mut rhs_negative_vec,
+                op_info,
+            )?;
+
+            Ok(self.check_match(&lhs_negative_vec, &rhs_negative_vec)
+                && self.check_match(&lhs_positive_vec, &rhs_positive_vec))
+        }
+    }
+
+    /// Collects all the leaf expressions separated by `op` operator. For instance,
+    /// `(a and b) and c` will collect `[a, b, c]`.
+    fn collect_op_child(
+        op: &Operator,
+        container: &mut Vec<Arc<dyn PhysicalExpr>>,
+        child: Arc<dyn PhysicalExpr>,
+    ) {
+        if let Some(binary) = child.as_any().downcast_ref::<BinaryExpr>() {
+            if binary.op != *op {
+                container.push(child);
+            } else {
+                collect_op_child(op, container, binary.left.clone());
+                collect_op_child(op, container, binary.right.clone());
+            }
+        } else {
+            container.push(child);
+        }
+    }
+
+    /// This is a helper function for both Plus/Minus and Multiply/Divide modes.
+    /// It either collects Plus/Minus operands, or collects Multiply/Divide operands
+    /// (positives are Plus and Multiply, negatives are Minus and Divide).
+    fn get_reciprocal_vecs(
+        expr: Arc<dyn PhysicalExpr>,
+        positive_vec: &mut Vec<Arc<dyn PhysicalExpr>>,
+        negative_vec: &mut Vec<Arc<dyn PhysicalExpr>>,
+        op_info: OperatorInfo,
+    ) -> Result<()> {
+        // The paramter `op_info` determines the mode. + and - operators must be
+        // differentiated from * and / opreators across the whole expression.
+        if let Some(binary_expr) = expr.as_any().downcast_ref::<BinaryExpr>() {
+            if (matches!(binary_expr.op(), Operator::Plus | Operator::Minus)
+                && matches!(op_info, OperatorInfo::Plus | OperatorInfo::Minus))
+                || (matches!(binary_expr.op(), Operator::Multiply | Operator::Divide)
+                    && matches!(op_info, OperatorInfo::Multiply | OperatorInfo::Divide))
+            {
+                get_reciprocal_vecs(
+                    binary_expr.left().clone(),
+                    positive_vec,
+                    negative_vec,
+                    op_info,
+                )?;
+                let neg_op =
+                    if matches!(binary_expr.op(), Operator::Plus | Operator::Multiply) {
+                        op_info
+                    } else {
+                        -op_info
+                    };
+                get_reciprocal_vecs(
+                    binary_expr.right().clone(),
+                    positive_vec,
+                    negative_vec,
+                    neg_op,
+                )?;
+            } else {
+                match op_info {
+                    OperatorInfo::Plus | OperatorInfo::Multiply => {
+                        positive_vec.push(Arc::new(binary_expr.clone()))
+                    }
+                    OperatorInfo::Minus | OperatorInfo::Divide => {
+                        negative_vec.push(Arc::new(binary_expr.clone()))
+                    }
+                }
+            }
+        } else if let Some(literal) = expr.as_any().downcast_ref::<Literal>() {
+            // Literal signs are only considered in + or - operations.
+            if matches!(op_info, OperatorInfo::Plus | OperatorInfo::Minus) {
+                let zero = &ScalarValue::new_zero(&literal.value().get_datatype())?;
+                match (op_info, literal.value().partial_cmp(zero)) {
+                    (
+                        OperatorInfo::Plus,
+                        Some(Ordering::Greater) | Some(Ordering::Equal),
+                    ) => positive_vec.push(Arc::new(literal.clone())),
+                    (OperatorInfo::Plus, Some(Ordering::Less)) => {
+                        let zero =
+                            ScalarValue::new_zero(&literal.value().get_datatype())?;
+                        let result = zero.sub(literal.value())?;
+                        negative_vec.push(Arc::new(Literal::new(result)));
+                    }
+                    (
+                        OperatorInfo::Minus,
+                        Some(Ordering::Less) | Some(Ordering::Equal),
+                    ) => {
+                        let zero =
+                            ScalarValue::new_zero(&literal.value().get_datatype())?;
+                        let result = zero.sub(literal.value())?;
+                        positive_vec.push(Arc::new(Literal::new(result)));
+                    }
+                    (OperatorInfo::Minus, Some(Ordering::Greater)) => {
+                        negative_vec.push(Arc::new(literal.clone()));
+                    }
+                    (_, _) => {
+                        return Err(DataFusionError::Execution(format!(
+                            "Ordering couldn't be calculated between {:?} and {:?}",
+                            literal.value(),
+                            zero
+                        )))
+                    }
+                }
+            }
+        } else if op_info == OperatorInfo::Plus || op_info == OperatorInfo::Multiply {
+            positive_vec.push(expr);
+        } else if op_info == OperatorInfo::Minus || op_info == OperatorInfo::Divide {
+            negative_vec.push(expr);
+        }
+        Ok(())
+    }
 
     /// Performs a binary operation, applying any type coercion necessary
     fn binary_op(
@@ -3923,5 +4369,1002 @@ mod tests {
             to_result_type_array(&Operator::Eq, dictionary.clone(), &DataType::Int32)
                 .unwrap();
         assert_eq!(&casted, &dictionary);
+    }
+
+    #[test]
+    fn test_bin_eq() -> Result<()> {
+        // 3 - ( (5+(-2)) - (4+1) )
+        let lhs = BinaryExpr::new(
+            Arc::new(Literal::new(ScalarValue::from(3))),
+            Operator::Minus,
+            Arc::new(BinaryExpr::new(
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Literal::new(ScalarValue::from(5))),
+                    Operator::Plus,
+                    Arc::new(Literal::new(ScalarValue::from(-2))),
+                )),
+                Operator::Minus,
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Literal::new(ScalarValue::from(4))),
+                    Operator::Plus,
+                    Arc::new(Literal::new(ScalarValue::from(1))),
+                )),
+            )),
+        );
+        // 4 + ( (3-(-1)) + (2+(-5)) )
+        let rhs = BinaryExpr::new(
+            Arc::new(Literal::new(ScalarValue::from(4))),
+            Operator::Plus,
+            Arc::new(BinaryExpr::new(
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Literal::new(ScalarValue::from(3))),
+                    Operator::Minus,
+                    Arc::new(Literal::new(ScalarValue::from(-1))),
+                )),
+                Operator::Plus,
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Literal::new(ScalarValue::from(2))),
+                    Operator::Plus,
+                    Arc::new(Literal::new(ScalarValue::from(-5))),
+                )),
+            )),
+        );
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &lhs, &rhs, &None, &false
+        )?);
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &lhs,
+            &rhs,
+            &Some(HashMap::new()),
+            &false
+        )?);
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &rhs, &lhs, &None, &false
+        )?);
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &rhs,
+            &lhs,
+            &Some(HashMap::new()),
+            &false
+        )?);
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &lhs,
+            &lhs,
+            &Some(HashMap::new()),
+            &false
+        )?);
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &rhs,
+            &rhs,
+            &Some(HashMap::new()),
+            &false
+        )?);
+
+        // (2*b) >= (3+a) AND 3.0 < (c*100)
+        let lhs = BinaryExpr::new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Literal::new(ScalarValue::from(2))),
+                    Operator::Multiply,
+                    Arc::new(Column::new("b", 2)),
+                )),
+                Operator::GtEq,
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Literal::new(ScalarValue::from(3))),
+                    Operator::Plus,
+                    Arc::new(Column::new("a", 1)),
+                )),
+            )),
+            Operator::And,
+            Arc::new(BinaryExpr::new(
+                Arc::new(Literal::new(ScalarValue::from(3.0))),
+                Operator::Lt,
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Column::new("c", 3)),
+                    Operator::Multiply,
+                    Arc::new(Literal::new(ScalarValue::from(100))),
+                )),
+            )),
+        );
+        // (100*c) > 3.0 AND (b*2) >= (a+3)
+        let rhs = BinaryExpr::new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Literal::new(ScalarValue::from(100))),
+                    Operator::Multiply,
+                    Arc::new(Column::new("c", 3)),
+                )),
+                Operator::Gt,
+                Arc::new(Literal::new(ScalarValue::from(3.0))),
+            )),
+            Operator::And,
+            Arc::new(BinaryExpr::new(
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Column::new("b", 2)),
+                    Operator::Multiply,
+                    Arc::new(Literal::new(ScalarValue::from(2))),
+                )),
+                Operator::GtEq,
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Column::new("a", 1)),
+                    Operator::Plus,
+                    Arc::new(Literal::new(ScalarValue::from(3))),
+                )),
+            )),
+        );
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &lhs, &rhs, &None, &false
+        )?);
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &lhs,
+            &rhs,
+            &Some(HashMap::new()),
+            &true
+        )?);
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &rhs, &lhs, &None, &false
+        )?);
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &rhs,
+            &lhs,
+            &Some(HashMap::new()),
+            &true
+        )?);
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &lhs,
+            &lhs,
+            &Some(HashMap::new()),
+            &false
+        )?);
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &rhs,
+            &rhs,
+            &Some(HashMap::new()),
+            &false
+        )?);
+
+        // (a + ((b+2) / (c*5))) * d
+        let lhs = BinaryExpr::new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("a", 1)),
+                Operator::Plus,
+                Arc::new(BinaryExpr::new(
+                    Arc::new(BinaryExpr::new(
+                        Arc::new(Column::new("b", 2)),
+                        Operator::Plus,
+                        Arc::new(Literal::new(ScalarValue::from(2))),
+                    )),
+                    Operator::Divide,
+                    Arc::new(BinaryExpr::new(
+                        Arc::new(Column::new("c", 3)),
+                        Operator::Multiply,
+                        Arc::new(Literal::new(ScalarValue::from(5))),
+                    )),
+                )),
+            )),
+            Operator::Multiply,
+            Arc::new(Column::new("d", 4)),
+        );
+        //  d * (((2+b) / (5*c)) + a)
+        let rhs = BinaryExpr::new(
+            Arc::new(Column::new("d", 4)),
+            Operator::Multiply,
+            Arc::new(BinaryExpr::new(
+                Arc::new(BinaryExpr::new(
+                    Arc::new(BinaryExpr::new(
+                        Arc::new(Literal::new(ScalarValue::from(2))),
+                        Operator::Plus,
+                        Arc::new(Column::new("b", 2)),
+                    )),
+                    Operator::Divide,
+                    Arc::new(BinaryExpr::new(
+                        Arc::new(Literal::new(ScalarValue::from(5))),
+                        Operator::Multiply,
+                        Arc::new(Column::new("c", 3)),
+                    )),
+                )),
+                Operator::Plus,
+                Arc::new(Column::new("a", 1)),
+            )),
+        );
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &lhs, &rhs, &None, &false
+        )?);
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &lhs,
+            &rhs,
+            &Some(HashMap::new()),
+            &true
+        )?);
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &rhs, &lhs, &None, &false
+        )?);
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &rhs,
+            &lhs,
+            &Some(HashMap::new()),
+            &true
+        )?);
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &lhs,
+            &lhs,
+            &Some(HashMap::new()),
+            &false
+        )?);
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &rhs,
+            &rhs,
+            &Some(HashMap::new()),
+            &false
+        )?);
+
+        // (( (int)a * (int)b ) * (int)c ) / (float)d )
+        let lhs = BinaryExpr::new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Column::new("a", 1)),
+                    Operator::Multiply,
+                    Arc::new(Column::new("b", 2)),
+                )),
+                Operator::Multiply,
+                Arc::new(Column::new("c", 3)),
+            )),
+            Operator::Divide,
+            Arc::new(Column::new("d", 4)),
+        );
+        // (( (int)c * (int)a ) * (int)b ) / (float)d )
+        let rhs = BinaryExpr::new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Column::new("c", 3)),
+                    Operator::Multiply,
+                    Arc::new(Column::new("a", 1)),
+                )),
+                Operator::Multiply,
+                Arc::new(Column::new("b", 2)),
+            )),
+            Operator::Divide,
+            Arc::new(Column::new("d", 4)),
+        );
+        let column_map: HashMap<Column, DataType> = vec![
+            (Column::new("a", 1), DataType::Int32),
+            (Column::new("b", 2), DataType::Int32),
+            (Column::new("c", 3), DataType::Int32),
+            (Column::new("d", 4), DataType::Float64),
+        ]
+        .into_iter()
+        .collect();
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &lhs,
+            &rhs,
+            &Some(column_map.clone()),
+            &false
+        )?);
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &rhs,
+            &lhs,
+            &Some(column_map),
+            &false
+        )?);
+        let column_map: HashMap<Column, DataType> =
+            vec![(Column::new("d", 4), DataType::Float64)]
+                .into_iter()
+                .collect();
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &lhs,
+            &rhs,
+            &Some(column_map.clone()),
+            &true
+        )?);
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &lhs, &rhs, &None, &false
+        )?);
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &rhs,
+            &lhs,
+            &Some(column_map),
+            &true
+        )?);
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &rhs, &lhs, &None, &false
+        )?);
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &lhs,
+            &lhs,
+            &Some(HashMap::new()),
+            &false
+        )?);
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &rhs,
+            &rhs,
+            &Some(HashMap::new()),
+            &false
+        )?);
+
+        // ( (unknown)a * (int)b ) / ( (int)c * (int)d )
+        let lhs = BinaryExpr::new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("a", 1)),
+                Operator::Multiply,
+                Arc::new(Column::new("b", 2)),
+            )),
+            Operator::Divide,
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("c", 3)),
+                Operator::Multiply,
+                Arc::new(Column::new("d", 4)),
+            )),
+        );
+        // ( (unknown)a * (int)b ) / ( (int)d * (int)c )
+        let rhs = BinaryExpr::new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("a", 1)),
+                Operator::Multiply,
+                Arc::new(Column::new("b", 2)),
+            )),
+            Operator::Divide,
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("d", 4)),
+                Operator::Multiply,
+                Arc::new(Column::new("c", 3)),
+            )),
+        );
+        let column_map: HashMap<Column, DataType> = vec![
+            (Column::new("b", 2), DataType::Int32),
+            (Column::new("c", 3), DataType::Int32),
+            (Column::new("d", 4), DataType::Int32),
+        ]
+        .into_iter()
+        .collect();
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &lhs,
+            &rhs,
+            &Some(column_map.clone()),
+            &false
+        )?);
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &lhs,
+            &rhs,
+            &Some(HashMap::new()),
+            &true
+        )?);
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &rhs,
+            &lhs,
+            &Some(column_map),
+            &false
+        )?);
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &rhs,
+            &lhs,
+            &Some(HashMap::new()),
+            &true
+        )?);
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &lhs,
+            &lhs,
+            &Some(HashMap::new()),
+            &false
+        )?);
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &rhs,
+            &rhs,
+            &Some(HashMap::new()),
+            &false
+        )?);
+
+        // (float)a / ((float)b * ((float)c / (float)d))
+        let lhs = BinaryExpr::new(
+            Arc::new(Column::new("a", 1)),
+            Operator::Divide,
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("b", 2)),
+                Operator::Multiply,
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Column::new("c", 3)),
+                    Operator::Divide,
+                    Arc::new(Column::new("d", 4)),
+                )),
+            )),
+        );
+        // ((float)a / (float)b) * ((float)d / (float)c)
+        let rhs = BinaryExpr::new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("a", 1)),
+                Operator::Divide,
+                Arc::new(Column::new("b", 2)),
+            )),
+            Operator::Multiply,
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("d", 4)),
+                Operator::Divide,
+                Arc::new(Column::new("c", 3)),
+            )),
+        );
+        let column_map: HashMap<Column, DataType> = vec![
+            (Column::new("a", 1), DataType::Float32),
+            (Column::new("b", 2), DataType::Float64),
+            (Column::new("c", 3), DataType::Float64),
+            (Column::new("d", 4), DataType::Float32),
+        ]
+        .into_iter()
+        .collect();
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &lhs,
+            &rhs,
+            &Some(column_map.clone()),
+            &true
+        )?);
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &lhs, &rhs, &None, &false
+        )?);
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &lhs, &rhs, &None, &true
+        )?);
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &rhs,
+            &lhs,
+            &Some(column_map),
+            &true
+        )?);
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &rhs, &lhs, &None, &false
+        )?);
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &rhs, &lhs, &None, &true
+        )?);
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &lhs,
+            &lhs,
+            &Some(HashMap::new()),
+            &false
+        )?);
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &rhs,
+            &rhs,
+            &Some(HashMap::new()),
+            &false
+        )?);
+
+        // (a*b) / c
+        let lhs = BinaryExpr::new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("a", 1)),
+                Operator::Multiply,
+                Arc::new(Column::new("b", 2)),
+            )),
+            Operator::Divide,
+            Arc::new(Column::new("c", 3)),
+        );
+        // (a/c) * b
+        let rhs = BinaryExpr::new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("a", 1)),
+                Operator::Divide,
+                Arc::new(Column::new("c", 3)),
+            )),
+            Operator::Multiply,
+            Arc::new(Column::new("b", 2)),
+        );
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &lhs,
+            &lhs,
+            &Some(HashMap::new()),
+            &false
+        )?);
+        assert!(BinaryExprEquivalenceChecker::is_equal(
+            &rhs,
+            &rhs,
+            &Some(HashMap::new()),
+            &false
+        )?);
+        for (lhs, rhs) in [(lhs.clone(), rhs.clone()), (rhs, lhs)] {
+            assert!(BinaryExprEquivalenceChecker::is_equal(
+                &lhs, &rhs, &None, &false
+            )?);
+            assert!(BinaryExprEquivalenceChecker::is_equal(
+                &lhs,
+                &rhs,
+                &Some(
+                    vec![
+                        (Column::new("b", 2), DataType::Int32),
+                        (Column::new("a", 1), DataType::Float32)
+                    ]
+                    .into_iter()
+                    .collect()
+                ),
+                &true
+            )?);
+            assert!(BinaryExprEquivalenceChecker::is_equal(
+                &lhs,
+                &rhs,
+                &Some(
+                    vec![
+                        (Column::new("c", 3), DataType::Int32),
+                        (Column::new("a", 1), DataType::Float32)
+                    ]
+                    .into_iter()
+                    .collect()
+                ),
+                &true
+            )?);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_bin_not_eq() -> Result<()> {
+        // (a*b) / c
+        let lhs = BinaryExpr::new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("a", 1)),
+                Operator::Multiply,
+                Arc::new(Column::new("b", 2)),
+            )),
+            Operator::Divide,
+            Arc::new(Column::new("c", 3)),
+        );
+        // (a/c) * b
+        let rhs = BinaryExpr::new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("a", 1)),
+                Operator::Divide,
+                Arc::new(Column::new("c", 3)),
+            )),
+            Operator::Multiply,
+            Arc::new(Column::new("b", 2)),
+        );
+        for (lhs, rhs) in [(lhs.clone(), rhs.clone()), (rhs, lhs)] {
+            assert!(!BinaryExprEquivalenceChecker::is_equal(
+                &lhs,
+                &rhs,
+                &Some(HashMap::new()),
+                &false
+            )?);
+            assert!(!BinaryExprEquivalenceChecker::is_equal(
+                &lhs,
+                &rhs,
+                &Some(
+                    vec![
+                        (Column::new("b", 2), DataType::Int32),
+                        (Column::new("a", 1), DataType::Float32)
+                    ]
+                    .into_iter()
+                    .collect()
+                ),
+                &false
+            )?);
+            assert!(!BinaryExprEquivalenceChecker::is_equal(
+                &lhs,
+                &rhs,
+                &Some(
+                    vec![
+                        (Column::new("c", 3), DataType::Int32),
+                        (Column::new("a", 1), DataType::Float32)
+                    ]
+                    .into_iter()
+                    .collect()
+                ),
+                &false
+            )?);
+        }
+        // a and b are floating point types
+        // a * b
+        // b * a
+        let lhs = BinaryExpr::new(
+            Arc::new(Column::new("a", 1)),
+            Operator::Multiply,
+            Arc::new(Column::new("b", 2)),
+        );
+        let rhs = BinaryExpr::new(
+            Arc::new(Column::new("b", 2)),
+            Operator::Multiply,
+            Arc::new(Column::new("a", 1)),
+        );
+        for (lhs, rhs) in [(lhs.clone(), rhs.clone()), (rhs, lhs)] {
+            assert!(!BinaryExprEquivalenceChecker::is_equal(
+                &lhs,
+                &rhs,
+                &Some(HashMap::new()),
+                &false
+            )?);
+            assert!(!BinaryExprEquivalenceChecker::is_equal(
+                &lhs,
+                &rhs,
+                &Some(
+                    vec![(Column::new("a", 1), DataType::Float32)]
+                        .into_iter()
+                        .collect()
+                ),
+                &false
+            )?);
+            assert!(!BinaryExprEquivalenceChecker::is_equal(
+                &lhs,
+                &rhs,
+                &Some(
+                    vec![(Column::new("b", 2), DataType::Float32)]
+                        .into_iter()
+                        .collect()
+                ),
+                &false
+            )?);
+        }
+
+        // 2 > b
+        let lhs = BinaryExpr::new(
+            Arc::new(Literal::new(ScalarValue::from(2))),
+            Operator::Gt,
+            Arc::new(Column::new("b", 2)),
+        );
+        // 2 >= b
+        let rhs = BinaryExpr::new(
+            Arc::new(Literal::new(ScalarValue::from(2))),
+            Operator::GtEq,
+            Arc::new(Column::new("b", 2)),
+        );
+        assert!(!BinaryExprEquivalenceChecker::is_equal(
+            &lhs, &rhs, &None, &true
+        )?);
+        assert!(!BinaryExprEquivalenceChecker::is_equal(
+            &rhs, &lhs, &None, &true
+        )?);
+
+        // (3.3 + a)
+        let lhs = BinaryExpr::new(
+            Arc::new(Literal::new(ScalarValue::from(3.3))),
+            Operator::Plus,
+            Arc::new(Column::new("a", 1)),
+        );
+        // (a + 3.3)
+        let rhs = BinaryExpr::new(
+            Arc::new(Column::new("a", 1)),
+            Operator::Plus,
+            Arc::new(Literal::new(ScalarValue::from(3.3))),
+        );
+        assert!(!BinaryExprEquivalenceChecker::is_equal(
+            &lhs,
+            &rhs,
+            &Some(HashMap::new()),
+            &false
+        )?);
+        assert!(!BinaryExprEquivalenceChecker::is_equal(
+            &rhs,
+            &lhs,
+            &Some(HashMap::new()),
+            &false
+        )?);
+
+        // 3 - ( (5+(-2)) + (1-4) )
+        let lhs = BinaryExpr::new(
+            Arc::new(Literal::new(ScalarValue::from(3))),
+            Operator::Minus,
+            Arc::new(BinaryExpr::new(
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Literal::new(ScalarValue::from(5))),
+                    Operator::Plus,
+                    Arc::new(Literal::new(ScalarValue::from(-2))),
+                )),
+                Operator::Plus,
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Literal::new(ScalarValue::from(1))),
+                    Operator::Minus,
+                    Arc::new(Literal::new(ScalarValue::from(4))),
+                )),
+            )),
+        );
+        // 3 - ( (4+(-2)) + (2-4) )
+        let rhs = BinaryExpr::new(
+            Arc::new(Literal::new(ScalarValue::from(3))),
+            Operator::Minus,
+            Arc::new(BinaryExpr::new(
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Literal::new(ScalarValue::from(4))),
+                    Operator::Plus,
+                    Arc::new(Literal::new(ScalarValue::from(-2))),
+                )),
+                Operator::Plus,
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Literal::new(ScalarValue::from(2))),
+                    Operator::Minus,
+                    Arc::new(Literal::new(ScalarValue::from(4))),
+                )),
+            )),
+        );
+        assert!(!BinaryExprEquivalenceChecker::is_equal(
+            &lhs, &rhs, &None, &true
+        )?);
+        assert!(!BinaryExprEquivalenceChecker::is_equal(
+            &rhs, &lhs, &None, &true
+        )?);
+
+        // (c*d) + ( (a-2) + (3+b) )
+        let lhs = BinaryExpr::new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("c", 3)),
+                Operator::Multiply,
+                Arc::new(Column::new("d", 4)),
+            )),
+            Operator::Plus,
+            Arc::new(BinaryExpr::new(
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Column::new("a", 1)),
+                    Operator::Minus,
+                    Arc::new(Literal::new(ScalarValue::from(2))),
+                )),
+                Operator::Plus,
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Literal::new(ScalarValue::from(3))),
+                    Operator::Plus,
+                    Arc::new(Column::new("b", 2)),
+                )),
+            )),
+        );
+        // ( (b+(-2)) - (3-a) ) + (c*d)
+        let rhs = BinaryExpr::new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Column::new("b", 2)),
+                    Operator::Plus,
+                    Arc::new(Literal::new(ScalarValue::from(-2))),
+                )),
+                Operator::Minus,
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Literal::new(ScalarValue::from(3))),
+                    Operator::Minus,
+                    Arc::new(Column::new("a", 1)),
+                )),
+            )),
+            Operator::Plus,
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("c", 3)),
+                Operator::Multiply,
+                Arc::new(Column::new("d", 4)),
+            )),
+        );
+        assert!(!BinaryExprEquivalenceChecker::is_equal(
+            &lhs, &rhs, &None, &true
+        )?);
+        assert!(!BinaryExprEquivalenceChecker::is_equal(
+            &rhs, &lhs, &None, &true
+        )?);
+
+        // (2*b) >= (3+a) AND (3.0*2.0) < (c*100)
+        let lhs = BinaryExpr::new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Literal::new(ScalarValue::from(2))),
+                    Operator::Multiply,
+                    Arc::new(Column::new("b", 2)),
+                )),
+                Operator::GtEq,
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Literal::new(ScalarValue::from(3))),
+                    Operator::Plus,
+                    Arc::new(Column::new("a", 1)),
+                )),
+            )),
+            Operator::And,
+            Arc::new(BinaryExpr::new(
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Literal::new(ScalarValue::from(3.0))),
+                    Operator::Multiply,
+                    Arc::new(Literal::new(ScalarValue::from(2.0))),
+                )),
+                Operator::Lt,
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Column::new("c", 3)),
+                    Operator::Multiply,
+                    Arc::new(Literal::new(ScalarValue::from(100))),
+                )),
+            )),
+        );
+        // (100*c) > (2.0*3.0) AND (2*b) >= (a+3)
+        let rhs = BinaryExpr::new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Literal::new(ScalarValue::from(100))),
+                    Operator::Multiply,
+                    Arc::new(Column::new("c", 3)),
+                )),
+                Operator::Gt,
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Literal::new(ScalarValue::from(2.0))),
+                    Operator::Multiply,
+                    Arc::new(Literal::new(ScalarValue::from(3.0))),
+                )),
+            )),
+            Operator::And,
+            Arc::new(BinaryExpr::new(
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Literal::new(ScalarValue::from(2))),
+                    Operator::Multiply,
+                    Arc::new(Column::new("b", 2)),
+                )),
+                Operator::GtEq,
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Column::new("a", 1)),
+                    Operator::Plus,
+                    Arc::new(Literal::new(ScalarValue::from(3))),
+                )),
+            )),
+        );
+        assert!(!BinaryExprEquivalenceChecker::is_equal(
+            &lhs,
+            &rhs,
+            &Some(HashMap::new()),
+            &false
+        )?);
+        assert!(!BinaryExprEquivalenceChecker::is_equal(
+            &rhs,
+            &lhs,
+            &Some(HashMap::new()),
+            &false
+        )?);
+
+        // (( (int)a * (float)b ) * (int)c ) / (float)d )
+        let lhs = BinaryExpr::new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Column::new("a", 1)),
+                    Operator::Multiply,
+                    Arc::new(Column::new("b", 2)),
+                )),
+                Operator::Multiply,
+                Arc::new(Column::new("c", 3)),
+            )),
+            Operator::Divide,
+            Arc::new(Column::new("d", 4)),
+        );
+        // (( (int)c * (int)a ) * (float)b ) / (float)d )
+        let rhs = BinaryExpr::new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Column::new("c", 3)),
+                    Operator::Multiply,
+                    Arc::new(Column::new("a", 1)),
+                )),
+                Operator::Multiply,
+                Arc::new(Column::new("b", 2)),
+            )),
+            Operator::Divide,
+            Arc::new(Column::new("d", 4)),
+        );
+        let column_map: HashMap<Column, DataType> = vec![
+            (Column::new("a", 1), DataType::Int32),
+            (Column::new("b", 2), DataType::Float32),
+            (Column::new("c", 3), DataType::Int32),
+            (Column::new("d", 4), DataType::Float64),
+        ]
+        .into_iter()
+        .collect();
+        assert!(!BinaryExprEquivalenceChecker::is_equal(
+            &lhs,
+            &rhs,
+            &Some(column_map.clone()),
+            &false
+        )?);
+        assert!(!BinaryExprEquivalenceChecker::is_equal(
+            &rhs,
+            &lhs,
+            &Some(column_map),
+            &false
+        )?);
+
+        // ( (int)a * (int)b ) / ( (unknown)c * (int)d )
+        let lhs = BinaryExpr::new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("a", 1)),
+                Operator::Multiply,
+                Arc::new(Column::new("b", 2)),
+            )),
+            Operator::Divide,
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("c", 3)),
+                Operator::Multiply,
+                Arc::new(Column::new("d", 4)),
+            )),
+        );
+        // ( (int)a * (int)b ) / ( (int)d * (unknown)c )
+        let rhs = BinaryExpr::new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("a", 1)),
+                Operator::Multiply,
+                Arc::new(Column::new("b", 2)),
+            )),
+            Operator::Divide,
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("d", 4)),
+                Operator::Multiply,
+                Arc::new(Column::new("c", 3)),
+            )),
+        );
+        let column_map: HashMap<Column, DataType> = vec![
+            (Column::new("a", 1), DataType::Int32),
+            (Column::new("b", 2), DataType::Int32),
+            (Column::new("d", 4), DataType::Int32),
+        ]
+        .into_iter()
+        .collect();
+        assert!(!BinaryExprEquivalenceChecker::is_equal(
+            &lhs,
+            &rhs,
+            &Some(column_map.clone()),
+            &false
+        )?);
+        assert!(!BinaryExprEquivalenceChecker::is_equal(
+            &lhs,
+            &rhs,
+            &Some(HashMap::new()),
+            &false
+        )?);
+        assert!(!BinaryExprEquivalenceChecker::is_equal(
+            &rhs,
+            &lhs,
+            &Some(column_map),
+            &false
+        )?);
+        assert!(!BinaryExprEquivalenceChecker::is_equal(
+            &rhs,
+            &lhs,
+            &Some(HashMap::new()),
+            &false
+        )?);
+
+        // a / (b * (c / d))
+        let lhs = BinaryExpr::new(
+            Arc::new(Column::new("a", 1)),
+            Operator::Divide,
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("b", 2)),
+                Operator::Multiply,
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Column::new("c", 3)),
+                    Operator::Divide,
+                    Arc::new(Column::new("d", 4)),
+                )),
+            )),
+        );
+        // (a / b) * (d / c)
+        let rhs = BinaryExpr::new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("a", 1)),
+                Operator::Divide,
+                Arc::new(Column::new("b", 2)),
+            )),
+            Operator::Multiply,
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("d", 4)),
+                Operator::Divide,
+                Arc::new(Column::new("c", 3)),
+            )),
+        );
+
+        assert!(!BinaryExprEquivalenceChecker::is_equal(
+            &lhs,
+            &rhs,
+            &Some(HashMap::new()),
+            &false
+        )?);
+        assert!(!BinaryExprEquivalenceChecker::is_equal(
+            &lhs,
+            &rhs,
+            &Some(HashMap::new()),
+            &true
+        )?);
+        assert!(!BinaryExprEquivalenceChecker::is_equal(
+            &rhs,
+            &lhs,
+            &Some(HashMap::new()),
+            &false
+        )?);
+        assert!(!BinaryExprEquivalenceChecker::is_equal(
+            &rhs,
+            &lhs,
+            &Some(HashMap::new()),
+            &true
+        )?);
+
+        Ok(())
     }
 }
