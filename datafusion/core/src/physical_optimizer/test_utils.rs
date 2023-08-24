@@ -428,9 +428,12 @@ macro_rules! assert_optimized_orthogonal {
             .iter().map(|s| *s).collect();
         //
         // Run JoinSelection - EnforceSorting
-        let optimized_physical_plan = JoinSelection::new().optimize(physical_plan.clone(), state.config_options())?;
+        let optimized_physical_plan = GlobalOrderRequire::new_add_mode().optimize(physical_plan.clone(), state.config_options())?;
+        let optimized_physical_plan = JoinSelection::new().optimize(optimized_physical_plan.clone(), state.config_options())?;
         let optimized_physical_plan =
             EnforceSorting::new().optimize(optimized_physical_plan, state.config_options())?;
+        let optimized_physical_plan =
+            GlobalOrderRequire::new_remove_mode().optimize(optimized_physical_plan, state.config_options())?;
 
         assert_eq!(physical_plan.schema(), optimized_physical_plan.schema());
 
@@ -440,21 +443,22 @@ macro_rules! assert_optimized_orthogonal {
             expected_optimized_lines, actual,
             "\n**JoinSelection - EnforceSorting Optimized Plan Mismatch\n\nexpected:\n\n{expected_optimized_lines:#?}\nactual:\n\n{actual:#?}\n\n"
         );
-        // TODO: Apply EnforceSorting first after the https://github.com/synnada-ai/arrow-datafusion/pull/165
-        //  is merged.
-        // // Run EnforceSorting - JoinSelection
-        // let optimized_physical_plan_2 =
-        //     EnforceSorting::new().optimize(physical_plan.clone(), state.config_options())?;
-        // let optimized_physical_plan_2 = JoinSelection::new().optimize(optimized_physical_plan_2.clone(), state.config_options())?;
-        //
-        // assert_eq!(physical_plan.schema(), optimized_physical_plan_2.schema());
-        //
-        // // Get string representation of the plan
-        // let actual = get_plan_string(&optimized_physical_plan_2);
-        // assert_eq!(
-        //     expected_optimized_lines, actual,
-        //     "\n**EnforceSorting - JoinSelection Optimized Plan Mismatch\n\nexpected:\n\n{expected_optimized_lines:#?}\nactual:\n\n{actual:#?}\n\n"
-        // );
+        // Run EnforceSorting - JoinSelection
+        let optimized_physical_plan_2 = GlobalOrderRequire::new_add_mode().optimize(physical_plan.clone(), state.config_options())?;
+        let optimized_physical_plan_2 =
+            EnforceSorting::new().optimize(optimized_physical_plan_2.clone(), state.config_options())?;
+        let optimized_physical_plan_2 = JoinSelection::new().optimize(optimized_physical_plan_2.clone(), state.config_options())?;
+        let optimized_physical_plan_2 =
+            GlobalOrderRequire::new_remove_mode().optimize(optimized_physical_plan_2, state.config_options())?;
+
+        assert_eq!(physical_plan.schema(), optimized_physical_plan_2.schema());
+
+        // Get string representation of the plan
+        let actual = get_plan_string(&optimized_physical_plan_2);
+        assert_eq!(
+            expected_optimized_lines, actual,
+            "\n**EnforceSorting - JoinSelection Optimized Plan Mismatch\n\nexpected:\n\n{expected_optimized_lines:#?}\nactual:\n\n{actual:#?}\n\n"
+        );
 
     };
 }
