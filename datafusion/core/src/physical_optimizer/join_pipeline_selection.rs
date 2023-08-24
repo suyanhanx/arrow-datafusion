@@ -344,15 +344,15 @@ fn check_hash_join_convertable(
             let left_satisfied = get_indices_of_matching_sort_exprs_with_order_eq(
                 left_order,
                 &on_left,
-                || hash_join.left().equivalence_properties(),
-                || hash_join.left().ordering_equivalence_properties(),
+                &hash_join.left().equivalence_properties(),
+                &hash_join.left().ordering_equivalence_properties(),
             );
             // Get right key(s)' sort options:
             let right_satisfied = get_indices_of_matching_sort_exprs_with_order_eq(
                 right_order,
                 &on_right,
-                || hash_join.right().equivalence_properties(),
-                || hash_join.right().ordering_equivalence_properties(),
+                &hash_join.right().equivalence_properties(),
+                &hash_join.right().ordering_equivalence_properties(),
             );
 
             if let (
