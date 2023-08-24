@@ -637,6 +637,7 @@ pub fn finalize_order_preserving_joins_at_root(
 mod order_preserving_join_swap_tests {
     use std::sync::Arc;
 
+    use crate::physical_optimizer::global_order_require::GlobalOrderRequire;
     use crate::physical_optimizer::join_selection::JoinSelection;
     use crate::physical_optimizer::sort_enforcement::EnforceSorting;
     use crate::physical_optimizer::test_utils::{
