@@ -24,6 +24,7 @@ use std::sync::Arc;
 use crate::config::ConfigOptions;
 use crate::error::Result;
 use crate::physical_optimizer::PhysicalOptimizerRule;
+use crate::physical_plan::joins::utils::is_filter_expr_prunable;
 use crate::physical_plan::joins::SymmetricHashJoinExec;
 use crate::physical_plan::{with_new_children_if_necessary, ExecutionPlan};
 
@@ -140,7 +141,8 @@ pub fn check_finiteness_requirements(
 ) -> Result<Transformed<PipelineStatePropagator>> {
     if let Some(exec) = input.plan.as_any().downcast_ref::<SymmetricHashJoinExec>() {
         if !(optimizer_options.allow_symmetric_joins_without_pruning
-            || (exec.check_if_order_information_available()? && is_prunable(exec)))
+            || (exec.check_if_order_information_available()?
+                && is_prunable(exec, &input.children_unbounded)))
         {
             const MSG: &str = "Join operation cannot operate on a non-prunable stream without enabling \
                                the 'allow_symmetric_joins_without_pruning' configuration flag";
@@ -156,21 +158,32 @@ pub fn check_finiteness_requirements(
         })
 }
 
-/// This function returns whether a given symmetric hash join is amenable to
-/// data pruning. For this to be possible, it needs to have a filter where
-/// all involved [`PhysicalExpr`]s, [`Operator`]s and data types support
-/// interval calculations.
-///
-/// [`PhysicalExpr`]: crate::physical_plan::PhysicalExpr
-/// [`Operator`]: datafusion_expr::Operator
-fn is_prunable(join: &SymmetricHashJoinExec) -> bool {
+/// This function returns whether a given symmetric hash join is amenable to data pruning.
+fn is_prunable(join: &SymmetricHashJoinExec, children_unbounded: &[bool]) -> bool {
     join.filter().map_or(false, |filter| {
-        check_support(filter.expression(), &join.schema())
-            && filter
+        if !check_support(filter.expression(), &join.schema())
+            || filter
                 .schema()
                 .fields()
                 .iter()
-                .all(|f| is_datatype_supported(f.data_type()))
+                .any(|f| !is_datatype_supported(f.data_type()))
+        {
+            return false;
+        }
+        let prunable_sides = is_filter_expr_prunable(
+            filter,
+            // Get the left leading order
+            join.left.output_ordering().map(|arr| arr[0].clone()),
+            // Get the right leading order
+            join.right.output_ordering().map(|arr| arr[0].clone()),
+            || join.left.equivalence_properties(),
+            || join.left.ordering_equivalence_properties(),
+            || join.right.equivalence_properties(),
+            || join.right.ordering_equivalence_properties(),
+        )
+        .unwrap_or((false, false));
+        (prunable_sides.1 || !children_unbounded[1])
+            && (prunable_sides.0 || !children_unbounded[0])
     })
 }
 

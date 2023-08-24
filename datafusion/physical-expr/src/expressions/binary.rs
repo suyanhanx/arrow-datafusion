@@ -31,14 +31,33 @@ use crate::PhysicalExpr;
 
 use arrow::array::*;
 use arrow::compute::cast;
+use arrow::compute::eq_dyn_bool_scalar;
+use arrow::compute::gt_dyn_bool_scalar;
+use arrow::compute::gt_eq_dyn_bool_scalar;
 use arrow::compute::kernels::boolean::{and_kleene, not, or_kleene};
 use arrow::compute::kernels::cmp::*;
 use arrow::compute::kernels::comparison::regexp_is_match_utf8;
 use arrow::compute::kernels::comparison::regexp_is_match_utf8_scalar;
+use arrow::compute::kernels::comparison::{
+    eq_dyn_binary_scalar, gt_dyn_binary_scalar, gt_eq_dyn_binary_scalar,
+    lt_dyn_binary_scalar, lt_eq_dyn_binary_scalar, neq_dyn_binary_scalar,
+};
+use arrow::compute::kernels::comparison::{
+    eq_dyn_scalar, gt_dyn_scalar, gt_eq_dyn_scalar, lt_dyn_scalar, lt_eq_dyn_scalar,
+    neq_dyn_scalar,
+};
+use arrow::compute::kernels::comparison::{
+    eq_dyn_utf8_scalar, gt_dyn_utf8_scalar, gt_eq_dyn_utf8_scalar, lt_dyn_utf8_scalar,
+    lt_eq_dyn_utf8_scalar, neq_dyn_utf8_scalar,
+};
 use arrow::compute::kernels::concat_elements::concat_elements_utf8;
+use arrow::compute::lt_dyn_bool_scalar;
+use arrow::compute::lt_eq_dyn_bool_scalar;
+use arrow::compute::neq_dyn_bool_scalar;
 use arrow::datatypes::*;
 use arrow::record_batch::RecordBatch;
 
+use arrow_array::{Datum, LargeStringArray, Scalar};
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::{internal_err, DataFusionError, Result, ScalarValue};
 use datafusion_expr::interval_arithmetic::{apply_operator, Interval};
@@ -130,6 +149,35 @@ macro_rules! compute_utf8_op {
             .downcast_ref::<$DT>()
             .expect("compute_op failed to downcast right side array");
         Ok(Arc::new(paste::expr! {[<$OP _utf8>]}(&ll, &rr)?))
+    }};
+}
+
+/// Invoke a compute kernel on a data array and a scalar value
+macro_rules! compute_utf8_op_scalar {
+    ($LEFT:expr, $RIGHT:expr, $OP:ident, $DT:ident, $OP_TYPE:expr) => {{
+        let ll = $LEFT
+            .as_any()
+            .downcast_ref::<$DT>()
+            .expect("compute_op failed to downcast left side array");
+        if let ScalarValue::Utf8(Some(string_value))
+        | ScalarValue::LargeUtf8(Some(string_value)) = $RIGHT
+        {
+            Ok(Arc::new(paste::expr! {[<$OP _utf8_scalar>]}(
+                &ll,
+                &string_value,
+            )?))
+        } else if $RIGHT.is_null() {
+            Ok(Arc::new(arrow::array::new_null_array(
+                $OP_TYPE,
+                $LEFT.len(),
+            )))
+        } else {
+            internal_err!(
+                "compute_utf8_op_scalar for '{}' failed to cast literal value {}",
+                stringify!($OP),
+                $RIGHT
+            )
+        }
     }};
 }
 

@@ -21,7 +21,17 @@ use std::{any::Any, sync::Arc};
 use crate::{physical_expr::down_cast_any_ref, PhysicalExpr};
 
 use crate::expressions::datum::apply_cmp;
-use arrow::record_batch::RecordBatch;
+use arrow::compute::kernels::comparison::{
+    ilike_utf8, like_utf8, nilike_utf8, nlike_utf8,
+};
+use arrow::compute::kernels::comparison::{
+    ilike_utf8_scalar, like_utf8_scalar, nilike_utf8_scalar, nlike_utf8_scalar,
+};
+use arrow::{
+    array::{Array, ArrayRef, StringArray},
+    record_batch::RecordBatch,
+};
+use arrow_array::LargeStringArray;
 use arrow_schema::{DataType, Schema};
 use datafusion_common::{internal_err, DataFusionError, Result};
 use datafusion_expr::ColumnarValue;
