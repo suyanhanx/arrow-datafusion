@@ -38,7 +38,7 @@ use crate::physical_plan::joins::{
         check_if_sliding_window_condition_is_met, get_probe_batch,
         is_batch_suitable_interval_calculation, JoinStreamState,
     },
-    symmetric_hash_join::{build_join_indices, OneSideHashJoiner},
+    symmetric_hash_join::OneSideHashJoiner,
     utils::{
         build_batch_from_indices, build_join_schema, calculate_join_output_ordering,
         check_join_is_valid, combine_join_equivalence_properties,
@@ -63,6 +63,7 @@ use datafusion_execution::TaskContext;
 use datafusion_physical_expr::intervals::ExprIntervalGraph;
 use datafusion_physical_expr::{OrderingEquivalenceProperties, PhysicalSortRequirement};
 
+use crate::physical_plan::joins::hash_join::build_equal_condition_join_indices;
 use ahash::RandomState;
 use futures::{ready, Stream, StreamExt};
 use parking_lot::Mutex;
@@ -391,8 +392,8 @@ impl ExecutionPlan for SlidingHashJoinExec {
         ]
     }
 
-    fn benefits_from_input_partitioning(&self) -> bool {
-        false
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false; 2]
     }
 
     fn equivalence_properties(&self) -> EquivalenceProperties {
@@ -676,18 +677,18 @@ fn join_with_probe_batch(
     }
 
     // Calculates the indices to use for build and probe sides of the join:
-    let (build_indices, probe_indices) = build_join_indices(
-        probe_batch,
+    let (build_indices, probe_indices) = build_equal_condition_join_indices(
         &build_hash_joiner.hashmap,
         &build_hash_joiner.input_buffer,
+        probe_batch,
         &build_hash_joiner.on,
         &probe_hash_joiner.on,
-        Some(filter),
         random_state,
         null_equals_null,
         &mut build_hash_joiner.hashes_buffer,
-        Some(build_hash_joiner.deleted_offset),
+        Some(filter),
         JoinSide::Left,
+        Some(build_hash_joiner.deleted_offset),
     )?;
 
     // Record indices of the rows that were visited (if required by the join type):
@@ -1242,8 +1243,8 @@ mod tests {
         let (left, right) = create_memory_table(
             left_batch,
             right_batch,
-            Some(left_sorted),
-            Some(right_sorted),
+            vec![left_sorted],
+            vec![right_sorted],
             batch_size,
         )?;
 
@@ -1300,8 +1301,8 @@ mod tests {
         let (left, right) = create_memory_table(
             left_batch,
             right_batch,
-            Some(left_sorted),
-            Some(right_sorted),
+            vec![left_sorted],
+            vec![right_sorted],
             13,
         )?;
 
@@ -1365,8 +1366,8 @@ mod tests {
         let (left, right) = create_memory_table(
             left_batch,
             right_batch,
-            Some(left_sorted),
-            Some(right_sorted),
+            vec![left_sorted],
+            vec![right_sorted],
             13,
         )?;
 
@@ -1429,8 +1430,8 @@ mod tests {
         let (left, right) = create_memory_table(
             left_batch,
             right_batch,
-            Some(left_sorted),
-            Some(right_sorted),
+            vec![left_sorted],
+            vec![right_sorted],
             13,
         )?;
 
@@ -1510,8 +1511,8 @@ mod tests {
         let (left, right) = create_memory_table(
             left_batch,
             right_batch,
-            Some(left_sorted),
-            Some(right_sorted),
+            vec![left_sorted],
+            vec![right_sorted],
             13,
         )?;
 
@@ -1590,8 +1591,8 @@ mod tests {
         let (left, right) = create_memory_table(
             left_batch,
             right_batch,
-            Some(left_sorted),
-            Some(right_sorted),
+            vec![left_sorted],
+            vec![right_sorted],
             13,
         )?;
 
