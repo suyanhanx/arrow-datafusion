@@ -740,7 +740,7 @@ mod order_preserving_join_swap_tests {
         let sort = sort_exec(window_sort_expr.clone(), join);
         let physical_plan = bounded_window_exec("b", window_sort_expr, sort);
 
-        let expected_input = vec![
+        let expected_input = [
             "BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
             "  SortExec: expr=[a@0 ASC]",
             "    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, e@4)]",
@@ -753,7 +753,7 @@ mod order_preserving_join_swap_tests {
             "              StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
             "      StreamingTableExec: partition_sizes=0, projection=[a, b, c, d, e, c, count], infinite_source=true, output_ordering=[e@4 ASC]",
         ];
-        let expected_optimized = vec![
+        let expected_optimized = [
             "BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
             "  SortMergeJoin: join_type=Inner, on=[(a@0, e@4)]",
             "    SortMergeJoin: join_type=Inner, on=[(a@0, d@3)]",
@@ -801,7 +801,7 @@ mod order_preserving_join_swap_tests {
         let physical_plan = sort_exec(window_sort_expr, join);
 
         // We expect that EnforceSorting will remove the SortExec.
-        let expected_input = vec![
+        let expected_input = [
             "SortExec: expr=[d@6 ASC]",
             "  HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, d@3)]",
             "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
@@ -811,7 +811,7 @@ mod order_preserving_join_swap_tests {
             "          StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
             "          StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
         ];
-        let expected_optimized = vec![
+        let expected_optimized = [
             "SortMergeJoin: join_type=Inner, on=[(a@0, d@3)]",
             "  StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
             "  BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
@@ -860,7 +860,7 @@ mod order_preserving_join_swap_tests {
         );
 
         // We expect that EnforceSorting will remove the SortExec.
-        let expected_input = vec![
+        let expected_input = [
             "FilterExec: NOT d@6",
             "  SortExec: expr=[d@6 ASC]",
             "    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, d@3)]",
@@ -871,7 +871,7 @@ mod order_preserving_join_swap_tests {
             "            StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
             "            StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
         ];
-        let expected_optimized = vec![
+        let expected_optimized = [
             "FilterExec: NOT d@6",
             "  SortMergeJoin: join_type=Inner, on=[(a@0, d@3)]",
             "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
@@ -932,7 +932,7 @@ mod order_preserving_join_swap_tests {
         let sort = sort_exec(window_sort_expr.clone(), join);
         let physical_plan = bounded_window_exec("b", window_sort_expr, sort);
 
-        let expected_input = vec![
+        let expected_input = [
             "BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
             "  SortExec: expr=[a@0 ASC]",
             "    HashJoinExec: mode=Partitioned, join_type=Left, on=[(a@0, e@4)]",
@@ -945,7 +945,7 @@ mod order_preserving_join_swap_tests {
             "              StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
             "      StreamingTableExec: partition_sizes=0, projection=[a, b, c, d, e, c, count], infinite_source=true, output_ordering=[e@4 ASC]",
         ];
-        let expected_optimized = vec![
+        let expected_optimized = [
             "BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
             "  SortMergeJoin: join_type=Left, on=[(a@0, e@4)]",
             "    SortMergeJoin: join_type=Left, on=[(a@0, d@3)]",
@@ -1034,14 +1034,14 @@ mod order_preserving_join_swap_tests {
             )],
             join,
         );
-        let expected_input = vec![
+        let expected_input = [
             "SortExec: expr=[row_number@6 ASC NULLS LAST]",
             "  HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, row_number@3)]",
             "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC NULLS LAST]",
             "    BoundedWindowAggExec: wdw=[row_number: Ok(Field { name: \"row_number\", data_type: UInt64, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
             "      StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC NULLS LAST]",
         ];
-        let expected_optimized = vec![
+        let expected_optimized = [
             "SortMergeJoin: join_type=Inner, on=[(a@0, row_number@3)]",
             "  StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC NULLS LAST]",
             "  BoundedWindowAggExec: wdw=[row_number: Ok(Field { name: \"row_number\", data_type: UInt64, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
@@ -1082,14 +1082,14 @@ mod order_preserving_join_swap_tests {
             )],
             join,
         );
-        let expected_input = vec![
+        let expected_input = [
             "SortExec: expr=[row_number@6 ASC NULLS LAST]",
             "  HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, d@0)]",
             "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC NULLS LAST]",
             "    BoundedWindowAggExec: wdw=[row_number: Ok(Field { name: \"row_number\", data_type: UInt64, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
             "      StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC NULLS LAST]",
         ];
-        let expected_optimized = vec![
+        let expected_optimized = [
             "ProjectionExec: expr=[a@4 as a, b@5 as b, c@6 as c, d@0 as d, e@1 as e, c@2 as c, row_number@3 as row_number]",
             "  SortMergeJoin: join_type=Inner, on=[(d@0, a@0)]",
             "    BoundedWindowAggExec: wdw=[row_number: Ok(Field { name: \"row_number\", data_type: UInt64, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
@@ -1133,7 +1133,7 @@ mod order_preserving_join_swap_tests {
             vec![sort_expr_options("a", &join_2.schema(), asc_null_last)],
             join_2,
         );
-        let expected_input = vec![
+        let expected_input = [
             "SortExec: expr=[a@0 ASC NULLS LAST]",
             "  HashJoinExec: mode=Partitioned, join_type=Inner, on=[(row_number@6, a@0)]",
             "    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, d@0)]",
@@ -1142,7 +1142,7 @@ mod order_preserving_join_swap_tests {
             "        StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC NULLS LAST]",
             "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC NULLS LAST]",
         ];
-        let expected_optimized = vec![
+        let expected_optimized = [
             "SortMergeJoin: join_type=Inner, on=[(row_number@6, a@0)]",
             "  ProjectionExec: expr=[a@4 as a, b@5 as b, c@6 as c, d@0 as d, e@1 as e, c@2 as c, row_number@3 as row_number]",
             "    SortMergeJoin: join_type=Inner, on=[(d@0, a@0)]",
@@ -1198,14 +1198,14 @@ mod order_preserving_join_swap_tests {
             )],
             join,
         );
-        let expected_input = vec![
+        let expected_input = [
             "SortExec: expr=[row_number@6 ASC NULLS LAST]",
             "  HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, d@0), (b@1, e@1)]",
             "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC NULLS LAST, b@1 ASC NULLS LAST]",
             "    BoundedWindowAggExec: wdw=[row_number: Ok(Field { name: \"row_number\", data_type: UInt64, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
             "      StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC NULLS LAST, e@1 ASC NULLS LAST]",
         ];
-        let expected_optimized = vec![
+        let expected_optimized = [
             "ProjectionExec: expr=[a@4 as a, b@5 as b, c@6 as c, d@0 as d, e@1 as e, c@2 as c, row_number@3 as row_number]",
             "  SortMergeJoin: join_type=Inner, on=[(d@0, a@0), (e@1, b@1)]",
             "    BoundedWindowAggExec: wdw=[row_number: Ok(Field { name: \"row_number\", data_type: UInt64, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
@@ -1263,14 +1263,14 @@ mod order_preserving_join_swap_tests {
         //  - Key replace
         //  - Child swap
         // to satisfy the SortExec requirement.
-        let expected_input = vec![
+        let expected_input = [
             "SortExec: expr=[row_number@6 ASC NULLS LAST]",
             "  HashJoinExec: mode=Partitioned, join_type=Inner, on=[(b@1, e@1), (a@0, d@0)]",
             "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC NULLS LAST, b@1 ASC NULLS LAST]",
             "    BoundedWindowAggExec: wdw=[row_number: Ok(Field { name: \"row_number\", data_type: UInt64, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
             "      StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC NULLS LAST, e@1 ASC NULLS LAST]",
         ];
-        let expected_optimized = vec![
+        let expected_optimized = [
             "ProjectionExec: expr=[a@4 as a, b@5 as b, c@6 as c, d@0 as d, e@1 as e, c@2 as c, row_number@3 as row_number]",
             "  SortMergeJoin: join_type=Inner, on=[(d@0, a@0), (e@1, b@1)]",
             "    BoundedWindowAggExec: wdw=[row_number: Ok(Field { name: \"row_number\", data_type: UInt64, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
@@ -1311,13 +1311,13 @@ mod order_preserving_join_swap_tests {
         let window_sort_expr = vec![sort_expr("e", &join_schema)];
         let physical_plan = bounded_window_exec("d", window_sort_expr, join);
 
-        let expected_input = vec![
+        let expected_input = [
             "BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
             "  HashJoinExec: mode=Partitioned, join_type=Inner, on=[(c@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
             "    MemoryExec: partitions=0, partition_sizes=[], output_ordering=a@0 ASC",
             "    MemoryExec: partitions=0, partition_sizes=[], output_ordering=d@0 ASC",
         ];
-        let expected_optimized = vec![
+        let expected_optimized = [
             "BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
             "  SortExec: expr=[e@4 ASC]",
             "    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(c@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
@@ -1350,12 +1350,12 @@ mod order_preserving_join_swap_tests {
             &JoinType::Inner,
         )?;
 
-        let expected_input = vec![
+        let expected_input = [
             "HashJoinExec: mode=Partitioned, join_type=Inner, on=[(c@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
             "  StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true",
             "  StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true",
         ];
-        let expected_optimized = vec![
+        let expected_optimized = [
             "SymmetricHashJoinExec: mode=Partitioned, join_type=Inner, on=[(c@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
             "  StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true",
             "  StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true",
