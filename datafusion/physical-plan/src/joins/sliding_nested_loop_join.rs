@@ -22,13 +22,12 @@ use crate::physical_plan::joins::sliding_window_join_utils::{
     calculate_the_necessary_build_side_range, check_if_sliding_window_condition_is_met,
     get_probe_batch, is_batch_suitable_interval_calculation, JoinStreamState,
 };
-use crate::physical_plan::joins::symmetric_hash_join::determine_prune_length;
-use crate::physical_plan::joins::utils;
 use crate::physical_plan::joins::utils::{
     apply_join_filter_to_indices, build_batch_from_indices, build_join_schema,
-    calculate_join_output_ordering, combine_join_equivalence_properties,
-    combine_join_ordering_equivalence_properties, estimate_join_statistics,
-    partitioned_join_output_partitioning, ColumnIndex, JoinFilter, JoinSide,
+    calculate_join_output_ordering, calculate_prune_length_with_probe_batch_helper,
+    combine_join_equivalence_properties, combine_join_ordering_equivalence_properties,
+    estimate_join_statistics, partitioned_join_output_partitioning, prepare_sorted_exprs,
+    ColumnIndex, JoinFilter, JoinSide,
 };
 use crate::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
 use crate::physical_plan::stream::RecordBatchBroadcastStreamsBuilder;
@@ -40,7 +39,7 @@ use crate::physical_plan::{
 use arrow::array::{UInt32Array, UInt32Builder, UInt64Array, UInt64Builder};
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use datafusion_common::{DataFusionError, Result, ScalarValue, Statistics};
+use datafusion_common::{internal_err, DataFusionError, Result, Statistics};
 use datafusion_execution::memory_pool::MemoryConsumer;
 use datafusion_execution::memory_pool::MemoryReservation;
 use datafusion_execution::TaskContext;
@@ -423,9 +422,7 @@ impl ExecutionPlan for SlidingNestedLoopJoinExec {
                 self.left_sort_exprs.clone(),
                 self.right_sort_exprs.clone(),
             )?)),
-            _ => Err(DataFusionError::Internal(
-                "SlidingNestedLoopJoinExec should have two children".to_string(),
-            )),
+            _ => internal_err!("SlidingNestedLoopJoinExec should have two children"),
         }
     }
 
@@ -441,14 +438,26 @@ impl ExecutionPlan for SlidingNestedLoopJoinExec {
             MemoryConsumer::new(format!("SlidingNestedLoopJoinStream[{partition}]"))
                 .register(context.memory_pool());
 
-        let (left_sorted_filter_expr, right_sorted_filter_expr, graph) =
-            utils::prepare_sorted_exprs(
+        let (left_sorted_filter_expr, right_sorted_filter_expr, graph) = if let Some((
+            left_sorted_filter_expr,
+            right_sorted_filter_expr,
+            graph,
+        )) =
+            prepare_sorted_exprs(
                 &self.filter,
-                &self.left,
-                &self.right,
+                &self.left.schema(),
+                &self.right.schema(),
                 &self.left_sort_exprs,
+                &self.left.equivalence_properties(),
+                &self.left.ordering_equivalence_properties(),
                 &self.right_sort_exprs,
-            )?;
+                &self.right.equivalence_properties(),
+                &self.right.ordering_equivalence_properties(),
+            )? {
+            (left_sorted_filter_expr, right_sorted_filter_expr, graph)
+        } else {
+            return internal_err!("SlidingHashJoinExec can not operate unless both sides are pruning tables.");
+        };
 
         let (build_stream, probe_stream) = self.get_streams(partition, context)?;
 
@@ -511,6 +520,8 @@ struct BuildSideBuffer {
     offset: usize,
     /// Deleted offset of the build side, used for indexing the inner buffer
     deleted_offset: usize,
+    /// Side
+    build_side: JoinSide,
 }
 
 impl BuildSideBuffer {
@@ -529,6 +540,7 @@ impl BuildSideBuffer {
             visited_rows: HashSet::new(),
             offset: 0,
             deleted_offset: 0,
+            build_side: JoinSide::Left,
         }
     }
 
@@ -602,35 +614,19 @@ impl BuildSideBuffer {
     /// The pruning length for the `BuildSideBuffer`.
     fn calculate_prune_length_with_probe_batch(
         &mut self,
-        build_side_sorted_filter_expr: &mut SortedFilterExpr,
-        probe_side_sorted_filter_expr: &mut SortedFilterExpr,
+        build_side_sorted_filter_exprs: &mut [SortedFilterExpr],
+        probe_side_sorted_filter_exprs: &mut [SortedFilterExpr],
+        filter: &JoinFilter,
         graph: &mut ExprIntervalGraph,
     ) -> Result<usize> {
-        // Return early if the input buffer is empty:
-        if self.input_buffer.num_rows() == 0 {
-            return Ok(0);
-        }
-        // Process the build and probe side sorted filter expressions if both are present.
-        // Collect the sorted filter expressions into a vector of (node_index, interval) tuples:
-        let mut filter_intervals = vec![];
-        for expr in [
-            &build_side_sorted_filter_expr,
-            &probe_side_sorted_filter_expr,
-        ] {
-            filter_intervals.push((expr.node_index(), expr.interval().clone()))
-        }
-        // Update the physical expression graph using the join filter intervals:
-        graph.update_ranges(&mut filter_intervals)?;
-        // Extract the new join filter interval for the build side:
-        let (_, calculated_build_side_interval) = filter_intervals.remove(0);
-        // If the intervals have not changed, return early without pruning:
-        if calculated_build_side_interval.eq(build_side_sorted_filter_expr.interval()) {
-            return Ok(0);
-        }
-        // Update the build side interval and determine the pruning length:
-        build_side_sorted_filter_expr.set_interval(calculated_build_side_interval);
-
-        determine_prune_length(&self.input_buffer, build_side_sorted_filter_expr)
+        calculate_prune_length_with_probe_batch_helper(
+            filter,
+            graph,
+            &self.input_buffer,
+            build_side_sorted_filter_exprs,
+            probe_side_sorted_filter_exprs,
+            self.build_side,
+        )
     }
 }
 
@@ -667,10 +663,10 @@ struct SlidingNestedLoopJoinStream {
     build_stream: SendableRecordBatchStream,
     /// Left globally sorted filter expression.
     /// This expression is used to range calculations from the left stream.
-    left_sorted_filter_expr: SortedFilterExpr,
+    left_sorted_filter_expr: Vec<SortedFilterExpr>,
     /// Right globally sorted filter expression.
     /// This expression is used to range calculations from the right stream.
-    right_sorted_filter_expr: SortedFilterExpr,
+    right_sorted_filter_expr: Vec<SortedFilterExpr>,
     graph: ExprIntervalGraph,
     column_indices: Vec<ColumnIndex>,
     metrics: SlidingNestedLoopJoinMetrics,
@@ -918,8 +914,10 @@ impl SlidingNestedLoopJoinStream {
                                 // Check if the batch meets interval calculation criteria:
                                 let stop_polling =
                                     is_batch_suitable_interval_calculation(
+                                        &self.filter,
                                         &self.right_sorted_filter_expr,
                                         &batch,
+                                        JoinSide::Right,
                                     )?;
                                 // Add the batch into the candidate buffer:
                                 self.probe_buffer.candidate_buffer.push(batch);
@@ -947,6 +945,7 @@ impl SlidingNestedLoopJoinStream {
                     // Update the probe side with the new probe batch:
                     let calculated_build_side_interval =
                         calculate_the_necessary_build_side_range(
+                            &self.filter,
                             &self.build_buffer.input_buffer,
                             &mut self.graph,
                             &mut self.left_sorted_filter_expr,
@@ -961,8 +960,6 @@ impl SlidingNestedLoopJoinStream {
                 JoinStreamState::PullBuild { interval } => {
                     // Get the expression used to determine the order in which
                     // rows from the left stream are added to the batches:
-                    let build_order = self.left_sorted_filter_expr.origin_sorted_expr();
-                    let sort_options = &build_order.options;
                     let build_interval = interval.clone();
                     // Keep pulling data from the left stream until a suitable
                     // range on batches is found:
@@ -974,20 +971,14 @@ impl SlidingNestedLoopJoinStream {
                                 }
                                 self.metrics.build.input_batches.add(1);
                                 self.metrics.build.input_rows.add(batch.num_rows());
-                                let array_ref = build_order
-                                    .expr
-                                    .evaluate(&batch.slice(batch.num_rows() - 1, 1))?
-                                    .into_array(batch.num_rows());
 
                                 self.build_buffer.update_internal_state(&batch)?;
 
-                                let latest_value =
-                                    ScalarValue::try_from_array(&array_ref, 0)?;
                                 if check_if_sliding_window_condition_is_met(
-                                    &latest_value,
+                                    &self.filter,
+                                    &batch,
                                     &build_interval,
-                                    sort_options,
-                                ) {
+                                )? {
                                     self.state = JoinStreamState::Join;
                                     break;
                                 }
@@ -1031,10 +1022,12 @@ impl SlidingNestedLoopJoinStream {
 
                     // Calculate the filter expression intervals for both sides of the join:
                     calculate_filter_expr_intervals(
+                        &self.filter,
                         &build_side_joiner.input_buffer,
                         build_side_sorted_filter_expr,
                         &probe_side_buffer.current_batch,
                         probe_side_sorted_filter_expr,
+                        JoinSide::Left,
                     )?;
 
                     // Determine how much of the internal state can be pruned by
@@ -1043,9 +1036,9 @@ impl SlidingNestedLoopJoinStream {
                         .calculate_prune_length_with_probe_batch(
                             build_side_sorted_filter_expr,
                             probe_side_sorted_filter_expr,
+                            &self.filter,
                             &mut self.graph,
                         )?;
-
                     // If some of the internal state can be pruned on build side,
                     // calculate the "anti" join result. The anti join result
                     // contains rows from the probe side that do not have matching
@@ -1188,14 +1181,15 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::physical_plan::joins::hash_join_utils::tests::complicated_filter;
+    use crate::physical_plan::joins::hash_join_utils::tests::{
+        complicated_4_column_exprs, complicated_filter,
+    };
     use crate::physical_plan::joins::test_utils::{
         build_sides_record_batches, compare_batches, create_memory_table,
         join_expr_tests_fixture_i32, partitioned_nested_join_with_filter,
-        partitioned_sliding_nested_join_with_filter,
+        partitioned_sliding_nested_join_with_filter, split_record_batches,
     };
     use crate::physical_plan::joins::utils::JoinSide;
-    use crate::prelude::SessionContext;
 
     use arrow::datatypes::{DataType, Field};
     use arrow_schema::SortOptions;
@@ -1232,7 +1226,51 @@ mod tests {
         Ok(())
     }
 
-    const TABLE_SIZE: i32 = 100;
+    const TABLE_SIZE: i32 = 30;
+
+    use crate::prelude::SessionContext;
+    use once_cell::sync::Lazy;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    type TableKey = (i32, i32, usize); // (cardinality.0, cardinality.1, batch_size)
+    type TableValue = (Vec<RecordBatch>, Vec<RecordBatch>); // (left, right)
+
+    // Cache for storing tables
+    static TABLE_CACHE: Lazy<Mutex<HashMap<TableKey, TableValue>>> =
+        Lazy::new(|| Mutex::new(HashMap::new()));
+
+    fn get_or_create_table(
+        cardinality: (i32, i32),
+        batch_size: usize,
+    ) -> Result<TableValue> {
+        {
+            let cache = TABLE_CACHE.lock().unwrap();
+            if let Some(table) = cache.get(&(cardinality.0, cardinality.1, batch_size)) {
+                return Ok(table.clone());
+            }
+        }
+
+        // If not, create the table
+        let (left_batch, right_batch) =
+            build_sides_record_batches(TABLE_SIZE, cardinality)?;
+
+        let (left_partition, right_partition) = (
+            split_record_batches(&left_batch, batch_size)?,
+            split_record_batches(&right_batch, batch_size)?,
+        );
+
+        // Lock the cache again and store the table
+        let mut cache = TABLE_CACHE.lock().unwrap();
+
+        // Store the table in the cache
+        cache.insert(
+            (cardinality.0, cardinality.1, batch_size),
+            (left_partition.clone(), right_partition.clone()),
+        );
+
+        Ok((left_partition, right_partition))
+    }
 
     #[rstest]
     #[tokio::test(flavor = "multi_thread")]
@@ -1248,20 +1286,15 @@ mod tests {
             JoinType::Full
         )]
         join_type: JoinType,
-        #[values(
-        (4, 5),
-        (31, 71),
-        )]
-        cardinality: (i32, i32),
         #[values(0, 1, 2, 3, 4, 5, 6, 7)] case_expr: usize,
         #[values(13, 15, 33, 100, 101, 123)] batch_size: usize,
     ) -> Result<()> {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
-        let (left_batch, right_batch) =
-            build_sides_record_batches(TABLE_SIZE, cardinality)?;
-        let left_schema = &left_batch.schema();
-        let right_schema = &right_batch.schema();
+        let (left_partition, right_partition) = get_or_create_table((4, 5), batch_size)?;
+
+        let left_schema = &left_partition[0].schema();
+        let right_schema = &right_partition[0].schema();
         let left_sorted = vec![PhysicalSortExpr {
             expr: col("la1", left_schema)?,
             options: SortOptions::default(),
@@ -1271,11 +1304,10 @@ mod tests {
             options: SortOptions::default(),
         }];
         let (left, right) = create_memory_table(
-            left_batch,
-            right_batch,
+            left_partition,
+            right_partition,
             vec![left_sorted],
             vec![right_sorted],
-            batch_size,
         )?;
 
         let intermediate_schema = Schema::new(vec![
@@ -1304,6 +1336,86 @@ mod tests {
         Ok(())
     }
 
+    #[rstest]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn complex_join_all_one_ascending_numeric_equivalence(
+        #[values(
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Right,
+            JoinType::RightSemi,
+            JoinType::LeftSemi,
+            JoinType::LeftAnti,
+            JoinType::RightAnti,
+            JoinType::Full
+        )]
+        join_type: JoinType,
+        #[values(0, 1, 2)] case_expr: usize,
+    ) -> Result<()> {
+        let session_ctx = SessionContext::new();
+        let task_ctx = session_ctx.task_ctx();
+        let (left_partition, right_partition) = get_or_create_table((4, 5), 8)?;
+
+        let left_schema = &left_partition[0].schema();
+        let right_schema = &right_partition[0].schema();
+        let left_sorted = vec![
+            vec![PhysicalSortExpr {
+                expr: col("la1", left_schema)?,
+                options: SortOptions::default(),
+            }],
+            vec![PhysicalSortExpr {
+                expr: col("la2", left_schema)?,
+                options: SortOptions::default(),
+            }],
+        ];
+        let right_sorted = vec![
+            vec![PhysicalSortExpr {
+                expr: col("ra2", right_schema)?,
+                options: SortOptions::default(),
+            }],
+            vec![PhysicalSortExpr {
+                expr: col("ra1", right_schema)?,
+                options: SortOptions::default(),
+            }],
+        ];
+        let (left, right) = create_memory_table(
+            left_partition,
+            right_partition,
+            left_sorted,
+            right_sorted,
+        )?;
+
+        let intermediate_schema = Schema::new(vec![
+            Field::new("0", DataType::Int32, true),
+            Field::new("1", DataType::Int32, true),
+            Field::new("2", DataType::Int32, true),
+            Field::new("3", DataType::Int32, true),
+        ]);
+        let filter_expr = complicated_4_column_exprs(case_expr, &intermediate_schema)?;
+        let column_indices = vec![
+            ColumnIndex {
+                index: left_schema.index_of("la1")?,
+                side: JoinSide::Left,
+            },
+            ColumnIndex {
+                index: left_schema.index_of("la2")?,
+                side: JoinSide::Left,
+            },
+            ColumnIndex {
+                index: right_schema.index_of("ra1")?,
+                side: JoinSide::Right,
+            },
+            ColumnIndex {
+                index: right_schema.index_of("ra2")?,
+                side: JoinSide::Right,
+            },
+        ];
+        let filter = JoinFilter::new(filter_expr, column_indices, intermediate_schema);
+
+        experiment(left, right, filter, join_type, task_ctx).await?;
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn build_null_columns_last() -> Result<()> {
         let join_type = JoinType::Full;
@@ -1312,10 +1424,10 @@ mod tests {
         let config = SessionConfig::new().with_repartition_joins(false);
         let session_ctx = SessionContext::with_config(config);
         let task_ctx = session_ctx.task_ctx();
-        let (left_batch, right_batch) =
-            build_sides_record_batches(TABLE_SIZE, cardinality)?;
-        let left_schema = &left_batch.schema();
-        let right_schema = &right_batch.schema();
+        let (left_partition, right_partition) = get_or_create_table(cardinality, 8)?;
+
+        let left_schema = &left_partition[0].schema();
+        let right_schema = &right_partition[0].schema();
         let left_sorted = vec![PhysicalSortExpr {
             expr: col("l_asc_null_last", left_schema)?,
             options: SortOptions {
@@ -1331,11 +1443,10 @@ mod tests {
             },
         }];
         let (left, right) = create_memory_table(
-            left_batch,
-            right_batch,
+            left_partition,
+            right_partition,
             vec![left_sorted],
             vec![right_sorted],
-            13,
         )?;
 
         let intermediate_schema = Schema::new(vec![
@@ -1371,10 +1482,10 @@ mod tests {
         let config = SessionConfig::new().with_repartition_joins(false);
         let session_ctx = SessionContext::with_config(config);
         let task_ctx = session_ctx.task_ctx();
-        let (left_batch, right_batch) =
-            build_sides_record_batches(TABLE_SIZE, cardinality)?;
-        let left_schema = &left_batch.schema();
-        let right_schema = &right_batch.schema();
+        let (left_partition, right_partition) = get_or_create_table(cardinality, 8)?;
+
+        let left_schema = &left_partition[0].schema();
+        let right_schema = &right_partition[0].schema();
         let left_sorted = vec![PhysicalSortExpr {
             expr: col("l_desc_null_first", left_schema)?,
             options: SortOptions {
@@ -1390,11 +1501,10 @@ mod tests {
             },
         }];
         let (left, right) = create_memory_table(
-            left_batch,
-            right_batch,
+            left_partition,
+            right_partition,
             vec![left_sorted],
             vec![right_sorted],
-            13,
         )?;
 
         let intermediate_schema = Schema::new(vec![
@@ -1436,19 +1546,14 @@ mod tests {
             JoinType::Full
         )]
         join_type: JoinType,
-        #[values(
-        (4, 5),
-        (31, 71),
-        )]
-        cardinality: (i32, i32),
         #[values(0, 1, 2, 3, 4, 5, 6)] case_expr: usize,
     ) -> Result<()> {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
-        let (left_batch, right_batch) =
-            build_sides_record_batches(TABLE_SIZE, cardinality)?;
-        let left_schema = &left_batch.schema();
-        let right_schema = &right_batch.schema();
+        let (left_partition, right_partition) = get_or_create_table((4, 5), 8)?;
+
+        let left_schema = &left_partition[0].schema();
+        let right_schema = &right_partition[0].schema();
         let left_sorted = vec![PhysicalSortExpr {
             expr: col("la1_des", left_schema)?,
             options: SortOptions {
@@ -1464,11 +1569,66 @@ mod tests {
             },
         }];
         let (left, right) = create_memory_table(
-            left_batch,
-            right_batch,
+            left_partition,
+            right_partition,
             vec![left_sorted],
             vec![right_sorted],
-            13,
+        )?;
+
+        let intermediate_schema = Schema::new(vec![
+            Field::new("left", DataType::Int32, true),
+            Field::new("right", DataType::Int32, true),
+        ]);
+        let filter_expr = join_expr_tests_fixture_i32(
+            case_expr,
+            col("left", &intermediate_schema)?,
+            col("right", &intermediate_schema)?,
+        );
+        let column_indices = vec![
+            ColumnIndex {
+                index: 5,
+                side: JoinSide::Left,
+            },
+            ColumnIndex {
+                index: 5,
+                side: JoinSide::Right,
+            },
+        ];
+        let filter = JoinFilter::new(filter_expr, column_indices, intermediate_schema);
+
+        experiment(left, right, filter, join_type, task_ctx).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn join_all_one_descending_numeric_particular_v2() -> Result<()> {
+        let join_type = JoinType::Inner;
+        let case_expr = 1;
+        let session_ctx = SessionContext::new();
+        let task_ctx = session_ctx.task_ctx();
+        let (left_partition, right_partition) = get_or_create_table((4, 5), 8)?;
+
+        let left_schema = &left_partition[0].schema();
+        let right_schema = &right_partition[0].schema();
+        let left_sorted = vec![PhysicalSortExpr {
+            expr: col("la1_des", left_schema)?,
+            options: SortOptions {
+                descending: true,
+                nulls_first: true,
+            },
+        }];
+        let right_sorted = vec![PhysicalSortExpr {
+            expr: col("ra1_des", right_schema)?,
+            options: SortOptions {
+                descending: true,
+                nulls_first: true,
+            },
+        }];
+        let (left, right) = create_memory_table(
+            left_partition,
+            right_partition,
+            vec![left_sorted],
+            vec![right_sorted],
         )?;
 
         let intermediate_schema = Schema::new(vec![
@@ -1510,19 +1670,14 @@ mod tests {
             JoinType::Full
         )]
         join_type: JoinType,
-        #[values(
-        (4, 5),
-        (31, 71),
-        )]
-        cardinality: (i32, i32),
     ) -> Result<()> {
         // a + b > c + 10 AND a + b < c + 100
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
-        let (left_batch, right_batch) =
-            build_sides_record_batches(TABLE_SIZE, cardinality)?;
-        let left_schema = &left_batch.schema();
-        let right_schema = &right_batch.schema();
+        let (left_partition, right_partition) = get_or_create_table((4, 5), 8)?;
+
+        let left_schema = &left_partition[0].schema();
+        let right_schema = &right_partition[0].schema();
         let left_sorted = vec![PhysicalSortExpr {
             expr: binary(
                 col("la1", left_schema)?,
@@ -1537,11 +1692,10 @@ mod tests {
             options: SortOptions::default(),
         }];
         let (left, right) = create_memory_table(
-            left_batch,
-            right_batch,
+            left_partition,
+            right_partition,
             vec![left_sorted],
             vec![right_sorted],
-            13,
         )?;
 
         let intermediate_schema = Schema::new(vec![

@@ -40,6 +40,7 @@ use arrow_schema::{Fields, SortOptions};
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::{Transformed, TreeNode, VisitRecursion};
+use datafusion_common::utils::bisect;
 use datafusion_common::{
     plan_datafusion_err, plan_err, DataFusionError, JoinSide, JoinType, Result,
     SharedResult,
@@ -1035,6 +1036,103 @@ pub(crate) fn build_batch_from_indices(
         columns.push(array);
     }
     Ok(RecordBatch::try_new(Arc::new(schema.clone()), columns)?)
+}
+
+/// Constructs a schema for the filter representation of the build side.
+///
+/// This function generates a [`SchemaRef`] with fields from the build side that are used
+/// in the join filter. The resulting [`SchemaRef`] can be used for creating a
+/// filter representation [`RecordBatch`].
+///
+/// # Arguments
+///
+/// * `filter_schema` - The [`Schema`] of the join filter.
+/// * `column_indices` - The indices of the columns used in the join filter.
+/// * `build_side` - The side of the join that is being built.
+///
+/// # Returns
+///
+/// Returns a [`SchemaRef`] representing the schema of the filter for the build side.
+pub(crate) fn get_filter_representation_schema_of_build_side(
+    filter_schema: &Schema,
+    column_indices: &[ColumnIndex],
+    build_side: JoinSide,
+) -> Result<SchemaRef> {
+    // Determine the number of fields in the filter representation schema by counting the
+    // fields from the build side that are used in the join filter.
+    let capacity = column_indices
+        .iter()
+        .filter(|index| index.side.eq(&build_side))
+        .count();
+
+    // Initialize a vector to hold the fields of the filter representation schema with the
+    // calculated capacity.
+    let mut result_fields = Vec::with_capacity(capacity);
+
+    // Iterate over the column indices and add the corresponding fields from the build
+    // side to the filter representation schema if they are used in the join filter.
+    for (index, column_index) in column_indices.iter().enumerate() {
+        if column_index.side == build_side {
+            result_fields.push(filter_schema.field(index).clone());
+        }
+    }
+
+    // Construct and return the filter representation schema as a SchemaRef.
+    Ok(Arc::new(Schema::new(result_fields)))
+}
+
+/// Constructs a filter representation of the build side.
+///
+/// This function generates a [`RecordBatch`] with columns from the build side
+/// that are used in the join filter. The resulting `RecordBatch` can be used
+/// for further filtering or pruning operations.
+///
+/// # Arguments
+///
+/// * `filter_schema` - The [`Schema`] of the join filter.
+/// * `build_inner_buffer` - The `RecordBatch` on the build side of the join.
+/// * `column_indices` - The indices of the columns used in the join filter.
+/// * `build_side` - The side of the join that is being built.
+///
+/// # Returns
+///
+/// Returns a `RecordBatch` representing the filter of the build side.
+pub(crate) fn get_filter_representation_of_build_side(
+    filter_schema: &Schema,
+    build_inner_buffer: &RecordBatch,
+    column_indices: &[ColumnIndex],
+    build_side: JoinSide,
+) -> Result<RecordBatch> {
+    // Generates the schema for the filter representation based on the filter schema,
+    // column indices, and build side.
+    let schema = get_filter_representation_schema_of_build_side(
+        filter_schema,
+        column_indices,
+        build_side,
+    )?;
+
+    // Determine the number of columns in the filter representation by counting the
+    // columns from the build side that are used in the join filter.
+    let capacity = column_indices
+        .iter()
+        .filter(|index| index.side.eq(&build_side))
+        .count();
+
+    // Initialize a vector to hold the columns of the filter representation with the
+    // calculated capacity.
+    let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(capacity);
+
+    // Iterate over the column indices and add the corresponding columns from the build
+    // side to the filter representation if they are used in the join filter.
+    for column_index in column_indices.iter() {
+        if column_index.side == build_side {
+            let array = build_inner_buffer.column(column_index.index).clone();
+            columns.push(array);
+        }
+    }
+
+    // Construct and return the filter representation as a RecordBatch.
+    Ok(RecordBatch::try_new(schema, columns)?)
 }
 
 /// The input is the matched indices for left and right and
@@ -2044,11 +2142,18 @@ fn update_sorted_exprs_with_node_indices(
     // Extract filter expressions from the sorted expressions:
     let filter_exprs = sorted_exprs
         .iter()
-        .map(|expr| expr.filter_expr().clone())
+        .map(|expr| expr.filter_expr().expr.clone())
         .collect::<Vec<_>>();
 
     // Gather corresponding node indices for the extracted filter expressions from the graph:
     let child_node_indices = graph.gather_node_indices(&filter_exprs);
+
+    let filter_sorted_exprs = sorted_exprs
+        .iter()
+        .map(|sorted_expr| sorted_expr.filter_expr().clone())
+        .collect::<Vec<_>>();
+
+    graph.assign_sort_information(&filter_sorted_exprs);
 
     // Iterate through the sorted expressions and the gathered node indices:
     for (sorted_expr, (_, index)) in sorted_exprs.iter_mut().zip(child_node_indices) {
@@ -2057,62 +2162,105 @@ fn update_sorted_exprs_with_node_indices(
     }
 }
 
-/// Prepares and sorts expressions based on a given filter, left and right execution plans, and sort expressions.
+/// Represents the sorted filter information resulting from the `prepare_sorted_exprs` method.
+///
+/// This type encapsulates the sorted filter expressions for both the left and right sides of a join,
+/// as well as an expression interval graph that provides additional context about the sorted expressions.
+///
+/// # Components
+///
+/// * `Vec<SortedFilterExpr>` - A vector of sorted filter expressions for the left side of the join.
+/// * `Vec<SortedFilterExpr>` - A vector of sorted filter expressions for the right side of the join.
+/// * `ExprIntervalGraph` - This object implements a directed acyclic expression graph (DAEG) that
+/// is used to compute ranges for filter expression through interval arithmetic.
+///
+pub type SortedFilterInformation = (
+    Vec<SortedFilterExpr>,
+    Vec<SortedFilterExpr>,
+    ExprIntervalGraph,
+);
+
+/// Prepares and sorts expressions based on a given filter, left and right schemas, and sort expressions.
+///
+/// This function prepares sorted filter expressions for both the left and right sides of a join operation.
+/// It first builds the filter order for each side based on the provided schemas, sort expressions, and
+/// equivalence properties. If both sides have valid sorted filter expressions, the function then constructs
+/// an expression interval graph and updates the sorted expressions with node indices. The final sorted filter
+/// expressions for both sides are then returned as part of the `SortedFilterInformation` type.
 ///
 /// # Arguments
 ///
 /// * `filter` - The join filter to base the sorting on.
-/// * `left` - The left execution plan.
-/// * `right` - The right execution plan.
+/// * `left_schema` - The schema for the left side of the join.
+/// * `right_schema` - The schema for the right side of the join.
 /// * `left_sort_exprs` - The expressions to sort on the left side.
+/// * `left_equivalence_properties` - Equivalence properties for the left side.
+/// * `left_ordering_equivalence_properties` - Ordering equivalence properties for the left side.
 /// * `right_sort_exprs` - The expressions to sort on the right side.
+/// * `right_equivalence_properties` - Equivalence properties for the right side.
+/// * `right_ordering_equivalence_properties` - Ordering equivalence properties for the right side.
 ///
 /// # Returns
 ///
-/// * A tuple consisting of the sorted filter expression for the left and right sides, and an expression interval graph.
+/// * An `Option` containing `SortedFilterInformation` if both sides have valid sorted filter expressions.
+///   The `SortedFilterInformation` type encapsulates the sorted filter expressions for both sides and an
+///   expression interval graph. If either side lacks valid sorted filter expressions, the function returns `None`.
+///
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_sorted_exprs(
     filter: &JoinFilter,
-    left: &Arc<dyn ExecutionPlan>,
-    right: &Arc<dyn ExecutionPlan>,
+    left_schema: &SchemaRef,
+    right_schema: &SchemaRef,
     left_sort_exprs: &[PhysicalSortExpr],
+    left_equivalence_properties: &EquivalenceProperties,
+    left_ordering_equivalence_properties: &OrderingEquivalenceProperties,
     right_sort_exprs: &[PhysicalSortExpr],
-) -> Result<(SortedFilterExpr, SortedFilterExpr, ExprIntervalGraph)> {
-    // Build the filter order for the left side
-    let err = || plan_datafusion_err!("Filter does not include the child order");
-
+    right_equivalence_properties: &EquivalenceProperties,
+    right_ordering_equivalence_properties: &OrderingEquivalenceProperties,
+) -> Result<Option<SortedFilterInformation>> {
+    // Build the filter order for the left side:
     let left_temp_sorted_filter_expr = build_filter_input_order(
         JoinSide::Left,
         filter,
-        &left.schema(),
+        left_schema,
         &left_sort_exprs[0],
-    )?
-    .ok_or_else(err)?;
+        left_equivalence_properties,
+        left_ordering_equivalence_properties,
+    )?;
 
-    // Build the filter order for the right side
+    // Build the filter order for the right side:
     let right_temp_sorted_filter_expr = build_filter_input_order(
         JoinSide::Right,
         filter,
-        &right.schema(),
+        right_schema,
         &right_sort_exprs[0],
-    )?
-    .ok_or_else(err)?;
+        right_equivalence_properties,
+        right_ordering_equivalence_properties,
+    )?;
 
-    // Collect the sorted expressions
-    let mut sorted_exprs =
-        vec![left_temp_sorted_filter_expr, right_temp_sorted_filter_expr];
-
-    // Build the expression interval graph
-    let mut graph =
-        ExprIntervalGraph::try_new(filter.expression().clone(), filter.schema())?;
-
-    // Update sorted expressions with node indices
-    update_sorted_exprs_with_node_indices(&mut graph, &mut sorted_exprs);
-
-    // Swap and remove to get the final sorted filter expressions
-    let right_sorted_filter_expr = sorted_exprs.swap_remove(1);
-    let left_sorted_filter_expr = sorted_exprs.swap_remove(0);
-
-    Ok((left_sorted_filter_expr, right_sorted_filter_expr, graph))
+    if !left_temp_sorted_filter_expr.is_empty()
+        && !right_temp_sorted_filter_expr.is_empty()
+    {
+        // Collect the sorted expressions:
+        let left_side_len = left_temp_sorted_filter_expr.len();
+        let mut sorted_exprs = left_temp_sorted_filter_expr;
+        sorted_exprs.extend(right_temp_sorted_filter_expr);
+        // Build the expression interval graph:
+        let mut graph = ExprIntervalGraph::try_new(filter.expression().clone())?;
+        // Update sorted expressions with node indices:
+        update_sorted_exprs_with_node_indices(&mut graph, &mut sorted_exprs);
+        // Swap and remove to get the final sorted filter expressions:
+        let left_sorted_filter_exprs =
+            sorted_exprs.drain(..left_side_len).collect::<Vec<_>>();
+        let right_sorted_filter_exprs = sorted_exprs;
+        Ok(Some((
+            left_sorted_filter_exprs,
+            right_sorted_filter_exprs,
+            graph,
+        )))
+    } else {
+        Ok(None)
+    }
 }
 
 /// The `handle_state` macro is designed to process the result of a state-changing
@@ -4283,4 +4431,185 @@ mod prunability_tests {
 
         Ok(())
     }
+}
+
+/// Calculates the prune length for a join operation using the provided probe batch.
+///
+/// This function determines the prune length for a join operation based on the provided filter,
+/// expression interval graph, build side buffer, and sorted filter expressions for both the build
+/// and probe sides. The prune length indicates the number of rows that can be safely removed
+/// during the join operation.
+///
+/// The function first checks if the build side buffer is empty and returns early if it is.
+/// It then processes the sorted filter expressions for both sides, updates the expression interval
+/// graph with the join filter intervals, and retrieves a representation of the build side based on
+/// the join filter. Finally, it determines the prune length based on the deepest pruning expressions
+/// and the intermediate representation of the build side.
+///
+/// # Arguments
+///
+/// * `filter` - The join filter used for the join operation.
+/// * `graph` - A mutable reference to the expression interval graph.
+/// * `build_side_buffer` - The record batch for the build side of the join.
+/// * `build_side_sorted_filter_exprs` - A mutable slice of sorted filter expressions for the build side.
+/// * `probe_side_sorted_filter_exprs` - A mutable slice of sorted filter expressions for the probe side.
+/// * `build_side` - Specifies which side (left or right) is the build side for the join.
+///
+/// # Returns
+///
+/// * A `Result` containing the calculated prune length. The prune length indicates the number of rows
+///   that can be safely removed during the join operation.
+///
+/// # Errors
+///
+/// This function can return an error if there are issues during the calculation process, such as
+/// inconsistencies in the provided data or problems updating the expression interval graph.
+///
+pub(crate) fn calculate_prune_length_with_probe_batch_helper(
+    filter: &JoinFilter,
+    graph: &mut ExprIntervalGraph,
+    build_side_buffer: &RecordBatch,
+    build_side_sorted_filter_exprs: &mut [SortedFilterExpr],
+    probe_side_sorted_filter_exprs: &mut [SortedFilterExpr],
+    build_side: JoinSide,
+) -> Result<usize> {
+    // Return early if the input buffer is empty:
+    if build_side_buffer.num_rows() == 0 {
+        return Ok(0);
+    }
+    // Process build and probe side sorted filter expressions if both are present.
+    // Collect the sorted filter expressions into a vector of (node index, interval) tuples:
+    let mut filter_intervals = build_side_sorted_filter_exprs
+        .iter()
+        .chain(probe_side_sorted_filter_exprs.iter())
+        .map(|expr| (expr.node_index(), expr.interval().clone()))
+        .collect::<Vec<_>>();
+
+    // Update the physical expression graph using the join filter intervals:
+    graph.update_ranges(&mut filter_intervals)?;
+
+    let intermediate_batch = get_filter_representation_of_build_side(
+        filter.schema(),
+        build_side_buffer,
+        filter.column_indices(),
+        build_side,
+    )?;
+
+    // Shrunk filter expressions
+    let shrunk_exprs = graph.get_deepest_pruning_exprs()?;
+    // Get only build side filter expressions:
+    let build_shrunk_exprs = get_build_side_pruned_exprs(
+        shrunk_exprs,
+        intermediate_batch.schema(),
+        filter,
+        build_side,
+    )?;
+
+    determine_prune_length(&intermediate_batch, build_shrunk_exprs)
+}
+
+/// Extracts and transforms the build side pruned expressions from the given set of shrunk expressions.
+///
+/// This function filters the provided shrunk expressions to retain only those that belong to the build side
+/// of the join operation. It then transforms these expressions to align with the intermediate schema,
+/// ensuring that the columns in the expressions match the columns in the intermediate schema.
+///
+/// # Arguments
+///
+/// * `shrunk_exprs` - A vector of shrunk expressions, each paired with an interval.
+/// * `intermediate_schema` - A reference to the schema of the intermediate representation of the build side.
+/// * `filter` - The join filter used for the join operation.
+/// * `build_side` - Specifies which side (left or right) is the build side for the join.
+///
+/// # Returns
+///
+/// * A `Result` containing a vector of transformed build side pruned expressions, each paired with an interval.
+///
+/// # Errors
+///
+/// This function can return an error if there are issues during the transformation process, such as
+/// inconsistencies in the provided data or problems matching columns with the intermediate schema.
+///
+pub(crate) fn get_build_side_pruned_exprs(
+    shrunk_exprs: Vec<(PhysicalSortExpr, Interval)>,
+    intermediate_schema: SchemaRef,
+    filter: &JoinFilter,
+    build_side: JoinSide,
+) -> Result<Vec<(PhysicalSortExpr, Interval)>> {
+    let build_side_it = shrunk_exprs
+        .into_iter()
+        // Get only build side filter expressions:
+        .filter(|(sort_expr, _)| {
+            let columns_in_expr = collect_columns(&sort_expr.expr);
+            // Check columns belong to the build side:
+            columns_in_expr
+                .iter()
+                .map(|col| {
+                    let index_in_filter_schema = col.index();
+                    filter.column_indices()[index_in_filter_schema].side
+                })
+                .all(|side| side.eq(&build_side))
+        });
+    let mut result = Vec::new();
+    for (mut sort_expr, interval) in build_side_it {
+        sort_expr.expr = sort_expr.expr.transform_up(&|expr| {
+            if let Some(col) = expr.as_any().downcast_ref::<Column>() {
+                let intermediate_expr =
+                    Arc::new(Column::new_with_schema(col.name(), &intermediate_schema)?)
+                        as _;
+                Ok(Transformed::Yes(intermediate_expr))
+            } else {
+                Ok(Transformed::No(expr))
+            }
+        })?;
+        result.push((sort_expr, interval))
+    }
+    Ok(result)
+}
+
+/// Determine the pruning length for `buffer`.
+///
+/// This function evaluates the build side filter expression, converts the
+/// result into an array and determines the pruning length by performing a
+/// binary search on the array.
+///
+/// # Arguments
+///
+/// * `buffer`: The record batch to be pruned.
+/// * `build_side_filter_expr`: The filter expression on the build side used
+/// to determine the pruning length.
+///
+/// # Returns
+///
+/// A [`Result`] object that contains the pruning length. The function will return
+/// an error if there is an issue evaluating the build side filter expression.
+fn determine_prune_length(
+    buffer: &RecordBatch,
+    build_shrunk_exprs: Vec<(PhysicalSortExpr, Interval)>,
+) -> Result<usize> {
+    let prune_lengths = build_shrunk_exprs
+        .into_iter()
+        .map(|(sort_expr, interval)| {
+            let options = sort_expr.options;
+
+            // Get the lower or upper interval based on the sort direction:
+            let target = if options.descending {
+                interval.upper.value
+            } else {
+                interval.lower.value
+            }
+            .clone();
+
+            // Evaluate the build side filter expression and convert it into an array:
+            let batch_arr = sort_expr
+                .expr
+                .evaluate(buffer)?
+                .into_array(buffer.num_rows());
+
+            // Perform binary search on the array to determine the length of
+            // the record batch to prune:
+            bisect::<true>(&[batch_arr], &[target], &[options])
+        })
+        .collect::<Result<Vec<usize>>>()?;
+    Ok(prune_lengths.into_iter().min().unwrap_or(0))
 }

@@ -877,9 +877,7 @@ mod tests {
                 expr.as_any().downcast_ref::<BinaryExpr>(),
                 expr.as_any().downcast_ref::<Column>(),
             ) {
-                (Some(literal), _, _) => {
-                    Some(literal.value().get_datatype().is_floating())
-                }
+                (Some(literal), _, _) => Some(literal.value().data_type().is_floating()),
                 (_, Some(binary), _) => self.contains_float_value(binary),
                 (_, _, Some(column)) => self
                     .column_types
@@ -1068,15 +1066,14 @@ mod tests {
         } else if let Some(literal) = expr.as_any().downcast_ref::<Literal>() {
             // Literal signs are only considered in + or - operations.
             if matches!(op_info, OperatorInfo::Plus | OperatorInfo::Minus) {
-                let zero = &ScalarValue::new_zero(&literal.value().get_datatype())?;
+                let zero = &ScalarValue::new_zero(&literal.value().data_type())?;
                 match (op_info, literal.value().partial_cmp(zero)) {
                     (
                         OperatorInfo::Plus,
                         Some(Ordering::Greater) | Some(Ordering::Equal),
                     ) => positive_vec.push(Arc::new(literal.clone())),
                     (OperatorInfo::Plus, Some(Ordering::Less)) => {
-                        let zero =
-                            ScalarValue::new_zero(&literal.value().get_datatype())?;
+                        let zero = ScalarValue::new_zero(&literal.value().data_type())?;
                         let result = zero.sub(literal.value())?;
                         negative_vec.push(Arc::new(Literal::new(result)));
                     }
@@ -1084,8 +1081,7 @@ mod tests {
                         OperatorInfo::Minus,
                         Some(Ordering::Less) | Some(Ordering::Equal),
                     ) => {
-                        let zero =
-                            ScalarValue::new_zero(&literal.value().get_datatype())?;
+                        let zero = ScalarValue::new_zero(&literal.value().data_type())?;
                         let result = zero.sub(literal.value())?;
                         positive_vec.push(Arc::new(Literal::new(result)));
                     }

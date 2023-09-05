@@ -24,9 +24,12 @@ use std::sync::Arc;
 use super::utils::{
     convert_duration_type_to_interval, convert_interval_type_to_duration, get_inverse_op,
 };
+use super::IntervalBound;
 use crate::expressions::Literal;
+use crate::intervals::interval_aritmetic::{apply_operator, Interval};
+use crate::sort_properties::SortProperties;
 use crate::utils::{build_dag, ExprTreeNode};
-use crate::PhysicalExpr;
+use crate::{PhysicalExpr, PhysicalSortExpr};
 
 use arrow_schema::{DataType, Schema};
 use datafusion_common::{internal_err, DataFusionError, Result};
@@ -151,6 +154,8 @@ pub enum PropagationResult {
 pub struct ExprIntervalGraphNode {
     expr: Arc<dyn PhysicalExpr>,
     interval: Interval,
+    is_strict_subset: bool,
+    sort_properties: SortProperties,
 }
 
 impl Display for ExprIntervalGraphNode {
@@ -167,8 +172,17 @@ impl ExprIntervalGraphNode {
     }
 
     /// Constructs a new DAEG node with the given range.
-    pub fn new_with_interval(expr: Arc<dyn PhysicalExpr>, interval: Interval) -> Self {
-        ExprIntervalGraphNode { expr, interval }
+    pub fn new_with_interval(
+        expr: Arc<dyn PhysicalExpr>,
+        interval: Interval,
+        sort_option: SortProperties,
+    ) -> Self {
+        ExprIntervalGraphNode {
+            expr,
+            interval,
+            is_strict_subset: false,
+            sort_properties: sort_option,
+        }
     }
 
     /// Get the interval object representing the range of the expression.
@@ -448,6 +462,43 @@ impl ExprIntervalGraph {
             .retain_nodes(|_, index| connected_nodes.contains(&index));
         expr_node_indices
     }
+    /// Assigns sort information to nodes in the graph based on the provided sorted expressions.
+    ///
+    /// This function traverses the graph in a depth-first search post-order manner. For each node, it checks its neighbors
+    /// and gathers sort properties from them. If the current node is not a leaf (i.e., it has children), it determines the
+    /// ordering option based on its children's sort properties and updates its sort properties accordingly.
+    ///
+    /// If the current node is a leaf, the function searches for a matching expression in the provided `sorted_exprs` array
+    /// and updates the node's sort properties based on the found expression's options.
+    ///
+    /// # Parameters
+    ///
+    /// - `sorted_exprs`: A reference to an array of `PhysicalSortExpr` that provides sort information for leaf nodes.
+    ///
+    pub fn assign_sort_information(&mut self, sorted_exprs: &[PhysicalSortExpr]) {
+        let mut dfs = DfsPostOrder::new(&self.graph, self.root);
+        while let Some(node) = dfs.next(&self.graph) {
+            let neighbors = self.graph.neighbors_directed(node, Outgoing);
+            let mut children_sort_option = neighbors
+                .map(|child| self.graph[child].sort_properties)
+                .collect::<Vec<_>>();
+            // If the current expression is a leaf, its interval should already
+            // be set externally, just continue with the evaluation procedure:
+            if !children_sort_option.is_empty() {
+                // Reverse to align with PhysicalExpr's children:
+                children_sort_option.reverse();
+                let option = self.graph[node].expr.get_ordering(&children_sort_option);
+                self.graph[node].sort_properties = option;
+            } else {
+                // Get the plan corresponding to this node:
+                let expr = &self.graph[node].expr;
+                if let Some(value) = sorted_exprs.iter().find(|e| e.expr.eq(expr)) {
+                    // Update the node index of the associated `PhysicalExpr`:
+                    self.graph[node].sort_properties = value.options.into();
+                }
+            }
+        }
+    }
 
     /// Returns the set of node indices reachable from the root node via a
     /// simple depth-first search.
@@ -616,6 +667,78 @@ impl ExprIntervalGraph {
             }
         }
         Ok(PropagationResult::Success)
+    }
+
+    /// Updates intervals for all expressions in the DAEG by successive
+    /// bottom-up and top-down traversals.
+    pub fn update_ranges(
+        &mut self,
+        leaf_bounds: &mut [(usize, Interval)],
+    ) -> Result<PropagationResult> {
+        self.assign_intervals(leaf_bounds);
+        let bounds = self.evaluate_bounds()?;
+        if bounds == &Interval::CERTAINLY_FALSE {
+            Ok(PropagationResult::Infeasible)
+        } else if bounds == &Interval::UNCERTAIN {
+            let result = self.propagate_constraints();
+            self.update_intervals(leaf_bounds);
+            result
+        } else {
+            Ok(PropagationResult::CannotPropagate)
+        }
+    }
+
+    /// Returns the deepest pruning expressions from the graph.
+    ///
+    /// This function traverses the graph in a depth-first search post-order manner. For each node, it checks its neighbors
+    /// and gathers information about their sort properties and whether they are strict subsets. If the current node is a strict
+    /// subset and either has no children or has children that do not match certain criteria, the function considers it for
+    /// inclusion in the result.
+    ///
+    /// Specifically, if the sort properties of the current node are `Ordered`, the function clones its expression and interval
+    /// and adds them to the result vector.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` containing a vector of tuples. Each tuple consists of a `PhysicalSortExpr` and an `Interval`. The `PhysicalSortExpr`
+    /// is constructed from the expression and SortOptions of the current node, and the `Interval` is a clone of the interval of the current node
+    /// expected to be strict subset of the interval before propagation.
+    ///
+    pub fn get_deepest_pruning_exprs(
+        &mut self,
+    ) -> Result<Vec<(PhysicalSortExpr, Interval)>> {
+        let mut deepest_shrunk_exprs = vec![];
+        let mut dfs = DfsPostOrder::new(&self.graph, self.root);
+        while let Some(node) = dfs.next(&self.graph) {
+            let neighbors = self.graph.neighbors_directed(node, Outgoing);
+            let children_info = neighbors
+                .map(|child| {
+                    (
+                        self.graph[child].sort_properties,
+                        self.graph[child].is_strict_subset,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let current_node = &mut self.graph[node];
+            if current_node.is_strict_subset
+                && (children_info.is_empty()
+                    || children_info.iter().any(
+                        |(child_sort_properties, child_is_strict_subset)| {
+                            !*child_is_strict_subset
+                                && !child_sort_properties.eq(&SortProperties::Singleton)
+                        },
+                    ))
+            {
+                if let SortProperties::Ordered(options) = current_node.sort_properties {
+                    let expr = current_node.expr.clone();
+                    deepest_shrunk_exprs.push((
+                        PhysicalSortExpr { expr, options },
+                        current_node.interval.clone(),
+                    ))
+                };
+            }
+        }
+        Ok(deepest_shrunk_exprs)
     }
 
     /// Returns the interval associated with the node at the given `index`.
