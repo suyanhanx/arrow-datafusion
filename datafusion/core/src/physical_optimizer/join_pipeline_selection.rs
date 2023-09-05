@@ -4,8 +4,7 @@
 use crate::physical_optimizer::join_selection::{
     swap_join_type, swap_reverting_projection,
 };
-use crate::physical_optimizer::sort_enforcement::unbounded_output;
-use crate::physical_optimizer::utils::is_hash_join;
+use crate::physical_optimizer::utils::{is_hash_join, unbounded_output};
 use crate::physical_plan::joins::{HashJoinExec, SortMergeJoinExec};
 use crate::physical_plan::projection::ProjectionExec;
 use crate::physical_plan::sorts::sort::SortExec;
@@ -637,9 +636,9 @@ pub fn finalize_order_preserving_joins_at_root(
 mod order_preserving_join_swap_tests {
     use std::sync::Arc;
 
+    use crate::physical_optimizer::enforce_sorting::EnforceSorting;
     use crate::physical_optimizer::global_order_require::GlobalOrderRequire;
     use crate::physical_optimizer::join_selection::JoinSelection;
-    use crate::physical_optimizer::sort_enforcement::EnforceSorting;
     use crate::physical_optimizer::test_utils::{
         memory_exec_with_sort, sort_expr_options,
     };

@@ -32,13 +32,16 @@ use arrow_array::{ArrowPrimitiveType, NativeAdapter, PrimitiveArray, RecordBatch
 use arrow_buffer::{ArrowNativeType, BooleanBufferBuilder};
 use arrow_schema::{Schema, SchemaRef};
 use async_trait::async_trait;
+use arrow_schema::SortOptions;
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{DataFusionError, JoinSide, Result, ScalarValue};
 use datafusion_execution::SendableRecordBatchStream;
 use datafusion_expr::interval_arithmetic::Interval;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::utils::collect_columns;
-use datafusion_physical_expr::{PhysicalExpr, PhysicalSortExpr};
+use datafusion_physical_expr::{
+    EquivalenceProperties, OrderingEquivalenceProperties, PhysicalExpr, PhysicalSortExpr,
+};
 
 use futures::{ready, FutureExt, StreamExt};
 use hashbrown::raw::RawTable;
@@ -249,15 +252,21 @@ pub fn map_origin_col_to_filter_col(
 /// data pruning purposes.
 ///
 /// The method works as follows:
-/// 1. Maps the original columns to the filter columns using the [`map_origin_col_to_filter_col`] function.
-/// 2. Collects all columns in the sort expression using the [`collect_columns`] function.
-/// 3. Checks if all columns are included in the map we obtain in the first step.
-/// 4. If all columns are included, the sort expression is converted into a filter expression using
-///    the [`convert_filter_columns`] function.
-/// 5. Searches for the converted filter expression in the filter expression using the
-///    [`check_filter_expr_contains_sort_information`] function.
-/// 6. If an exact match is found, returns the converted filter expression as [`Some(Arc<dyn PhysicalExpr>)`].
-/// 7. If all columns are not included or an exact match is not found, returns [`None`].
+/// 1. Collect all globally ordered (the first expression in lexical ordering) expressions with
+/// [`EquivalenceProperties`] and [`OrderingEquivalenceProperties`]
+/// 2. Maps the original columns to the filter columns using the [`map_origin_col_to_filter_col`] function.
+/// 3. Constructs an intermediate schema from the filter columns included in the particular join side.
+/// For each [`PhysicalSortExpr`]
+///     1. Collects all columns in the sort expression using the [`collect_columns`] function.
+///     2. Checks if all columns are included in the map we obtain in the first step.
+///     3. If all columns are included, the sort expression is converted into a filter expression using
+///        the [`convert_filter_columns`] function.
+///     4. Searches for the converted filter expression in the filter expression using the
+///        [`check_filter_expr_contains_sort_information`] function.
+///     5. If an exact match is found,
+///         a. Convert the ordering into both filter schema and and intermediate schema columns.
+///         b. Returns the converted filter expressions as [`SortedFilterExpr`]
+///     6. If all columns are not included or an exact match is not found, returns [`None`].
 ///
 /// Examples:
 /// Consider the filter expression "a + b > c + 10 AND a + b < c + 100".
@@ -265,63 +274,99 @@ pub fn map_origin_col_to_filter_col(
 /// 2. If the expression "d@" is sorted, it will not be accepted since the "d@" column is not part of the filter.
 /// 3. If the expression "a@ + b@ + c@" is sorted, all columns are represented in the filter expression. However,
 ///    there is no exact match, so this expression does not indicate pruning.
-pub fn convert_sort_expr_with_filter_schema(
-    side: &JoinSide,
-    filter: &JoinFilter,
-    schema: &SchemaRef,
-    sort_expr: &PhysicalSortExpr,
-) -> Result<Option<Arc<dyn PhysicalExpr>>> {
-    let column_map = map_origin_col_to_filter_col(filter, schema, side)?;
-    let expr = sort_expr.expr.clone();
-    // Get main schema columns:
-    let expr_columns = collect_columns(&expr);
-    // Calculation is possible with `column_map` since sort exprs belong to a child.
-    let all_columns_are_included =
-        expr_columns.iter().all(|col| column_map.contains_key(col));
-    if all_columns_are_included {
-        // Since we are sure that one to one column mapping includes all columns, we convert
-        // the sort expression into a filter expression.
-        let converted_filter_expr = expr.transform_up(&|p| {
-            convert_filter_columns(p.as_ref(), &column_map).map(|transformed| {
-                match transformed {
-                    Some(transformed) => Transformed::Yes(transformed),
-                    None => Transformed::No(p),
-                }
-            })
-        })?;
-        // Search the converted `PhysicalExpr` in filter expression; if an exact
-        // match is found, use this sorted expression in graph traversals.
-        if check_filter_expr_contains_sort_information(
-            filter.expression(),
-            &converted_filter_expr,
-        ) {
-            return Ok(Some(converted_filter_expr));
-        }
-    }
-    Ok(None)
-}
-
-/// This function is used to build the filter expression based on the sort order of input columns.
-///
-/// It first calls the [`convert_sort_expr_with_filter_schema`] method to determine if the sort
-/// order of columns can be used in the filter expression. If it returns a [`Some`] value, the
-/// method wraps the result in a [`SortedFilterExpr`] instance with the original sort expression and
-/// the converted filter expression. Otherwise, this function returns an error.
-///
-/// The `SortedFilterExpr` instance contains information about the sort order of columns that can
-/// be used in the filter expression, which can be used to optimize the query execution process.
 pub fn build_filter_input_order(
     side: JoinSide,
     filter: &JoinFilter,
     schema: &SchemaRef,
-    order: &PhysicalSortExpr,
-) -> Result<Option<SortedFilterExpr>> {
-    let opt_expr = convert_sort_expr_with_filter_schema(&side, filter, schema, order)?;
-    opt_expr
-        .map(|filter_expr| {
-            SortedFilterExpr::try_new(order.clone(), filter_expr, filter.schema())
+    sort_expr: &PhysicalSortExpr,
+    equivalence_properties: &EquivalenceProperties,
+    ordering_equivalence_properties: &OrderingEquivalenceProperties,
+) -> Result<Vec<SortedFilterExpr>> {
+    let mut additional_sort_exprs: HashSet<PhysicalSortExpr> = HashSet::new();
+    additional_sort_exprs.insert(sort_expr.clone());
+    for class in ordering_equivalence_properties.classes() {
+        for ordering in class.iter() {
+            additional_sort_exprs.insert(ordering[0].clone());
+        }
+    }
+    let mut temp_sort_exprs = vec![];
+    for global_sort in &additional_sort_exprs {
+        if let Some(col) = global_sort.expr.as_any().downcast_ref::<Column>() {
+            for class in equivalence_properties.classes() {
+                if class.contains(col) {
+                    let sort_exprs = class.iter().map(|col| PhysicalSortExpr {
+                        expr: Arc::new(col.clone()),
+                        options: global_sort.options,
+                    });
+                    temp_sort_exprs.extend(sort_exprs)
+                }
+            }
+        }
+    }
+
+    additional_sort_exprs.extend(temp_sort_exprs);
+    let column_map = map_origin_col_to_filter_col(filter, schema, &side)?;
+    let intermediate_schema = get_filter_representation_schema_of_build_side(
+        filter.schema(),
+        filter.column_indices(),
+        side,
+    )?;
+    let sorted_filter_exprs = additional_sort_exprs
+        .into_iter()
+        .map(|sort_expr| {
+            let expr = sort_expr.expr.clone();
+            // Get main schema columns:
+            let expr_columns = collect_columns(&expr);
+            // Calculation is possible with `column_map` since sort exprs belong to a child.
+            let all_columns_are_included =
+                expr_columns.iter().all(|col| column_map.contains_key(col));
+            if all_columns_are_included {
+                // Since we are sure that one to one column mapping includes all columns, we convert
+                // the sort expression into a filter expression.
+                let converted_filter_expr = expr.transform_up(&|p| {
+                    convert_filter_columns(p.as_ref(), &column_map).map(|transformed| {
+                        match transformed {
+                            Some(transformed) => Transformed::Yes(transformed),
+                            None => Transformed::No(p),
+                        }
+                    })
+                })?;
+                // Search the converted `PhysicalExpr` in filter expression; if an exact
+                // match is found, use this sorted expression in graph traversals.
+                if check_filter_expr_contains_sort_information(
+                    filter.expression(),
+                    &converted_filter_expr,
+                ) {
+                    let build_side_intermediate_expr =
+                        converted_filter_expr.clone().transform_up(&|expr| {
+                            if let Some(col) = expr.as_any().downcast_ref::<Column>() {
+                                let intermediate_expr = Arc::new(Column::new_with_schema(
+                                    col.name(),
+                                    &intermediate_schema,
+                                )?)
+                                    as _;
+                                Ok(Transformed::Yes(intermediate_expr))
+                            } else {
+                                Ok(Transformed::No(expr))
+                            }
+                        })?;
+                    return Ok(Some(SortedFilterExpr::new(
+                        PhysicalSortExpr {
+                            expr: converted_filter_expr.clone(),
+                            options: sort_expr.options,
+                        },
+                        build_side_intermediate_expr,
+                    )));
+                }
+            }
+            Ok(None)
         })
-        .transpose()
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+
+    Ok(sorted_filter_exprs)
 }
 
 /// Convert a physical expression into a filter expression using the given
@@ -340,22 +385,49 @@ fn convert_filter_columns(
     })
 }
 
-/// The [SortedFilterExpr] object represents a sorted filter expression. It
-/// contains the following information: The origin expression, the filter
-/// expression, an interval encapsulating expression bounds, and a stable
-/// index identifying the expression in the expression DAG.
+impl Display for SortedFilterExpr {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(
+            f,
+            "filter_expr: {}, int_filter_expr: {}, interval: {}",
+            self.filter_expr, self.intermediate_batch_filter_expr, self.interval
+        )
+    }
+}
+
+/// Represents an ordered expression within a filter expression.
 ///
-/// Physical schema of a [JoinFilter]'s intermediate batch combines two sides
-/// and uses new column names. In this process, a column exchange is done so
-/// we can utilize sorting information while traversing the filter expression
-/// DAG for interval calculations. When evaluating the inner buffer, we use
-/// `origin_sorted_expr`.
+/// `SortedFilterExpr` is used to manage details related to ordered expressions
+/// within filter expressions during a join operation. It consists of four main
+/// components:
+///
+/// 1. `filter_expr`: Represents the ordered expression within the filter. This is
+///    represented as a `PhysicalSortExpr` which specifies the column and the corresponding
+///    column index that are part of the expression, as well as any options associated with sorting.
+/// 2. `intermediate_batch_filter_expr`: This is an intermediate representation of the build-side
+///    expression that is derived from the original filter expression. The build-side expression
+///    is the version of the expression that is used to evaluate intermediate batches of data during
+///    the join operation. It specifies the column and the corresponding column index within
+///    the intermediate batch.
+/// 3. `interval`: This stores the interval associated with the filter expression.
+/// 4. `node_index`: This stores the node index of the filter expression within the `ExprIntervalGraph`.
+///
+/// It is important to note that the column index in `filter_expr` is based on the original
+/// schema, while the column index in `intermediate_batch_filter_expr` is based on the intermediate
+/// batch schema, which can differ from the original schema. The intermediate batch is created
+/// during the join operation, containing columns only from one side of the join. As a result,
+/// the column indexes in the intermediate batch may differ from those in the original schema.
+///
+/// This distinction is crucial because it ensures that the correct columns are referenced during
+/// the join operation, and that the intermediate batch correctly reflects the structure of the
+/// data at that stage of the join process.
 #[derive(Debug, Clone)]
 pub struct SortedFilterExpr {
-    /// Sorted expression from a join side (i.e. a child of the join)
-    origin_sorted_expr: PhysicalSortExpr,
-    /// Expression adjusted for filter schema.
-    filter_expr: Arc<dyn PhysicalExpr>,
+    /// Ordered filter expression
+    filter_expr: PhysicalSortExpr,
+    /// Expression adjusted for filter schema projected by build side.
+    /// Only the column indexes are changed.
+    intermediate_batch_filter_expr: Arc<dyn PhysicalExpr>,
     /// Interval containing expression bounds
     interval: Interval,
     /// Node index in the expression DAG
@@ -364,25 +436,29 @@ pub struct SortedFilterExpr {
 
 impl SortedFilterExpr {
     /// Constructor
-    pub fn try_new(
-        origin_sorted_expr: PhysicalSortExpr,
-        filter_expr: Arc<dyn PhysicalExpr>,
-        filter_schema: &Schema,
-    ) -> Result<Self> {
-        let dt = &filter_expr.data_type(filter_schema)?;
-        Ok(Self {
-            origin_sorted_expr,
+    pub fn new(
+        filter_expr: PhysicalSortExpr,
+        intermediate_batch_filter_expr: Arc<dyn PhysicalExpr>,
+    ) -> Self {
+        Self {
             filter_expr,
-            interval: Interval::make_unbounded(dt)?,
+            intermediate_batch_filter_expr,
+            interval: Interval::default(),
             node_index: 0,
         })
     }
-    /// Get origin expr information
-    pub fn origin_sorted_expr(&self) -> &PhysicalSortExpr {
-        &self.origin_sorted_expr
+    /// Get intermediate_batch_filter_expr
+    pub fn intermediate_batch_filter_expr(&self) -> Arc<dyn PhysicalExpr> {
+        self.intermediate_batch_filter_expr.clone()
     }
+
+    /// Get intermediate_batch_filter_expr
+    pub fn order(&self) -> SortOptions {
+        self.filter_expr.options
+    }
+
     /// Get filter expr information
-    pub fn filter_expr(&self) -> &Arc<dyn PhysicalExpr> {
+    pub fn filter_expr(&self) -> &PhysicalSortExpr {
         &self.filter_expr
     }
     /// Get interval information
@@ -411,10 +487,10 @@ impl SortedFilterExpr {
 ///
 /// # Arguments
 ///
-/// * `build_input_buffer` - The [RecordBatch] on the build side of the join.
-/// * `build_sorted_filter_expr` - Build side [SortedFilterExpr] to update.
+/// * `build_input_buffer` - The [`RecordBatch`] on the build side of the join.
+/// * `build_sorted_filter_exprs` - Build side [`SortedFilterExpr`] to update.
 /// * `probe_batch` - The `RecordBatch` on the probe side of the join.
-/// * `probe_sorted_filter_expr` - Probe side `SortedFilterExpr` to update.
+/// * `probe_sorted_filter_exprs` - Probe side `SortedFilterExpr` to update.
 ///
 /// ### Note
 /// ```text
@@ -464,25 +540,33 @@ impl SortedFilterExpr {
 /// traversing the expression graph.
 /// ```
 pub fn calculate_filter_expr_intervals(
+    filter: &JoinFilter,
     build_input_buffer: &RecordBatch,
-    build_sorted_filter_expr: &mut SortedFilterExpr,
+    build_sorted_filter_exprs: &mut [SortedFilterExpr],
     probe_batch: &RecordBatch,
-    probe_sorted_filter_expr: &mut SortedFilterExpr,
+    probe_sorted_filter_exprs: &mut [SortedFilterExpr],
+    build_side: JoinSide,
 ) -> Result<()> {
     // If either build or probe side has no data, return early:
     if build_input_buffer.num_rows() == 0 || probe_batch.num_rows() == 0 {
         return Ok(());
     }
-    // Calculate the interval for the build side filter expression (if present):
-    update_filter_expr_interval(
+    let build_intermediate_batch = get_filter_representation_of_build_side(
+        filter.schema(),
         &build_input_buffer.slice(0, 1),
-        build_sorted_filter_expr,
+        filter.column_indices(),
+        build_side,
+    )?;
+    // Calculate the interval for the build side filter expression (if present):
+    update_filter_expr_interval(&build_intermediate_batch, build_sorted_filter_exprs)?;
+    let probe_intermediate_batch = get_filter_representation_of_build_side(
+        filter.schema(),
+        &probe_batch.slice(probe_batch.num_rows() - 1, 1),
+        filter.column_indices(),
+        build_side.negate(),
     )?;
     // Calculate the interval for the probe side filter expression (if present):
-    update_filter_expr_interval(
-        &probe_batch.slice(probe_batch.num_rows() - 1, 1),
-        probe_sorted_filter_expr,
-    )
+    update_filter_expr_interval(&probe_intermediate_batch, probe_sorted_filter_exprs)
 }
 
 /// This is a subroutine of the function [`calculate_filter_expr_intervals`].
@@ -490,27 +574,28 @@ pub fn calculate_filter_expr_intervals(
 /// the filter expression (i.e. `sorted_expr`) with this interval.
 pub fn update_filter_expr_interval(
     batch: &RecordBatch,
-    sorted_expr: &mut SortedFilterExpr,
+    sorted_exprs: &mut [SortedFilterExpr],
 ) -> Result<()> {
-    // Evaluate the filter expression and convert the result to an array:
-    let array = sorted_expr
-        .origin_sorted_expr()
-        .expr
-        .evaluate(batch)?
-        .into_array(1)?;
-    // Convert the array to a ScalarValue:
-    let value = ScalarValue::try_from_array(&array, 0)?;
-    // Create a ScalarValue representing positive or negative infinity for the same data type:
-    let inf = ScalarValue::try_from(value.data_type())?;
-    // Update the interval with lower and upper bounds based on the sort option:
-    let interval = if sorted_expr.origin_sorted_expr().options.descending {
-        Interval::try_new(inf, value)?
-    } else {
-        Interval::try_new(value, inf)?
-    };
-    // Set the calculated interval for the sorted filter expression:
-    sorted_expr.set_interval(interval);
-    Ok(())
+    sorted_exprs.iter_mut().try_for_each(|sorted_expr| {
+        // Evaluate the filter expression and convert the result to an array:
+        let array = sorted_expr
+            .intermediate_batch_filter_expr()
+            .evaluate(batch)?
+            .into_array(1);
+        // Convert the array to a ScalarValue:
+        let value = ScalarValue::try_from_array(&array, 0)?;
+        // Create a ScalarValue representing positive or negative infinity for the same data type:
+        let unbounded = IntervalBound::make_unbounded(value.data_type())?;
+        // Update the interval with lower and upper bounds based on the sort option:
+        let interval = if sorted_expr.order().descending {
+            Interval::new(unbounded, IntervalBound::new(value, false))
+        } else {
+            Interval::new(IntervalBound::new(value, false), unbounded)
+        };
+        // Set the calculated interval for the sorted filter expression:
+        sorted_expr.set_interval(interval);
+        Ok(())
+    })
 }
 
 /// Get the anti join indices from the visited hash set.
@@ -1165,6 +1250,152 @@ pub mod tests {
         binary(left_expr, Operator::And, right_expr, filter_schema)
     }
 
+    pub(crate) fn complicated_4_column_exprs(
+        expr_id: usize,
+        filter_schema: &Schema,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        let columns = filter_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(index, field)| Column::new(field.name(), index))
+            .map(Arc::new)
+            .collect::<Vec<_>>();
+        match expr_id {
+            // Filter expr for a + b > d + 10 AND a < c + 20
+            0 => {
+                let left_expr = binary(
+                    cast(
+                        binary(
+                            columns[0].clone(),
+                            Operator::Plus,
+                            columns[1].clone(),
+                            filter_schema,
+                        )?,
+                        filter_schema,
+                        DataType::Int64,
+                    )?,
+                    Operator::Gt,
+                    binary(
+                        cast(columns[3].clone(), filter_schema, DataType::Int64)?,
+                        Operator::Plus,
+                        lit(ScalarValue::Int64(Some(10))),
+                        filter_schema,
+                    )?,
+                    filter_schema,
+                )?;
+
+                let right_expr = binary(
+                    cast(columns[0].clone(), filter_schema, DataType::Int64)?,
+                    Operator::Lt,
+                    binary(
+                        cast(columns[2].clone(), filter_schema, DataType::Int64)?,
+                        Operator::Plus,
+                        lit(ScalarValue::Int64(Some(20))),
+                        filter_schema,
+                    )?,
+                    filter_schema,
+                )?;
+                binary(left_expr, Operator::And, right_expr, filter_schema)
+            }
+            // Filter expr for a + b > d + 10 AND a < c + 20 AND c > b
+            1 => {
+                let left_expr = binary(
+                    cast(
+                        binary(
+                            columns[0].clone(),
+                            Operator::Plus,
+                            columns[1].clone(),
+                            filter_schema,
+                        )?,
+                        filter_schema,
+                        DataType::Int64,
+                    )?,
+                    Operator::Gt,
+                    binary(
+                        cast(columns[3].clone(), filter_schema, DataType::Int64)?,
+                        Operator::Plus,
+                        lit(ScalarValue::Int64(Some(10))),
+                        filter_schema,
+                    )?,
+                    filter_schema,
+                )?;
+
+                let right_expr = binary(
+                    cast(columns[0].clone(), filter_schema, DataType::Int64)?,
+                    Operator::Lt,
+                    binary(
+                        cast(columns[2].clone(), filter_schema, DataType::Int64)?,
+                        Operator::Plus,
+                        lit(ScalarValue::Int64(Some(20))),
+                        filter_schema,
+                    )?,
+                    filter_schema,
+                )?;
+                let left_and =
+                    binary(left_expr, Operator::And, right_expr, filter_schema)?;
+                let right_and = binary(
+                    cast(columns[2].clone(), filter_schema, DataType::Int64)?,
+                    Operator::GtEq,
+                    binary(
+                        cast(columns[1].clone(), filter_schema, DataType::Int64)?,
+                        Operator::Plus,
+                        lit(ScalarValue::Int64(Some(20))),
+                        filter_schema,
+                    )?,
+                    filter_schema,
+                )?;
+                binary(left_and, Operator::And, right_and, filter_schema)
+            }
+            // a + b > c + 10 AND a + b < c + 100
+            2 => {
+                let left_expr = binary(
+                    cast(
+                        binary(
+                            columns[0].clone(),
+                            Operator::Plus,
+                            columns[1].clone(),
+                            filter_schema,
+                        )?,
+                        filter_schema,
+                        DataType::Int64,
+                    )?,
+                    Operator::Gt,
+                    binary(
+                        cast(columns[2].clone(), filter_schema, DataType::Int64)?,
+                        Operator::Plus,
+                        lit(ScalarValue::Int64(Some(10))),
+                        filter_schema,
+                    )?,
+                    filter_schema,
+                )?;
+
+                let right_expr = binary(
+                    cast(
+                        binary(
+                            columns[0].clone(),
+                            Operator::Plus,
+                            columns[1].clone(),
+                            filter_schema,
+                        )?,
+                        filter_schema,
+                        DataType::Int64,
+                    )?,
+                    Operator::Lt,
+                    binary(
+                        cast(columns[2].clone(), filter_schema, DataType::Int64)?,
+                        Operator::Plus,
+                        lit(ScalarValue::Int64(Some(100))),
+                        filter_schema,
+                    )?,
+                    filter_schema,
+                )?;
+                binary(left_expr, Operator::And, right_expr, filter_schema)
+            }
+            _ => unimplemented!(),
+        }
+    }
+
     #[test]
     fn test_column_exchange() -> Result<()> {
         let left_child_schema =
@@ -1195,14 +1426,24 @@ pub mod tests {
             Field::new("filter_2", DataType::Int32, true),
             Field::new("filter_3", DataType::Int32, true),
         ]);
+
         // Our filter expression is: left_1 > right_1 + right_2.
         let filter_left = col("filter_1", &intermediate_schema)?;
+        // We are expecting the filter schema represented order at the and.
+        let left_child_filter_sort_expr = PhysicalSortExpr {
+            expr: filter_left.clone(),
+            options: SortOptions::default(),
+        };
         let filter_right = binary(
             col("filter_2", &intermediate_schema)?,
             Operator::Plus,
             col("filter_3", &intermediate_schema)?,
             &intermediate_schema,
         )?;
+        let right_child_filter_sort_expr = PhysicalSortExpr {
+            expr: filter_right.clone(),
+            options: SortOptions::default(),
+        };
         let filter_expr = binary(
             filter_left.clone(),
             Operator::Gt,
@@ -1225,28 +1466,28 @@ pub mod tests {
         ];
         let filter = JoinFilter::new(filter_expr, column_indices, intermediate_schema);
 
-        let left_sort_filter_expr = build_filter_input_order(
+        let empty_eq = EquivalenceProperties::new(Arc::new(Schema::empty()));
+        let empty_order_eq = EquivalenceProperties::new(Arc::new(Schema::empty()));
+        let left_sort_filter_exprs = build_filter_input_order(
             JoinSide::Left,
             &filter,
             &Arc::new(left_child_schema),
             &left_child_sort_expr,
-        )?
-        .unwrap();
-        assert!(left_child_sort_expr.eq(left_sort_filter_expr.origin_sorted_expr()));
+            &empty_eq,
+            &empty_order_eq,
+        )?;
 
-        let right_sort_filter_expr = build_filter_input_order(
+        assert!(left_child_filter_sort_expr.eq(left_sort_filter_exprs[0].filter_expr()));
+
+        let right_sort_filter_exprs = build_filter_input_order(
             JoinSide::Right,
             &filter,
             &Arc::new(right_child_schema),
             &right_child_sort_expr,
-        )?
-        .unwrap();
-        assert!(right_child_sort_expr.eq(right_sort_filter_expr.origin_sorted_expr()));
-
-        // Assert that adjusted (left) filter expression matches with `left_child_sort_expr`:
-        assert!(filter_left.eq(left_sort_filter_expr.filter_expr()));
-        // Assert that adjusted (right) filter expression matches with `right_child_sort_expr`:
-        assert!(filter_right.eq(right_sort_filter_expr.filter_expr()));
+            &empty_eq,
+            &empty_order_eq,
+        )?;
+        assert!(right_child_filter_sort_expr.eq(right_sort_filter_exprs[0].filter_expr()));
         Ok(())
     }
 
@@ -1338,15 +1579,15 @@ pub mod tests {
         let filter_expr = complicated_filter(&intermediate_schema)?;
         let column_indices = vec![
             ColumnIndex {
-                index: 0,
+                index: left_schema.index_of("la1").unwrap(),
                 side: JoinSide::Left,
             },
             ColumnIndex {
-                index: 4,
+                index: left_schema.index_of("la2").unwrap(),
                 side: JoinSide::Left,
             },
             ColumnIndex {
-                index: 0,
+                index: right_schema.index_of("ra1").unwrap(),
                 side: JoinSide::Right,
             },
         ];
@@ -1355,16 +1596,23 @@ pub mod tests {
         let left_schema = Arc::new(left_schema);
         let right_schema = Arc::new(right_schema);
 
-        assert!(build_filter_input_order(
+        let empty_eq = EquivalenceProperties::new(Arc::new(Schema::empty()));
+        let empty_order_eq =
+            OrderingEquivalenceProperties::new(Arc::new(Schema::empty()));
+
+        assert!(!build_filter_input_order(
             JoinSide::Left,
             &filter,
             &left_schema,
             &PhysicalSortExpr {
                 expr: col("la1", left_schema.as_ref())?,
                 options: SortOptions::default(),
-            }
+            },
+            &empty_eq,
+            &empty_order_eq
         )?
-        .is_some());
+        .is_empty());
+
         assert!(build_filter_input_order(
             JoinSide::Left,
             &filter,
@@ -1372,19 +1620,23 @@ pub mod tests {
             &PhysicalSortExpr {
                 expr: col("lt1", left_schema.as_ref())?,
                 options: SortOptions::default(),
-            }
+            },
+            &empty_eq,
+            &empty_order_eq
         )?
-        .is_none());
-        assert!(build_filter_input_order(
+        .is_empty());
+        assert!(!build_filter_input_order(
             JoinSide::Right,
             &filter,
             &right_schema,
             &PhysicalSortExpr {
                 expr: col("ra1", right_schema.as_ref())?,
                 options: SortOptions::default(),
-            }
+            },
+            &empty_eq,
+            &empty_order_eq
         )?
-        .is_some());
+        .is_empty());
         assert!(build_filter_input_order(
             JoinSide::Right,
             &filter,
@@ -1392,9 +1644,138 @@ pub mod tests {
             &PhysicalSortExpr {
                 expr: col("rb1", right_schema.as_ref())?,
                 options: SortOptions::default(),
-            }
+            },
+            &empty_eq,
+            &empty_order_eq
         )?
-        .is_none());
+        .is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn build_sorted_expr_equivalence() -> Result<()> {
+        let left_schema = Schema::new(vec![
+            Field::new("la1", DataType::Int32, false),
+            Field::new("lb1", DataType::Int32, false),
+            Field::new("lc1", DataType::Int32, false),
+            Field::new("lt1", DataType::Int32, false),
+            Field::new("la2", DataType::Int32, false),
+            Field::new("la1_des", DataType::Int32, false),
+        ]);
+
+        let right_schema = Schema::new(vec![
+            Field::new("ra1", DataType::Int32, false),
+            Field::new("rb1", DataType::Int32, false),
+            Field::new("rc1", DataType::Int32, false),
+            Field::new("rt1", DataType::Int32, false),
+            Field::new("ra2", DataType::Int32, false),
+            Field::new("ra1_des", DataType::Int32, false),
+        ]);
+
+        let intermediate_schema = Schema::new(vec![
+            Field::new("0", DataType::Int32, true),
+            Field::new("1", DataType::Int32, true),
+            Field::new("2", DataType::Int32, true),
+            Field::new("3", DataType::Int32, true),
+        ]);
+        let filter_expr = complicated_4_column_exprs(0, &intermediate_schema)?;
+        let column_indices = vec![
+            ColumnIndex {
+                index: left_schema.index_of("la1").unwrap(),
+                side: JoinSide::Left,
+            },
+            ColumnIndex {
+                index: left_schema.index_of("la2").unwrap(),
+                side: JoinSide::Left,
+            },
+            ColumnIndex {
+                index: right_schema.index_of("ra1").unwrap(),
+                side: JoinSide::Right,
+            },
+            ColumnIndex {
+                index: left_schema.index_of("lt1").unwrap(),
+                side: JoinSide::Left,
+            },
+        ];
+        let filter = JoinFilter::new(filter_expr, column_indices, intermediate_schema);
+
+        let left_schema = Arc::new(left_schema);
+
+        let mut left_eq = EquivalenceProperties::new(left_schema.clone());
+        let mut left_order_eq = OrderingEquivalenceProperties::new(left_schema.clone());
+
+        // Add a column exist in filter
+        left_eq.add_equal_conditions((
+            &Column::new_with_schema("la2", &left_schema)?,
+            &Column::new_with_schema("la1", &left_schema)?,
+        ));
+
+        let res = build_filter_input_order(
+            JoinSide::Left,
+            &filter,
+            &left_schema,
+            &PhysicalSortExpr {
+                expr: col("la1", left_schema.as_ref())?,
+                options: SortOptions::default(),
+            },
+            &left_eq,
+            &left_order_eq,
+        )?;
+
+        assert_eq!(res.len(), 2);
+
+        // Add a column exist in filter
+        left_order_eq.add_equal_conditions((
+            &vec![PhysicalSortExpr {
+                expr: Arc::new(Column::new_with_schema("la2", &left_schema)?),
+                options: SortOptions::default(),
+            }],
+            &vec![PhysicalSortExpr {
+                expr: Arc::new(Column::new_with_schema("lt1", &left_schema)?),
+                options: SortOptions::default(),
+            }],
+        ));
+
+        let res = build_filter_input_order(
+            JoinSide::Left,
+            &filter,
+            &left_schema,
+            &PhysicalSortExpr {
+                expr: col("lt1", left_schema.as_ref())?,
+                options: SortOptions::default(),
+            },
+            &left_eq,
+            &left_order_eq,
+        )?;
+
+        assert_eq!(res.len(), 3);
+
+        // Add a column exist in filter
+        left_order_eq.add_equal_conditions((
+            &vec![PhysicalSortExpr {
+                expr: Arc::new(Column::new_with_schema("lc1", &left_schema)?),
+                options: SortOptions::default(),
+            }],
+            &vec![PhysicalSortExpr {
+                expr: Arc::new(Column::new_with_schema("lt1", &left_schema)?),
+                options: SortOptions::default(),
+            }],
+        ));
+
+        let res = build_filter_input_order(
+            JoinSide::Left,
+            &filter,
+            &left_schema,
+            &PhysicalSortExpr {
+                expr: col("la1", left_schema.as_ref())?,
+                options: SortOptions::default(),
+            },
+            &left_eq,
+            &left_order_eq,
+        )?;
+
+        assert_eq!(res.len(), 3);
 
         Ok(())
     }
@@ -1439,13 +1820,18 @@ pub mod tests {
             options: SortOptions::default(),
         };
 
-        let res = convert_sort_expr_with_filter_schema(
-            &JoinSide::Left,
+        let schema = Arc::new(schema);
+        let eq_prop = EquivalenceProperties::new(schema.clone());
+        let order_eq_prop = OrderingEquivalenceProperties::new(schema.clone());
+        let res = build_filter_input_order(
+            JoinSide::Left,
             &filter,
-            &Arc::new(schema),
+            &schema,
             &sorted,
+            &eq_prop,
+            &order_eq_prop,
         )?;
-        assert!(res.is_none());
+        assert!(res.is_empty());
         Ok(())
     }
 

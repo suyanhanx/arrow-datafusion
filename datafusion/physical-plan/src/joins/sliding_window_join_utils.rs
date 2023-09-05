@@ -1,104 +1,156 @@
 // Copyright (C) Synnada, Inc. - All Rights Reserved.
 // This file does not contain any Apache Software Foundation copyrighted code.
 
-use crate::physical_plan::joins::hash_join_utils::{
-    get_pruning_anti_indices, get_pruning_semi_indices, SortedFilterExpr,
-};
-use crate::physical_plan::joins::utils::{
-    append_right_indices, get_anti_indices, get_semi_indices,
+use crate::physical_plan::joins::{
+    hash_join_utils::{
+        get_pruning_anti_indices, get_pruning_semi_indices, SortedFilterExpr,
+    },
+    utils::{
+        append_right_indices, get_anti_indices, get_build_side_pruned_exprs,
+        get_filter_representation_of_build_side, get_semi_indices, JoinFilter, JoinSide,
+    },
 };
 
-use arrow_array::builder::{PrimitiveBuilder, UInt32Builder, UInt64Builder};
-use arrow_array::types::{UInt32Type, UInt64Type};
 use arrow_array::{
+    builder::{PrimitiveBuilder, UInt32Builder, UInt64Builder},
+    types::{UInt32Type, UInt64Type},
     ArrowPrimitiveType, NativeAdapter, PrimitiveArray, RecordBatch, UInt32Array,
     UInt64Array,
 };
-use arrow_schema::SortOptions;
-use datafusion_common::Result;
-use datafusion_common::{DataFusionError, JoinType, ScalarValue};
-use datafusion_physical_expr::intervals::{ExprIntervalGraph, Interval, IntervalBound};
+use datafusion_common::{DataFusionError, JoinType, Result, ScalarValue};
+use datafusion_physical_expr::{
+    intervals::{ExprIntervalGraph, Interval, IntervalBound},
+    PhysicalSortExpr,
+};
 
 use hashbrown::HashSet;
 
 /// This function checks if the batch offers a reference value that enables us
 /// to tell whether is falls in the viable sliding window via interval analysis.
 pub fn is_batch_suitable_interval_calculation(
-    probe_sorted_filter_expr: &SortedFilterExpr,
+    filter: &JoinFilter,
+    probe_sorted_filter_exprs: &[SortedFilterExpr],
     batch: &RecordBatch,
+    build_side: JoinSide,
 ) -> Result<bool> {
     // Return false if the batch is empty:
     if batch.num_rows() == 0 {
         return Ok(false);
     }
 
-    // Calculate the latest value of the sorted filter expression:
-    let probe_order = probe_sorted_filter_expr.origin_sorted_expr();
-    let array_ref = probe_order
-        .expr
-        .evaluate(batch)?
-        .into_array(batch.num_rows());
-    let latest_value = ScalarValue::try_from_array(&array_ref, batch.num_rows() - 1)?;
+    let intermediate_batch = get_filter_representation_of_build_side(
+        filter.schema(),
+        &batch.slice(batch.num_rows() - 1, 1),
+        filter.column_indices(),
+        build_side,
+    )?;
 
-    // Return true if the latest value is not null:
-    Ok(!latest_value.is_null())
+    let result = probe_sorted_filter_exprs
+        .iter()
+        .map(|sorted_filter_expr| {
+            let expr = sorted_filter_expr.intermediate_batch_filter_expr();
+            let array_ref = expr
+                .evaluate(&intermediate_batch)?
+                .into_array(intermediate_batch.num_rows());
+            // Calculate the latest value of the sorted filter expression:
+            let latest_value = ScalarValue::try_from_array(&array_ref, 0);
+            // Return true if the latest value is not null:
+            latest_value.map(|s| !s.is_null())
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(result.into_iter().all(|b| b))
 }
 
 /// This function takes a batch of data from the probe side, calculates the
 /// interval for the build side filter expression, and updates the probe
 /// buffer and the stream state accordingly.
 pub fn calculate_the_necessary_build_side_range(
-    input_buffer: &RecordBatch,
+    filter: &JoinFilter,
+    build_inner_buffer: &RecordBatch,
     graph: &mut ExprIntervalGraph,
-    left_sorted_filter_expr: &mut SortedFilterExpr,
-    right_sorted_filter_expr: &mut SortedFilterExpr,
+    build_sorted_filter_exprs: &mut [SortedFilterExpr],
+    probe_sorted_filter_exprs: &mut [SortedFilterExpr],
     probe_batch: &RecordBatch,
-) -> datafusion_common::Result<Interval> {
+) -> Result<Vec<(PhysicalSortExpr, Interval)>> {
     // Calculate the interval for the build side filter expression (if present):
     update_filter_expr_bounds(
-        input_buffer,
-        left_sorted_filter_expr,
+        filter,
+        build_inner_buffer,
+        build_sorted_filter_exprs,
+        JoinSide::Left,
         probe_batch,
-        right_sorted_filter_expr,
+        probe_sorted_filter_exprs,
+        JoinSide::Right,
     )?;
-    let mut filter_intervals = vec![];
-    for expr in [left_sorted_filter_expr, right_sorted_filter_expr] {
-        filter_intervals.push((expr.node_index(), expr.interval().clone()))
-    }
+
+    let mut filter_intervals = build_sorted_filter_exprs
+        .iter()
+        .chain(probe_sorted_filter_exprs.iter())
+        .map(|sorted_filter_expr| {
+            (
+                sorted_filter_expr.node_index(),
+                sorted_filter_expr.interval().clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+
     // Update the physical expression graph using the join filter intervals:
     graph.update_ranges(&mut filter_intervals)?;
-    Ok(filter_intervals.remove(0).1)
+
+    let intermediate_batch = get_filter_representation_of_build_side(
+        filter.schema(),
+        build_inner_buffer,
+        filter.column_indices(),
+        JoinSide::Left,
+    )?;
+
+    let intermediate_schema = intermediate_batch.schema();
+
+    // Filter expressions that can shrink.
+    let shrunk_exprs = graph.get_deepest_pruning_exprs()?;
+    // Get only build side filter expressions
+    get_build_side_pruned_exprs(shrunk_exprs, intermediate_schema, filter, JoinSide::Left)
 }
 
 /// Checks whether the given reference value (i.e. `latest_value`) falls within
 /// the viable sliding window specified by `interval` according to the sort
 /// options of the join in question (i.e. `sort_options`).
 pub fn check_if_sliding_window_condition_is_met(
-    latest_value: &ScalarValue, // latest value pulled from the left stream
-    interval: &Interval, // interval in the build side against which we are checking
-    sort_options: &SortOptions, // sort options used in the join
-) -> bool {
-    match sort_options {
-        SortOptions {
-            descending: false, ..
-        } =>
-        // Data is sorted in ascending order, so check if latest value is greater
-        // than the upper bound of the interval. If it is, we must have processed
-        // all rows that are needed from the build side for this window.
-        {
-            latest_value > &interval.upper.value
-        }
+    filter: &JoinFilter,
+    incoming_build_batch: &RecordBatch,
+    intervals: &[(PhysicalSortExpr, Interval)], // interval in the build side against which we are checking
+) -> Result<bool> {
+    let latest_build_intermediate_batch = get_filter_representation_of_build_side(
+        filter.schema(),
+        &incoming_build_batch.slice(incoming_build_batch.num_rows() - 1, 1),
+        filter.column_indices(),
+        JoinSide::Left,
+    )?;
 
-        SortOptions {
-            descending: true, ..
-        } =>
-        // Data is sorted in descending order, so check if latest value is less
-        // than the lower bound of the interval. If it is, we must have processed
-        // all rows that are needed from the build side for this window.
-        {
-            latest_value < &interval.lower.value
-        }
-    }
+    let results: Vec<bool> = intervals
+        .iter()
+        .map(|(sorted_shrunk_expr, interval)| {
+            let array = sorted_shrunk_expr
+                .expr
+                .clone()
+                .evaluate(&latest_build_intermediate_batch)?
+                .into_array(1);
+            let latest_value = ScalarValue::try_from_array(&array, 0)?;
+            Ok(if sorted_shrunk_expr.options.descending {
+                // Data is sorted in descending order, so check if latest value is less
+                // than the lower bound of the interval. If it is, we must have processed
+                // all rows that are needed from the build side for this window.
+                latest_value < interval.lower.value
+            } else {
+                // Data is sorted in ascending order, so check if latest value is greater
+                // than the upper bound of the interval. If it is, we must have processed
+                // all rows that are needed from the build side for this window.
+                latest_value > interval.upper.value
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(results.iter().all(|e| *e))
 }
 
 /// This function combines the given batches into a probe batch.
@@ -349,7 +401,9 @@ pub enum JoinStreamState {
     /// given interval.
     /// This state continues to pull data until a suitable range of batches is
     /// found, or the build stream is exhausted.
-    PullBuild { interval: Interval },
+    PullBuild {
+        interval: Vec<(PhysicalSortExpr, Interval)>,
+    },
     /// The probe side is completely processed. In this state, the build side
     /// will be ready and its results will be processed until the build stream
     /// is also exhausted.
@@ -375,16 +429,24 @@ pub enum JoinStreamState {
 /// the expressions. The function sets a null interval for the build side and
 /// calculates the actual interval for the probe side based on the sort options.
 pub(crate) fn update_filter_expr_bounds(
+    filter: &JoinFilter,
     build_inner_buffer: &RecordBatch,
-    build_sorted_filter_expr: &mut SortedFilterExpr,
+    build_sorted_filter_exprs: &mut [SortedFilterExpr],
+    build_side: JoinSide,
     probe_batch: &RecordBatch,
-    probe_sorted_filter_expr: &mut SortedFilterExpr,
+    probe_sorted_filter_exprs: &mut [SortedFilterExpr],
+    probe_side: JoinSide,
 ) -> Result<()> {
+    let build_intermediate_batch = get_filter_representation_of_build_side(
+        filter.schema(),
+        &build_inner_buffer.slice(0, 0),
+        filter.column_indices(),
+        build_side,
+    )?;
     // Evaluate the build side order expression to get datatype:
-    let build_order_datatype = build_sorted_filter_expr
-        .origin_sorted_expr()
-        .expr
-        .evaluate(&build_inner_buffer.slice(0, 0))?
+    let build_order_datatype = build_sorted_filter_exprs[0]
+        .intermediate_batch_filter_expr()
+        .evaluate(&build_intermediate_batch)?
         .data_type();
 
     // Create a null scalar value with the obtained datatype:
@@ -394,39 +456,61 @@ pub(crate) fn update_filter_expr_bounds(
         IntervalBound::new(null_scalar.clone(), true),
         IntervalBound::new(null_scalar, true),
     );
-    // Set the null interval for the build side filter expression:
-    build_sorted_filter_expr.set_interval(null_interval);
 
-    // Evaluate the probe side filter expression and convert the result to an array:
-    let array = probe_sorted_filter_expr
-        .origin_sorted_expr()
-        .expr
-        .evaluate(probe_batch)?
-        .into_array(probe_batch.num_rows() - 1);
+    build_sorted_filter_exprs
+        .iter_mut()
+        .for_each(|sorted_filter_expr| {
+            sorted_filter_expr.set_interval(null_interval.clone());
+        });
 
-    // Extract the left and right values from the array:
-    let left_value = ScalarValue::try_from_array(&array, 0)?;
-    let right_value = ScalarValue::try_from_array(&array, probe_batch.num_rows() - 1)?;
+    let first_probe_intermediate_batch = get_filter_representation_of_build_side(
+        filter.schema(),
+        &probe_batch.slice(0, 1),
+        filter.column_indices(),
+        probe_side,
+    )?;
 
-    // Determine the interval bounds based on sort options:
-    let interval = if probe_sorted_filter_expr
-        .origin_sorted_expr()
-        .options
-        .descending
-    {
-        Interval::new(
-            IntervalBound::new(right_value, false),
-            IntervalBound::new(left_value, false),
-        )
-    } else {
-        Interval::new(
-            IntervalBound::new(left_value, false),
-            IntervalBound::new(right_value, false),
-        )
-    };
-    // Set the calculated interval for the sorted filter expression:
-    probe_sorted_filter_expr.set_interval(interval);
-    Ok(())
+    let last_probe_intermediate_batch = get_filter_representation_of_build_side(
+        filter.schema(),
+        &probe_batch.slice(probe_batch.num_rows() - 1, 1),
+        filter.column_indices(),
+        probe_side,
+    )?;
+
+    probe_sorted_filter_exprs
+        .iter_mut()
+        .try_for_each(|sorted_filter_expr| {
+            let expr = sorted_filter_expr.intermediate_batch_filter_expr();
+            // Evaluate the probe side filter expression with the first batch
+            // and convert the result to an array:
+            let first_array = expr
+                .evaluate(&first_probe_intermediate_batch)?
+                .into_array(first_probe_intermediate_batch.num_rows());
+
+            // Evaluate the probe side filter expression with the last batch
+            // and convert the result to an array:
+            let last_array = expr
+                .evaluate(&last_probe_intermediate_batch)?
+                .into_array(last_probe_intermediate_batch.num_rows());
+            // Extract the left and right values from the array:
+            let left_value = ScalarValue::try_from_array(&first_array, 0)?;
+            let right_value = ScalarValue::try_from_array(&last_array, 0)?;
+            // Determine the interval bounds based on sort options:
+            let interval = if sorted_filter_expr.order().descending {
+                Interval::new(
+                    IntervalBound::new(right_value, false),
+                    IntervalBound::new(left_value, false),
+                )
+            } else {
+                Interval::new(
+                    IntervalBound::new(left_value, false),
+                    IntervalBound::new(right_value, false),
+                )
+            };
+            // Set the calculated interval for the sorted filter expression:
+            sorted_filter_expr.set_interval(interval);
+            Ok(())
+        })
 }
 
 #[cfg(test)]

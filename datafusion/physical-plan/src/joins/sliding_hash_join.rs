@@ -26,9 +26,9 @@ use crate::logical_expr::JoinType;
 use crate::physical_plan::common::SharedMemoryReservation;
 use crate::physical_plan::expressions::{Column, PhysicalSortExpr};
 use crate::physical_plan::joins::{
+    hash_join::build_equal_condition_join_indices,
     hash_join_utils::{
-        build_filter_expression_graph, calculate_filter_expr_intervals,
-        combine_two_batches, record_visited_indices, IntervalCalculatorInnerState,
+        calculate_filter_expr_intervals, combine_two_batches, record_visited_indices,
         SortedFilterExpr,
     },
     sliding_window_join_utils::{
@@ -43,7 +43,8 @@ use crate::physical_plan::joins::{
         build_batch_from_indices, build_join_schema, calculate_join_output_ordering,
         check_join_is_valid, combine_join_equivalence_properties,
         combine_join_ordering_equivalence_properties,
-        partitioned_join_output_partitioning, ColumnIndex, JoinFilter, JoinOn, JoinSide,
+        partitioned_join_output_partitioning, prepare_sorted_exprs, ColumnIndex,
+        JoinFilter, JoinOn, JoinSide,
     },
     StreamJoinPartitionMode,
 };
@@ -57,13 +58,12 @@ use crate::physical_plan::{
 
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use datafusion_common::ScalarValue;
+use datafusion_common::{internal_err, plan_err};
 use datafusion_execution::memory_pool::MemoryConsumer;
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::intervals::ExprIntervalGraph;
 use datafusion_physical_expr::{OrderingEquivalenceProperties, PhysicalSortRequirement};
 
-use crate::physical_plan::joins::hash_join::build_equal_condition_join_indices;
 use ahash::RandomState;
 use futures::{ready, Stream, StreamExt};
 use parking_lot::Mutex;
@@ -150,8 +150,6 @@ pub struct SlidingHashJoinExec {
     pub(crate) filter: JoinFilter,
     /// How the join is performed
     pub(crate) join_type: JoinType,
-    /// Expression graph and `SortedFilterExpr`s for interval calculations
-    filter_state: Arc<Mutex<IntervalCalculatorInnerState>>,
     /// The schema once the join is applied
     schema: SchemaRef,
     /// Shares the `RandomState` for the hashing algorithm
@@ -254,9 +252,9 @@ impl SlidingHashJoinExec {
 
         // Error out if no "on" constraints are given:
         if on.is_empty() {
-            return Err(DataFusionError::Plan(
-                "On constraints in SlidingHashJoinExec should be non-empty".to_string(),
-            ));
+            return plan_err!(
+                "On constraints in SlidingHashJoinExec should be non-empty"
+            );
         }
 
         // Check if the join is valid with the given on constraints:
@@ -268,8 +266,6 @@ impl SlidingHashJoinExec {
 
         // Initialize the random state for the join operation:
         let random_state = RandomState::with_seeds(0, 0, 0, 0);
-
-        let filter_state = Arc::new(Mutex::new(IntervalCalculatorInnerState::default()));
 
         let output_ordering = calculate_join_output_ordering(
             &left_sort_exprs,
@@ -287,7 +283,6 @@ impl SlidingHashJoinExec {
             on,
             filter,
             join_type: *join_type,
-            filter_state,
             schema: Arc::new(schema),
             random_state,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -445,9 +440,7 @@ impl ExecutionPlan for SlidingHashJoinExec {
                 self.right_sort_exprs.clone(),
                 self.mode,
             )?)),
-            _ => Err(DataFusionError::Internal(
-                "SlidingHashJoinExec wrong number of children".to_string(),
-            )),
+            _ => internal_err!("SlidingHashJoinExec wrong number of children"),
         }
     }
 
@@ -459,26 +452,31 @@ impl ExecutionPlan for SlidingHashJoinExec {
         let left_partitions = self.left.output_partitioning().partition_count();
         let right_partitions = self.right.output_partitioning().partition_count();
         if left_partitions != right_partitions {
-            return Err(DataFusionError::Internal(format!(
+            return internal_err!(
                 "Invalid SlidingHashJoinExec, partition count mismatch {left_partitions}!={right_partitions},\
-                 consider using RepartitionExec",
-            )));
+                 consider using RepartitionExec"
+            );
         }
 
-        let (left_sorted_filter_expr, right_sorted_filter_expr, graph) = if let (
-            Some(left_sorted_filter_expr),
-            Some(right_sorted_filter_expr),
-            Some(graph),
-        ) =
-            build_filter_expression_graph(
-                &self.filter_state,
-                &self.left,
-                &self.right,
+        let (left_sorted_filter_expr, right_sorted_filter_expr, graph) = if let Some((
+            left_sorted_filter_expr,
+            right_sorted_filter_expr,
+            graph,
+        )) =
+            prepare_sorted_exprs(
                 &self.filter,
+                &self.left.schema(),
+                &self.right.schema(),
+                &self.left_sort_exprs,
+                &self.left.equivalence_properties(),
+                &self.left.ordering_equivalence_properties(),
+                &self.right_sort_exprs,
+                &self.right.equivalence_properties(),
+                &self.right.ordering_equivalence_properties(),
             )? {
             (left_sorted_filter_expr, right_sorted_filter_expr, graph)
         } else {
-            return Err(DataFusionError::Internal("AsymmetricHashJoin can not operate without both sides are not prunning tables.".to_owned()));
+            return internal_err!("SlidingHashJoinExec can not operate unless both sides are pruning tables.");
         };
 
         let (on_left, on_right) = self.on.iter().cloned().unzip();
@@ -730,10 +728,10 @@ struct SlidingHashJoinStream {
     right_stream: SendableRecordBatchStream,
     /// Left globally sorted filter expression.
     /// This expression is used to range calculations from the left stream.
-    left_sorted_filter_expr: SortedFilterExpr,
+    left_sorted_filter_expr: Vec<SortedFilterExpr>,
     /// Right globally sorted filter expression.
     /// This expression is used to range calculations from the right stream.
-    right_sorted_filter_expr: SortedFilterExpr,
+    right_sorted_filter_expr: Vec<SortedFilterExpr>,
     /// Hash joiner for the right side. It is responsible for creating a hash map
     /// from the right side data, which can be used to quickly look up matches when
     /// joining with left side data.
@@ -829,8 +827,10 @@ impl SlidingHashJoinStream {
                                 // Check if batch meets interval calculation criteria:
                                 let stop_polling =
                                     is_batch_suitable_interval_calculation(
+                                        &self.filter,
                                         &self.right_sorted_filter_expr,
                                         &batch,
+                                        JoinSide::Right,
                                     )?;
                                 // Add the batch into candidate buffer:
                                 self.probe_buffer.candidate_buffer.push(batch);
@@ -858,6 +858,7 @@ impl SlidingHashJoinStream {
                     // Update the probe side with the new probe batch:
                     let calculated_build_side_interval =
                         calculate_the_necessary_build_side_range(
+                            &self.filter,
                             &self.build_buffer.input_buffer,
                             &mut self.graph,
                             &mut self.left_sorted_filter_expr,
@@ -872,8 +873,6 @@ impl SlidingHashJoinStream {
                 JoinStreamState::PullBuild { interval } => {
                     // Get the expression used to determine the order in which
                     // rows from the left stream are added to the batches:
-                    let build_order = self.left_sorted_filter_expr.origin_sorted_expr();
-                    let sort_options = &build_order.options;
                     let build_interval = interval.clone();
                     // Keep pulling data from the left stream until a suitable
                     // range on batches is found:
@@ -885,22 +884,16 @@ impl SlidingHashJoinStream {
                                 }
                                 self.metrics.left.input_batches.add(1);
                                 self.metrics.left.input_rows.add(batch.num_rows());
-                                let array_ref = build_order
-                                    .expr
-                                    .evaluate(&batch.slice(batch.num_rows() - 1, 1))?
-                                    .into_array(batch.num_rows());
 
                                 self.build_buffer
                                     .update_internal_state(&batch, &self.random_state)?;
                                 self.build_buffer.offset += batch.num_rows();
 
-                                let latest_value =
-                                    ScalarValue::try_from_array(&array_ref, 0)?;
                                 if check_if_sliding_window_condition_is_met(
-                                    &latest_value,
+                                    &self.filter,
+                                    &batch,
                                     &build_interval,
-                                    sort_options,
-                                ) {
+                                )? {
                                     self.state = JoinStreamState::Join;
                                     break;
                                 }
@@ -947,10 +940,12 @@ impl SlidingHashJoinStream {
 
                     // Calculate the filter expression intervals for both sides of the join:
                     calculate_filter_expr_intervals(
+                        &self.filter,
                         &build_hash_joiner.input_buffer,
                         build_side_sorted_filter_expr,
                         &probe_side_buffer.current_batch,
                         probe_side_sorted_filter_expr,
+                        JoinSide::Left,
                     )?;
 
                     // Determine how much of the internal state can be pruned by
@@ -959,6 +954,7 @@ impl SlidingHashJoinStream {
                         .calculate_prune_length_with_probe_batch(
                             build_side_sorted_filter_expr,
                             probe_side_sorted_filter_expr,
+                            &self.filter,
                             &mut self.graph,
                         )?;
 
@@ -1085,17 +1081,64 @@ impl SlidingHashJoinStream {
 
 #[cfg(test)]
 mod tests {
-    const TABLE_SIZE: i32 = 100;
+    const TABLE_SIZE: i32 = 30;
+
+    use once_cell::sync::Lazy;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    type TableKey = (i32, i32, usize); // (cardinality.0, cardinality.1, batch_size)
+    type TableValue = (Vec<RecordBatch>, Vec<RecordBatch>); // (left, right)
+
+    // Cache for storing tables
+    static TABLE_CACHE: Lazy<Mutex<HashMap<TableKey, TableValue>>> =
+        Lazy::new(|| Mutex::new(HashMap::new()));
+
+    fn get_or_create_table(
+        cardinality: (i32, i32),
+        batch_size: usize,
+    ) -> Result<TableValue> {
+        {
+            let cache = TABLE_CACHE.lock().unwrap();
+            if let Some(table) = cache.get(&(cardinality.0, cardinality.1, batch_size)) {
+                return Ok(table.clone());
+            }
+        }
+
+        // If not, create the table
+        let (left_batch, right_batch) =
+            build_sides_record_batches(TABLE_SIZE, cardinality)?;
+
+        let (left_partition, right_partition) = (
+            split_record_batches(&left_batch, batch_size)?,
+            split_record_batches(&right_batch, batch_size)?,
+        );
+
+        // Lock the cache again and store the table
+        let mut cache = TABLE_CACHE.lock().unwrap();
+
+        // Store the table in the cache
+        cache.insert(
+            (cardinality.0, cardinality.1, batch_size),
+            (left_partition.clone(), right_partition.clone()),
+        );
+
+        Ok((left_partition, right_partition))
+    }
 
     use std::sync::Arc;
 
     use super::*;
     use crate::execution::context::SessionConfig;
-    use crate::physical_plan::joins::hash_join_utils::tests::complicated_filter;
+    use crate::physical_plan::joins::hash_join_utils::tests::{
+        complicated_4_column_exprs, complicated_filter,
+    };
     use crate::physical_plan::joins::test_utils::{
         build_sides_record_batches, compare_batches, create_memory_table,
         join_expr_tests_fixture_i32, partitioned_hash_join_with_filter,
+        split_record_batches,
     };
+    use crate::physical_plan::joins::utils::JoinOn;
     use crate::physical_plan::repartition::RepartitionExec;
     use crate::physical_plan::{common, expressions::Column, joins::utils::JoinSide};
     use crate::prelude::SessionContext;
@@ -1228,10 +1271,10 @@ mod tests {
     ) -> Result<()> {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
-        let (left_batch, right_batch) =
-            build_sides_record_batches(TABLE_SIZE, cardinality)?;
-        let left_schema = &left_batch.schema();
-        let right_schema = &right_batch.schema();
+        let (left_partition, right_partition) =
+            get_or_create_table(cardinality, batch_size)?;
+        let left_schema = &left_partition[0].schema();
+        let right_schema = &right_partition[0].schema();
         let left_sorted = vec![PhysicalSortExpr {
             expr: col("la1", left_schema)?,
             options: SortOptions::default(),
@@ -1241,11 +1284,10 @@ mod tests {
             options: SortOptions::default(),
         }];
         let (left, right) = create_memory_table(
-            left_batch,
-            right_batch,
+            left_partition,
+            right_partition,
             vec![left_sorted],
             vec![right_sorted],
-            batch_size,
         )?;
 
         let on = vec![(
@@ -1286,10 +1328,9 @@ mod tests {
         let case_expr = 1;
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
-        let (left_batch, right_batch) =
-            build_sides_record_batches(TABLE_SIZE, cardinality)?;
-        let left_schema = &left_batch.schema();
-        let right_schema = &right_batch.schema();
+        let (left_partition, right_partition) = get_or_create_table(cardinality, 8)?;
+        let left_schema = &left_partition[0].schema();
+        let right_schema = &right_partition[0].schema();
         let left_sorted = vec![PhysicalSortExpr {
             expr: col("la1", left_schema)?,
             options: SortOptions::default(),
@@ -1299,11 +1340,10 @@ mod tests {
             options: SortOptions::default(),
         }];
         let (left, right) = create_memory_table(
-            left_batch,
-            right_batch,
+            left_partition,
+            right_partition,
             vec![left_sorted],
             vec![right_sorted],
-            13,
         )?;
 
         let on = vec![(
@@ -1345,10 +1385,9 @@ mod tests {
         let config = SessionConfig::new().with_repartition_joins(false);
         let session_ctx = SessionContext::with_config(config);
         let task_ctx = session_ctx.task_ctx();
-        let (left_batch, right_batch) =
-            build_sides_record_batches(TABLE_SIZE, cardinality)?;
-        let left_schema = &left_batch.schema();
-        let right_schema = &right_batch.schema();
+        let (left_partition, right_partition) = get_or_create_table(cardinality, 8)?;
+        let left_schema = &left_partition[0].schema();
+        let right_schema = &right_partition[0].schema();
         let left_sorted = vec![PhysicalSortExpr {
             expr: col("l_asc_null_last", left_schema)?,
             options: SortOptions {
@@ -1364,11 +1403,10 @@ mod tests {
             },
         }];
         let (left, right) = create_memory_table(
-            left_batch,
-            right_batch,
+            left_partition,
+            right_partition,
             vec![left_sorted],
             vec![right_sorted],
-            13,
         )?;
 
         let on = vec![(
@@ -1409,10 +1447,9 @@ mod tests {
         let config = SessionConfig::new().with_repartition_joins(false);
         let session_ctx = SessionContext::with_config(config);
         let task_ctx = session_ctx.task_ctx();
-        let (left_batch, right_batch) =
-            build_sides_record_batches(TABLE_SIZE, cardinality)?;
-        let left_schema = &left_batch.schema();
-        let right_schema = &right_batch.schema();
+        let (left_partition, right_partition) = get_or_create_table(cardinality, 8)?;
+        let left_schema = &left_partition[0].schema();
+        let right_schema = &right_partition[0].schema();
         let left_sorted = vec![PhysicalSortExpr {
             expr: col("l_desc_null_first", left_schema)?,
             options: SortOptions {
@@ -1428,11 +1465,10 @@ mod tests {
             },
         }];
         let (left, right) = create_memory_table(
-            left_batch,
-            right_batch,
+            left_partition,
+            right_partition,
             vec![left_sorted],
             vec![right_sorted],
-            13,
         )?;
 
         let on = vec![(
@@ -1490,10 +1526,9 @@ mod tests {
     ) -> Result<()> {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
-        let (left_batch, right_batch) =
-            build_sides_record_batches(TABLE_SIZE, cardinality)?;
-        let left_schema = &left_batch.schema();
-        let right_schema = &right_batch.schema();
+        let (left_partition, right_partition) = get_or_create_table(cardinality, 8)?;
+        let left_schema = &left_partition[0].schema();
+        let right_schema = &right_partition[0].schema();
         let left_sorted = vec![PhysicalSortExpr {
             expr: col("la1_des", left_schema)?,
             options: SortOptions {
@@ -1509,11 +1544,10 @@ mod tests {
             },
         }];
         let (left, right) = create_memory_table(
-            left_batch,
-            right_batch,
+            left_partition,
+            right_partition,
             vec![left_sorted],
             vec![right_sorted],
-            13,
         )?;
 
         let on = vec![(
@@ -1571,10 +1605,9 @@ mod tests {
         // a + b > c + 10 AND a + b < c + 100
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
-        let (left_batch, right_batch) =
-            build_sides_record_batches(TABLE_SIZE, cardinality)?;
-        let left_schema = &left_batch.schema();
-        let right_schema = &right_batch.schema();
+        let (left_partition, right_partition) = get_or_create_table(cardinality, 8)?;
+        let left_schema = &left_partition[0].schema();
+        let right_schema = &right_partition[0].schema();
         let left_sorted = vec![PhysicalSortExpr {
             expr: binary(
                 col("la1", left_schema)?,
@@ -1589,11 +1622,10 @@ mod tests {
             options: SortOptions::default(),
         }];
         let (left, right) = create_memory_table(
-            left_batch,
-            right_batch,
+            left_partition,
+            right_partition,
             vec![left_sorted],
             vec![right_sorted],
-            13,
         )?;
 
         let on = vec![(
@@ -1618,6 +1650,98 @@ mod tests {
             },
             ColumnIndex {
                 index: 0,
+                side: JoinSide::Right,
+            },
+        ];
+        let filter = JoinFilter::new(filter_expr, column_indices, intermediate_schema);
+
+        experiment(left, right, filter, join_type, on, task_ctx).await?;
+        Ok(())
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn complex_join_all_one_ascending_numeric_equivalence(
+        #[values(
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Right,
+            JoinType::RightSemi,
+            JoinType::LeftSemi,
+            JoinType::LeftAnti,
+            JoinType::RightAnti,
+            JoinType::Full
+        )]
+        join_type: JoinType,
+        #[values(
+        (4, 4),
+        (11, 21),
+        (21, 12),
+        (99, 12),
+        (12, 99),
+        )]
+        cardinality: (i32, i32),
+        #[values(0, 1, 2)] case_expr: usize,
+    ) -> Result<()> {
+        let session_ctx = SessionContext::new();
+        let task_ctx = session_ctx.task_ctx();
+        let (left_partition, right_partition) = get_or_create_table(cardinality, 8)?;
+        let left_schema = &left_partition[0].schema();
+        let right_schema = &right_partition[0].schema();
+        let left_sorted = vec![
+            vec![PhysicalSortExpr {
+                expr: col("la1", left_schema)?,
+                options: SortOptions::default(),
+            }],
+            vec![PhysicalSortExpr {
+                expr: col("la2", left_schema)?,
+                options: SortOptions::default(),
+            }],
+        ];
+        let right_sorted = vec![
+            vec![PhysicalSortExpr {
+                expr: col("ra2", right_schema)?,
+                options: SortOptions::default(),
+            }],
+            vec![PhysicalSortExpr {
+                expr: col("ra1", right_schema)?,
+                options: SortOptions::default(),
+            }],
+        ];
+        let (left, right) = create_memory_table(
+            left_partition,
+            right_partition,
+            left_sorted,
+            right_sorted,
+        )?;
+
+        let on = vec![(
+            Column::new_with_schema("lc1", left_schema)?,
+            Column::new_with_schema("rc1", right_schema)?,
+        )];
+
+        let intermediate_schema = Schema::new(vec![
+            Field::new("0", DataType::Int32, true),
+            Field::new("1", DataType::Int32, true),
+            Field::new("2", DataType::Int32, true),
+            Field::new("3", DataType::Int32, true),
+        ]);
+        let filter_expr = complicated_4_column_exprs(case_expr, &intermediate_schema)?;
+        let column_indices = vec![
+            ColumnIndex {
+                index: left_schema.index_of("la1")?,
+                side: JoinSide::Left,
+            },
+            ColumnIndex {
+                index: left_schema.index_of("la2")?,
+                side: JoinSide::Left,
+            },
+            ColumnIndex {
+                index: right_schema.index_of("ra1")?,
+                side: JoinSide::Right,
+            },
+            ColumnIndex {
+                index: right_schema.index_of("ra2")?,
                 side: JoinSide::Right,
             },
         ];
