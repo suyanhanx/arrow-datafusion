@@ -15,6 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// This file contains both Apache Software Foundation copyrighted code
+// as well as Synnada, Inc. extensions.
+// Synnada, Inc. extensions start with commit 152a6e5df3d1528a81a1a9d7f103fd3646c2fb84.
+// Synnada, Inc. claims copyright only for Synnada, Inc. extensions.
+
 mod kernels;
 
 use std::hash::{Hash, Hasher};

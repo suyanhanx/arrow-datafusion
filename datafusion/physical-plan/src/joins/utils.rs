@@ -15,6 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// This file contains both Apache Software Foundation copyrighted code
+// as well as Synnada, Inc. extensions.
+// Synnada, Inc. extensions start with commit 631d45cf5aa7e15ec90fb14cd770869c82186f2e.
+// Synnada, Inc. claims copyright only for Synnada, Inc. extensions.
+
 //! Join related functionality used both on logical and physical plans
 
 use std::collections::HashSet;
