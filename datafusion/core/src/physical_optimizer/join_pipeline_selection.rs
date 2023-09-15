@@ -1,32 +1,39 @@
 // Copyright (C) Synnada, Inc. - All Rights Reserved.
 // This file does not contain any Apache Software Foundation copyrighted code.
 
+use std::sync::Arc;
+
 use crate::physical_optimizer::join_selection::{
-    swap_join_type, swap_reverting_projection,
+    swap_filter, swap_join_type, swap_reverting_projection,
 };
-use crate::physical_optimizer::utils::{is_hash_join, unbounded_output};
-use crate::physical_plan::joins::{HashJoinExec, SortMergeJoinExec};
+use crate::physical_optimizer::utils::{is_hash_join, is_nested_loop_join, is_sort};
+use crate::physical_plan::joins::utils::{is_filter_expr_prunable, JoinOn};
+use crate::physical_plan::joins::{
+    HashJoinExec, NestedLoopJoinExec, SlidingHashJoinExec, SlidingNestedLoopJoinExec,
+    SortMergeJoinExec, StreamJoinPartitionMode,
+};
 use crate::physical_plan::projection::ProjectionExec;
 use crate::physical_plan::sorts::sort::SortExec;
 use crate::physical_plan::{with_new_children_if_necessary, ExecutionPlan};
+
 use arrow_schema::SortOptions;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::{Transformed, TreeNode, VisitRecursion};
-use datafusion_common::{DataFusionError, JoinType};
+use datafusion_common::{DataFusionError, JoinType, Result};
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::utils::{
     get_indices_of_matching_sort_exprs_with_order_eq,
     ordering_satisfy_requirement_concrete,
 };
 use datafusion_physical_expr::PhysicalSortRequirement;
+
 use itertools::{iproduct, izip, Itertools};
-use std::sync::Arc;
 
 /// This object is used within the JoinSelection rule to track the closest
-/// [`HashJoinExec`] descendant(s) for every child of a plan.
+/// [`HashJoinExec`] or [`NestedLoopJoinExec`] descendant(s) for every child of a plan.
 #[derive(Debug, Clone)]
 pub struct PlanWithCorrespondingHashJoin {
-    plan: Arc<dyn ExecutionPlan>,
+    pub(crate) plan: Arc<dyn ExecutionPlan>,
     // For every child, we keep a subtree of `ExecutionPlan`s starting from the
     // child until the `HashJoinExec`(s) that affect the output ordering of the
     // child. If the child has no connection to any `HashJoinExec`, simply store
@@ -46,7 +53,7 @@ impl PlanWithCorrespondingHashJoin {
     pub fn new_from_children_nodes(
         children_nodes: Vec<PlanWithCorrespondingHashJoin>,
         parent_plan: Arc<dyn ExecutionPlan>,
-    ) -> datafusion_common::Result<Self> {
+    ) -> Result<Self> {
         let children_plans = children_nodes
             .iter()
             .map(|item| item.plan.clone())
@@ -59,7 +66,7 @@ impl PlanWithCorrespondingHashJoin {
                 if plan.children().is_empty() {
                     // Plan has no children, there is nothing to propagate.
                     None
-                } else if is_hash_join(&plan)
+                } else if (is_hash_join(&plan) || is_nested_loop_join(&plan))
                     && item.hash_join_onwards.iter().all(|e| e.is_none())
                 {
                     Some(MultipleExecTree::new(vec![plan], idx, vec![]))
@@ -71,6 +78,8 @@ impl PlanWithCorrespondingHashJoin {
                             .filter_map(|(maintains, element, required_ordering)| {
                                 if (required_ordering.is_none() && maintains)
                                     || is_hash_join(&plan)
+                                    || is_nested_loop_join(&plan)
+                                    || is_sort(&plan)
                                 {
                                     element
                                 } else {
@@ -103,9 +112,9 @@ impl PlanWithCorrespondingHashJoin {
 }
 
 impl TreeNode for PlanWithCorrespondingHashJoin {
-    fn apply_children<F>(&self, op: &mut F) -> datafusion_common::Result<VisitRecursion>
-    where
-        F: FnMut(&Self) -> datafusion_common::Result<VisitRecursion>,
+    fn apply_children<F>(&self, op: &mut F) -> Result<VisitRecursion>
+        where
+            F: FnMut(&Self) -> Result<VisitRecursion>,
     {
         for child in self.children() {
             match op(&child)? {
@@ -118,9 +127,9 @@ impl TreeNode for PlanWithCorrespondingHashJoin {
         Ok(VisitRecursion::Continue)
     }
 
-    fn map_children<F>(self, transform: F) -> datafusion_common::Result<Self>
-    where
-        F: FnMut(Self) -> datafusion_common::Result<Self>,
+    fn map_children<F>(self, transform: F) -> Result<Self>
+        where
+            F: FnMut(Self) -> Result<Self>,
     {
         let children = self.children();
         if children.is_empty() {
@@ -129,7 +138,7 @@ impl TreeNode for PlanWithCorrespondingHashJoin {
             let children_nodes = children
                 .into_iter()
                 .map(transform)
-                .collect::<datafusion_common::Result<Vec<_>>>()?;
+                .collect::<Result<Vec<_>>>()?;
             PlanWithCorrespondingHashJoin::new_from_children_nodes(
                 children_nodes,
                 self.plan,
@@ -143,7 +152,7 @@ fn swap_sort_merge_join(
     hash_join: &HashJoinExec,
     keys: Vec<(Column, Column)>,
     sort_options: Vec<SortOptions>,
-) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+) -> Result<Arc<dyn ExecutionPlan>> {
     let left = hash_join.left();
     let right = hash_join.right();
     let swapped_join_type = swap_join_type(hash_join.join_type);
@@ -230,7 +239,7 @@ impl MultipleExecTree {
 fn create_join_cases_local_preserve_order(
     hash_join_onwards: &mut MultipleExecTree,
     config_options: &ConfigOptions,
-) -> datafusion_common::Result<Vec<Arc<dyn ExecutionPlan>>> {
+) -> Result<Vec<Arc<dyn ExecutionPlan>>> {
     // Clone all the plans in the given subtree:
     let plans = hash_join_onwards.plans.clone();
 
@@ -274,7 +283,7 @@ fn create_join_cases_local_preserve_order(
                 let plan = with_new_children_if_necessary(plan, children)?.into();
                 Ok(plan)
             })
-            .collect::<datafusion_common::Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()?;
     }
 
     // For each plan, check if it is a `HashJoinExec`. If so, check if we can convert
@@ -282,18 +291,148 @@ fn create_join_cases_local_preserve_order(
     let plans: Vec<_> = hash_join_onwards
         .plans
         .iter()
-        .flat_map(|plan| match plan.as_any().downcast_ref::<HashJoinExec>() {
-            Some(hash_join) => {
+        .flat_map(|plan| {
+            if let Some(hash_join) = plan.as_any().downcast_ref::<HashJoinExec>() {
                 match check_hash_join_convertable(hash_join, config_options) {
                     Ok(Some(result)) => result,
                     _ => vec![plan.clone()],
                 }
+            } else if let Some(nested_loop_join) =
+                plan.as_any().downcast_ref::<NestedLoopJoinExec>()
+            {
+                match check_nested_loop_join_convertable(nested_loop_join, config_options)
+                {
+                    Ok(Some(result)) => result,
+                    _ => vec![plan.clone()],
+                }
+            } else if let Some(sort_exec) = plan.as_any().downcast_ref::<SortExec>() {
+                let sort_child = sort_exec.input().clone();
+                let child_requirement = sort_exec
+                    .expr()
+                    .iter()
+                    .cloned()
+                    .map(PhysicalSortRequirement::from)
+                    .collect::<Vec<_>>();
+                if sort_child
+                    .output_ordering()
+                    .map_or(false, |provided_ordering| {
+                        ordering_satisfy_requirement_concrete(
+                            provided_ordering,
+                            &child_requirement,
+                            || sort_child.equivalence_properties(),
+                            || sort_child.ordering_equivalence_properties(),
+                        )
+                    })
+                {
+                    vec![sort_child.clone()]
+                } else {
+                    vec![]
+                }
+            } else {
+                vec![plan.clone()]
             }
-            None => vec![plan.clone()],
         })
         .collect();
 
     Ok(plans)
+}
+
+/// Swaps join columns.
+fn swap_join_on(on: &JoinOn) -> JoinOn {
+    on.iter().map(|(l, r)| (r.clone(), l.clone())).collect()
+}
+
+/// This function swaps the inputs of the given join operator.
+fn swap_sliding_hash_join(join: &SlidingHashJoinExec) -> Result<Arc<dyn ExecutionPlan>> {
+    let err_msg = || {
+        DataFusionError::Internal(
+            "SlidingHashJoinExec needs left and right side ordered.".to_owned(),
+        )
+    };
+    let left = join.left.clone();
+    let right = join.right.clone();
+    let left_sort_expr = left
+        .output_ordering()
+        .map(|order| order.to_vec())
+        .ok_or_else(err_msg)?;
+    let right_sort_expr = right
+        .output_ordering()
+        .map(|order| order.to_vec())
+        .ok_or_else(err_msg)?;
+
+    let new_join = SlidingHashJoinExec::try_new(
+        right.clone(),
+        left.clone(),
+        swap_join_on(&join.on),
+        swap_filter(&join.filter),
+        &swap_join_type(join.join_type),
+        join.null_equals_null,
+        right_sort_expr,
+        left_sort_expr,
+        join.mode,
+    )?;
+    if matches!(
+        join.join_type,
+        JoinType::LeftSemi
+            | JoinType::RightSemi
+            | JoinType::LeftAnti
+            | JoinType::RightAnti
+    ) {
+        Ok(Arc::new(new_join))
+    } else {
+        // TODO: Avoid adding ProjectionExec again and again, only add one final projection.
+        let proj = ProjectionExec::try_new(
+            swap_reverting_projection(&left.schema(), &right.schema()),
+            Arc::new(new_join),
+        )?;
+        Ok(Arc::new(proj))
+    }
+}
+
+/// This function swaps the inputs of the given join operator.
+pub fn swap_sliding_nested_loop_join(
+    join: &SlidingNestedLoopJoinExec,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let err_msg = || {
+        DataFusionError::Internal(
+            "SlidingNestedLoopJoinExec needs left and right side ordered.".to_owned(),
+        )
+    };
+    let left = join.left.clone();
+    let right = join.right.clone();
+    let left_sort_expr = left
+        .output_ordering()
+        .map(|order| order.to_vec())
+        .ok_or_else(err_msg)?;
+    let right_sort_expr = right
+        .output_ordering()
+        .map(|order| order.to_vec())
+        .ok_or_else(err_msg)?;
+
+    let new_join = SlidingNestedLoopJoinExec::try_new(
+        right.clone(),
+        left.clone(),
+        swap_filter(&join.filter),
+        &swap_join_type(join.join_type),
+        right_sort_expr,
+        left_sort_expr,
+    )?;
+    if matches!(
+        join.join_type,
+        JoinType::LeftSemi
+            | JoinType::RightSemi
+            | JoinType::LeftAnti
+            | JoinType::RightAnti
+    ) {
+        Ok(Arc::new(new_join))
+    } else {
+        // TODO: Avoid adding ProjectionExec again and again, only add one final projection.
+        let proj = ProjectionExec::try_new(
+            swap_reverting_projection(&left.schema(), &right.schema()),
+            Arc::new(new_join),
+        )?;
+        Ok(Arc::new(proj))
+    }
 }
 
 /// Checks if a given `HashJoinExec` can be converted into another form of execution plans,
@@ -323,21 +462,56 @@ fn create_join_cases_local_preserve_order(
 /// will result in an `Err` being returned.
 fn check_hash_join_convertable(
     hash_join: &HashJoinExec,
-    _config_options: &ConfigOptions,
-) -> datafusion_common::Result<Option<Vec<Arc<dyn ExecutionPlan>>>> {
+    config_options: &ConfigOptions,
+) -> Result<Option<Vec<Arc<dyn ExecutionPlan>>>> {
     let filter = hash_join.filter();
     let (on_left, on_right): (Vec<_>, Vec<_>) = hash_join.on.iter().cloned().unzip();
     let left_order = hash_join.left().output_ordering();
     let right_order = hash_join.right().output_ordering();
-    let is_left_unbounded = unbounded_output(hash_join.left());
-    let is_right_unbounded = unbounded_output(hash_join.right());
+    let is_left_streaming = is_plan_streaming(hash_join.left());
+    let is_right_streaming = is_plan_streaming(hash_join.right());
     match (
-        is_left_unbounded,
-        is_right_unbounded,
+        is_left_streaming,
+        is_right_streaming,
         filter,
         left_order,
         right_order,
     ) {
+        (true, true, Some(filter), Some(left_order), Some(right_order)) => {
+            let (left_prunable, right_prunable) = is_filter_expr_prunable(
+                filter,
+                Some(left_order[0].clone()),
+                Some(right_order[0].clone()),
+                || hash_join.left().equivalence_properties(),
+                || hash_join.left().ordering_equivalence_properties(),
+                || hash_join.right().equivalence_properties(),
+                || hash_join.right().ordering_equivalence_properties(),
+            )?;
+
+            if left_prunable && right_prunable {
+                let mode = if config_options.optimizer.repartition_joins {
+                    StreamJoinPartitionMode::Partitioned
+                } else {
+                    StreamJoinPartitionMode::SinglePartition
+                };
+                let sliding_hash_join = Arc::new(SlidingHashJoinExec::try_new(
+                    hash_join.left.clone(),
+                    hash_join.right.clone(),
+                    hash_join.on.clone(),
+                    filter.clone(),
+                    &hash_join.join_type,
+                    hash_join.null_equals_null,
+                    left_order.to_vec(),
+                    right_order.to_vec(),
+                    mode,
+                )?);
+                let reversed_sliding_hash_join =
+                    swap_sliding_hash_join(&sliding_hash_join)?;
+                Ok(Some(vec![sliding_hash_join, reversed_sliding_hash_join]))
+            } else {
+                Ok(None)
+            }
+        }
         (true, true, None, Some(left_order), Some(right_order)) => {
             // Get left key(s)' sort options:
             let left_satisfied = get_indices_of_matching_sort_exprs_with_order_eq(
@@ -362,9 +536,9 @@ fn check_hash_join_convertable(
                 // Check if the indices are equal and the sort options are aligned:
                 if left_indices == right_indices
                     && left_satisfied
-                        .iter()
-                        .zip(right_satisfied.iter())
-                        .all(|(l, r)| l == r)
+                    .iter()
+                    .zip(right_satisfied.iter())
+                    .all(|(l, r)| l == r)
                 {
                     let adjusted_keys = left_indices
                         .iter()
@@ -399,6 +573,56 @@ fn check_hash_join_convertable(
     }
 }
 
+fn check_nested_loop_join_convertable(
+    nested_loop_join: &NestedLoopJoinExec,
+    _config_options: &ConfigOptions,
+) -> Result<Option<Vec<Arc<dyn ExecutionPlan>>>> {
+    let filter = nested_loop_join.filter();
+    let left_order = nested_loop_join.left().output_ordering();
+    let right_order = nested_loop_join.right().output_ordering();
+    let is_left_streaming = is_plan_streaming(nested_loop_join.left());
+    let is_right_streaming = is_plan_streaming(nested_loop_join.right());
+    match (
+        is_left_streaming,
+        is_right_streaming,
+        filter,
+        left_order,
+        right_order,
+    ) {
+        (true, true, Some(filter), Some(left_order), Some(right_order)) => {
+            let (left_prunable, right_prunable) = is_filter_expr_prunable(
+                filter,
+                Some(left_order[0].clone()),
+                Some(right_order[0].clone()),
+                || nested_loop_join.left().equivalence_properties(),
+                || nested_loop_join.left().ordering_equivalence_properties(),
+                || nested_loop_join.right().equivalence_properties(),
+                || nested_loop_join.right().ordering_equivalence_properties(),
+            )?;
+            if left_prunable && right_prunable {
+                let sliding_nested_loop_join =
+                    Arc::new(SlidingNestedLoopJoinExec::try_new(
+                        nested_loop_join.left.clone(),
+                        nested_loop_join.right.clone(),
+                        filter.clone(),
+                        &nested_loop_join.join_type,
+                        left_order.to_vec(),
+                        right_order.to_vec(),
+                    )?);
+                let reversed_sliding_nested_loop_join =
+                    swap_sliding_nested_loop_join(&sliding_nested_loop_join)?;
+                Ok(Some(vec![
+                    sliding_nested_loop_join,
+                    reversed_sliding_nested_loop_join,
+                ]))
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Generates and filters a set of execution plans based on a specified ordering requirement.
 ///
 /// This function leverages the `create_join_cases_local_preserve_order` function to generate
@@ -426,7 +650,7 @@ fn get_meeting_the_plan_with_required_order(
     hash_join_onward: &mut MultipleExecTree,
     required_ordering: &[PhysicalSortRequirement],
     config_options: &ConfigOptions,
-) -> datafusion_common::Result<Vec<Arc<dyn ExecutionPlan>>> {
+) -> Result<Vec<Arc<dyn ExecutionPlan>>> {
     let possible_plans =
         create_join_cases_local_preserve_order(hash_join_onward, config_options)?;
     Ok(find_suitable_plans(possible_plans, required_ordering))
@@ -474,10 +698,23 @@ fn find_suitable_plans(
 ///
 /// TODO: Until the Datafusion can identify execution costs of the plans, we
 ///       are selecting the first feasible plan.
-fn select_best_plan(
+fn select_best_streaming_plan(
     possible_plans: Vec<Arc<dyn ExecutionPlan>>,
 ) -> Option<Arc<dyn ExecutionPlan>> {
-    possible_plans.first().cloned()
+    possible_plans
+        .into_iter()
+        .find(|plan| is_plan_streaming(plan))
+}
+
+// Check if the given `plan` processes infinite data in a streaming fashion.
+fn is_plan_streaming(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    let children_unbounded_output = plan
+        .children()
+        .iter()
+        .map(is_plan_streaming)
+        .collect::<Vec<_>>();
+    plan.unbounded_output(&children_unbounded_output)
+        .unwrap_or(false)
 }
 
 /// This subrule tries to modify joins in order to preserve output ordering(s).
@@ -486,7 +723,7 @@ fn select_best_plan(
 pub fn select_joins_to_preserve_order_subrule(
     requirements: PlanWithCorrespondingHashJoin,
     config_options: &ConfigOptions,
-) -> datafusion_common::Result<Transformed<PlanWithCorrespondingHashJoin>> {
+) -> Result<Transformed<PlanWithCorrespondingHashJoin>> {
     // If there are no child nodes, return as is:
     if requirements.plan.children().is_empty() {
         return Ok(Transformed::No(requirements));
@@ -522,7 +759,7 @@ pub fn select_joins_to_preserve_order_subrule(
                 config_options,
             )?;
             // If there is a plan that is more optimal, choose it:
-            if let Some(plan) = select_best_plan(possible_plans) {
+            if let Some(plan) = select_best_streaming_plan(possible_plans) {
                 *child = plan;
                 is_transformed = true;
             }
@@ -534,29 +771,6 @@ pub fn select_joins_to_preserve_order_subrule(
                 hash_join_onwards,
             }));
         }
-    } else if let Some(sort_exec) = plan.as_any().downcast_ref::<SortExec>() {
-        // If the plan is a `SortExec`, create child requirements:
-        let child_requirement = sort_exec
-            .expr()
-            .iter()
-            .cloned()
-            .map(PhysicalSortRequirement::from)
-            .collect::<Vec<_>>();
-        if let Some(hash_join_onward) = hash_join_onwards.get_mut(0).unwrap() {
-            // Get possible plans meeting the ordering requirements:
-            let possible_plans = get_meeting_the_plan_with_required_order(
-                hash_join_onward,
-                &child_requirement,
-                config_options,
-            )?;
-            // If there is a plan that is more optimal, choose it:
-            if let Some(new_child) = select_best_plan(possible_plans) {
-                return Ok(Transformed::Yes(PlanWithCorrespondingHashJoin {
-                    plan: new_child,
-                    hash_join_onwards: vec![None],
-                }));
-            }
-        };
     };
     // If no transformation is possible or required, return as is:
     Ok(Transformed::No(PlanWithCorrespondingHashJoin {
@@ -565,82 +779,16 @@ pub fn select_joins_to_preserve_order_subrule(
     }))
 }
 
-/// This function takes the last step to finalize the recursive analysis made
-/// by the subrule `select_joins_to_preserve_order_subrule`. If the main plan
-/// has an output ordering at the very top, our aim is to maintain that order.
-/// For example, this function enables us to handle the plans like:
-/// [
-///     "FilterExec: NOT d@6",
-///     "  HashJoinExec: mode=Partitioned, join_type=Inner, on=\[(c@2, c@2)\], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
-///     "    StreamingTableExec: partition_sizes=0, projection=\[a, b, c\], infinite_source=true, output_ordering=\[a@0 ASC\]",
-///     "    BoundedWindowAggExec: wdw= \[count: Ok(Field { .. }), frame: WindowFrame { .. }], mode=\[Sorted\]",
-///     "      HashJoinExec: mode=Partitioned, join_type=Inner, on=\[(c@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
-///     "        StreamingTableExec: partition_sizes=0, projection=\[a, b, c\], infinite_source=true, output_ordering=\[a@0 ASC\]",
-///     "        StreamingTableExec: partition_sizes=0, projection=\[d, e, c\], infinite_source=true, output_ordering=\[d@0 ASC\]",
-/// ]
-pub fn finalize_order_preserving_joins_at_root(
-    requirements: PlanWithCorrespondingHashJoin,
-    config_options: &ConfigOptions,
-) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-    let PlanWithCorrespondingHashJoin {
-        plan,
-        mut hash_join_onwards,
-    } = requirements;
-    // If the top operator is a `SortExec`, or requires an output ordering, we
-    // already make the necessary `HashJoin` replacements in the subrule
-    // `select_joins_to_preserve_order_subrule`.
-    if plan.as_any().is::<SortExec>()
-        || plan.required_input_ordering().iter().any(|e| e.is_some())
-    {
-        return Ok(plan);
-    }
-    // Check if the plan has an output ordering. If not, return early.
-    let required_ordering = match plan.output_ordering() {
-        Some(sort_exprs) => sort_exprs
-            .iter()
-            .cloned()
-            .map(PhysicalSortRequirement::from)
-            .collect::<Vec<_>>(),
-        None => return Ok(plan),
-    };
-
-    // Handle terminal hash joins:
-    if let Some(hash_join) = plan.as_any().downcast_ref::<HashJoinExec>() {
-        if let Ok(Some(plans)) = check_hash_join_convertable(hash_join, config_options) {
-            let suitable_plans = find_suitable_plans(plans, &required_ordering);
-            if let Some(plan) = select_best_plan(suitable_plans) {
-                return Ok(plan);
-            }
-        }
-    }
-    let children_cases = hash_join_onwards
-        .iter_mut()
-        .filter_map(|hj| {
-            hj.as_mut()
-                .map(|hj| create_join_cases_local_preserve_order(hj, config_options))
-        })
-        .collect::<datafusion_common::Result<Vec<_>>>()?
-        .into_iter()
-        .multi_cartesian_product();
-    let possible_plans = children_cases
-        .map(|children| plan.clone().with_new_children(children))
-        .collect::<datafusion_common::Result<Vec<_>>>()?;
-    let suitable_plans = find_suitable_plans(possible_plans, &required_ordering);
-    if let Some(plan) = select_best_plan(suitable_plans) {
-        return Ok(plan);
-    }
-    Ok(plan)
-}
-
 #[cfg(test)]
 mod order_preserving_join_swap_tests {
     use std::sync::Arc;
 
-    use crate::physical_optimizer::enforce_sorting::EnforceSorting;
     use crate::physical_optimizer::global_order_require::GlobalOrderRequire;
     use crate::physical_optimizer::join_selection::JoinSelection;
+    use crate::physical_optimizer::enforce_sorting::EnforceSorting;
     use crate::physical_optimizer::test_utils::{
-        memory_exec_with_sort, sort_expr_options,
+        memory_exec_with_sort, nested_loop_join_exec, not_prunable_filter,
+        sort_expr_options,
     };
     use crate::physical_optimizer::PhysicalOptimizerRule;
     use crate::physical_plan::joins::utils::{ColumnIndex, JoinSide};
@@ -648,12 +796,14 @@ mod order_preserving_join_swap_tests {
     use crate::physical_plan::{displayable, ExecutionPlan};
     use crate::prelude::SessionContext;
     use crate::{
-        assert_optimized_orthogonal,
+        assert_enforce_sorting_join_selection, assert_join_selection_enforce_sorting,
+        assert_original_plan,
         physical_optimizer::test_utils::{
             bounded_window_exec, filter_exec, hash_join_exec, prunable_filter, sort_exec,
             sort_expr, streaming_table_exec,
         },
     };
+
     use arrow_schema::{DataType, Field, Schema, SchemaRef, SortOptions};
     use datafusion_common::Result;
     use datafusion_expr::{BuiltInWindowFunction, JoinType, WindowFrame, WindowFunction};
@@ -694,16 +844,16 @@ mod order_preserving_join_swap_tests {
     #[tokio::test]
     async fn test_multiple_options_for_sort_merge_joins() -> Result<()> {
         let left_schema = create_test_schema()?;
-        let right_schema = create_test_schema2()?;
+        let right_table_schema = create_test_schema2()?;
         let left_input =
             streaming_table_exec(&left_schema, Some(vec![sort_expr("a", &left_schema)]));
         let right_input = streaming_table_exec(
-            &right_schema,
-            Some(vec![sort_expr("d", &right_schema)]),
+            &right_table_schema,
+            Some(vec![sort_expr("d", &right_table_schema)]),
         );
         let on = vec![(
             Column::new_with_schema("a", &left_schema)?,
-            Column::new_with_schema("d", &right_schema)?,
+            Column::new_with_schema("d", &right_table_schema)?,
         )];
         let join = hash_join_exec(left_input, right_input, on, None, &JoinType::Inner)?;
         let join_schema = join.schema();
@@ -714,7 +864,6 @@ mod order_preserving_join_swap_tests {
         let left_input =
             streaming_table_exec(&left_schema, Some(vec![sort_expr("a", &left_schema)]));
         let right_input = bounded_window_exec("b", window_sort_expr, sort);
-        let right_schema = right_input.schema();
         let on = vec![(
             Column::new_with_schema("a", &left_schema)?,
             Column::new_with_schema("d", &join_schema)?,
@@ -725,12 +874,12 @@ mod order_preserving_join_swap_tests {
         let left_input = join.clone();
         let left_schema = join.schema();
         let right_input = streaming_table_exec(
-            &right_schema,
-            Some(vec![sort_expr("e", &right_schema)]),
+            &right_table_schema,
+            Some(vec![sort_expr("e", &right_table_schema)]),
         );
         let on = vec![(
             Column::new_with_schema("a", &left_schema)?,
-            Column::new_with_schema("e", &right_schema)?,
+            Column::new_with_schema("e", &right_table_schema)?,
         )];
         let join = hash_join_exec(left_input, right_input, on, None, &JoinType::Inner)?;
         let join_schema = join.schema();
@@ -742,7 +891,7 @@ mod order_preserving_join_swap_tests {
         let expected_input = [
             "BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
             "  SortExec: expr=[a@0 ASC]",
-            "    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, e@4)]",
+            "    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, e@1)]",
             "      HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, d@3)]",
             "        StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
             "        BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
@@ -750,20 +899,22 @@ mod order_preserving_join_swap_tests {
             "            HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, d@0)]",
             "              StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
             "              StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
-            "      StreamingTableExec: partition_sizes=0, projection=[a, b, c, d, e, c, count], infinite_source=true, output_ordering=[e@4 ASC]",
+            "      StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[e@1 ASC]",
         ];
         let expected_optimized = [
             "BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
-            "  SortMergeJoin: join_type=Inner, on=[(a@0, e@4)]",
+            "  SortMergeJoin: join_type=Inner, on=[(a@0, e@1)]",
             "    SortMergeJoin: join_type=Inner, on=[(a@0, d@3)]",
             "      StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
             "      BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
             "        SortMergeJoin: join_type=Inner, on=[(a@0, d@0)]",
             "          StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
             "          StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
-            "    StreamingTableExec: partition_sizes=0, projection=[a, b, c, d, e, c, count], infinite_source=true, output_ordering=[e@4 ASC]",
+            "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[e@1 ASC]",
         ];
-        assert_optimized_orthogonal!(expected_input, expected_optimized, physical_plan);
+        assert_original_plan!(expected_input, physical_plan.clone());
+        assert_join_selection_enforce_sorting!(expected_optimized, physical_plan.clone());
+        assert_enforce_sorting_join_selection!(expected_optimized, physical_plan);
         Ok(())
     }
 
@@ -818,7 +969,9 @@ mod order_preserving_join_swap_tests {
             "      StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
             "      StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
         ];
-        assert_optimized_orthogonal!(expected_input, expected_optimized, physical_plan);
+        assert_original_plan!(expected_input, physical_plan.clone());
+        assert_join_selection_enforce_sorting!(expected_optimized, physical_plan.clone());
+        assert_enforce_sorting_join_selection!(expected_optimized, physical_plan);
         Ok(())
     }
 
@@ -879,7 +1032,9 @@ mod order_preserving_join_swap_tests {
             "        StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
             "        StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
         ];
-        assert_optimized_orthogonal!(expected_input, expected_optimized, physical_plan);
+        assert_original_plan!(expected_input, physical_plan.clone());
+        assert_join_selection_enforce_sorting!(expected_optimized, physical_plan.clone());
+        assert_enforce_sorting_join_selection!(expected_optimized, physical_plan);
         Ok(())
     }
 
@@ -906,7 +1061,6 @@ mod order_preserving_join_swap_tests {
         let left_input =
             streaming_table_exec(&left_schema, Some(vec![sort_expr("a", &left_schema)]));
         let right_input = bounded_window_exec("b", window_sort_expr, sort);
-        let right_schema = right_input.schema();
         let on = vec![(
             Column::new_with_schema("a", &left_schema)?,
             Column::new_with_schema("d", &join_schema)?,
@@ -934,7 +1088,7 @@ mod order_preserving_join_swap_tests {
         let expected_input = [
             "BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
             "  SortExec: expr=[a@0 ASC]",
-            "    HashJoinExec: mode=Partitioned, join_type=Left, on=[(a@0, e@4)]",
+            "    HashJoinExec: mode=Partitioned, join_type=Left, on=[(a@0, e@1)]",
             "      HashJoinExec: mode=Partitioned, join_type=Left, on=[(a@0, d@3)]",
             "        StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
             "        BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
@@ -942,20 +1096,22 @@ mod order_preserving_join_swap_tests {
             "            HashJoinExec: mode=Partitioned, join_type=Right, on=[(a@0, d@0)]",
             "              StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
             "              StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
-            "      StreamingTableExec: partition_sizes=0, projection=[a, b, c, d, e, c, count], infinite_source=true, output_ordering=[e@4 ASC]",
+            "      StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[e@1 ASC]",
         ];
         let expected_optimized = [
             "BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
-            "  SortMergeJoin: join_type=Left, on=[(a@0, e@4)]",
+            "  SortMergeJoin: join_type=Left, on=[(a@0, e@1)]",
             "    SortMergeJoin: join_type=Left, on=[(a@0, d@3)]",
             "      StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
             "      BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
             "        SortMergeJoin: join_type=Right, on=[(a@0, d@0)]",
             "          StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
             "          StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
-            "    StreamingTableExec: partition_sizes=0, projection=[a, b, c, d, e, c, count], infinite_source=true, output_ordering=[e@4 ASC]",
+            "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[e@1 ASC]",
         ];
-        assert_optimized_orthogonal!(expected_input, expected_optimized, physical_plan);
+        assert_original_plan!(expected_input, physical_plan.clone());
+        assert_join_selection_enforce_sorting!(expected_optimized, physical_plan.clone());
+        assert_enforce_sorting_join_selection!(expected_optimized, physical_plan);
         Ok(())
     }
 
@@ -980,13 +1136,13 @@ mod order_preserving_join_swap_tests {
                     Arc::new(WindowFrame::new(true)),
                     schema.as_ref(),
                 )
-                .unwrap()],
+                    .unwrap()],
                 input.clone(),
                 input.schema(),
                 vec![],
                 crate::physical_plan::windows::PartitionSearchMode::Sorted,
             )
-            .unwrap(),
+                .unwrap(),
         )
     }
 
@@ -1046,7 +1202,9 @@ mod order_preserving_join_swap_tests {
             "  BoundedWindowAggExec: wdw=[row_number: Ok(Field { name: \"row_number\", data_type: UInt64, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
             "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC NULLS LAST]",
         ];
-        assert_optimized_orthogonal!(expected_input, expected_optimized, physical_plan);
+        assert_original_plan!(expected_input, physical_plan.clone());
+        assert_join_selection_enforce_sorting!(expected_optimized, physical_plan.clone());
+        assert_enforce_sorting_join_selection!(expected_optimized, physical_plan);
         Ok(())
     }
 
@@ -1095,7 +1253,9 @@ mod order_preserving_join_swap_tests {
             "      StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC NULLS LAST]",
             "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC NULLS LAST]",
         ];
-        assert_optimized_orthogonal!(expected_input, expected_optimized, physical_plan);
+        assert_original_plan!(expected_input, physical_plan.clone());
+        assert_join_selection_enforce_sorting!(expected_optimized, physical_plan.clone());
+        assert_enforce_sorting_join_selection!(expected_optimized, physical_plan);
         Ok(())
     }
 
@@ -1150,7 +1310,9 @@ mod order_preserving_join_swap_tests {
             "      StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC NULLS LAST]",
             "  StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC NULLS LAST]",
         ];
-        assert_optimized_orthogonal!(expected_input, expected_optimized, physical_plan);
+        assert_original_plan!(expected_input, physical_plan.clone());
+        assert_join_selection_enforce_sorting!(expected_optimized, physical_plan.clone());
+        assert_enforce_sorting_join_selection!(expected_optimized, physical_plan);
         Ok(())
     }
 
@@ -1211,7 +1373,9 @@ mod order_preserving_join_swap_tests {
             "      StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC NULLS LAST, e@1 ASC NULLS LAST]",
             "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC NULLS LAST, b@1 ASC NULLS LAST]",
         ];
-        assert_optimized_orthogonal!(expected_input, expected_optimized, physical_plan);
+        assert_original_plan!(expected_input, physical_plan.clone());
+        assert_join_selection_enforce_sorting!(expected_optimized, physical_plan.clone());
+        assert_enforce_sorting_join_selection!(expected_optimized, physical_plan);
         Ok(())
     }
 
@@ -1276,7 +1440,9 @@ mod order_preserving_join_swap_tests {
             "      StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC NULLS LAST, e@1 ASC NULLS LAST]",
             "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC NULLS LAST, b@1 ASC NULLS LAST]",
         ];
-        assert_optimized_orthogonal!(expected_input, expected_optimized, physical_plan);
+        assert_original_plan!(expected_input, physical_plan.clone());
+        assert_join_selection_enforce_sorting!(expected_optimized, physical_plan.clone());
+        assert_enforce_sorting_join_selection!(expected_optimized, physical_plan);
         Ok(())
     }
 
@@ -1323,7 +1489,9 @@ mod order_preserving_join_swap_tests {
             "      MemoryExec: partitions=0, partition_sizes=[], output_ordering=a@0 ASC",
             "      MemoryExec: partitions=0, partition_sizes=[], output_ordering=d@0 ASC",
         ];
-        assert_optimized_orthogonal!(expected_input, expected_optimized, physical_plan);
+        assert_original_plan!(expected_input, physical_plan.clone());
+        assert_join_selection_enforce_sorting!(expected_optimized, physical_plan.clone());
+        assert_enforce_sorting_join_selection!(expected_optimized, physical_plan);
         Ok(())
     }
 
@@ -1359,7 +1527,1154 @@ mod order_preserving_join_swap_tests {
             "  StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true",
             "  StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true",
         ];
-        assert_optimized_orthogonal!(expected_input, expected_optimized, physical_plan);
+        assert_original_plan!(expected_input, physical_plan.clone());
+        assert_join_selection_enforce_sorting!(expected_optimized, physical_plan.clone());
+        assert_enforce_sorting_join_selection!(expected_optimized, physical_plan);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_remove_unnecessary_sort() -> Result<()> {
+        let left_schema = create_test_schema()?;
+        let right_schema = create_test_schema2()?;
+        let left_input =
+            streaming_table_exec(&left_schema, Some(vec![sort_expr("a", &left_schema)]));
+        let right_input = streaming_table_exec(
+            &right_schema,
+            Some(vec![sort_expr("d", &right_schema)]),
+        );
+        let prunable_filter = prunable_filter(
+            col_indices("a", &left_schema, JoinSide::Left),
+            col_indices("d", &right_schema, JoinSide::Right),
+        );
+        let on = vec![(
+            Column::new_with_schema("c", &left_schema)?,
+            Column::new_with_schema("c", &right_schema)?,
+        )];
+        let join = hash_join_exec(
+            left_input,
+            right_input,
+            on,
+            Some(prunable_filter),
+            &JoinType::Inner,
+        )?;
+        let physical_plan = sort_exec(vec![sort_expr("d", &join.schema())], join);
+
+        let expected_input = [
+            "SortExec: expr=[d@3 ASC]",
+            "  HashJoinExec: mode=Partitioned, join_type=Inner, on=[(c@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+        ];
+        let expected_optimized = [
+            "SlidingHashJoinExec: join_type=Inner, on=[(c@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "  StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "  StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+        ];
+        assert_original_plan!(expected_input, physical_plan.clone());
+        assert_join_selection_enforce_sorting!(expected_optimized, physical_plan.clone());
+        assert_enforce_sorting_join_selection!(expected_optimized, physical_plan);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_can_not_remove_unnecessary_sort() -> Result<()> {
+        let left_schema = create_test_schema()?;
+        let right_schema = create_test_schema2()?;
+        let left_input =
+            streaming_table_exec(&left_schema, Some(vec![sort_expr("a", &left_schema)]));
+        let right_input = streaming_table_exec(
+            &right_schema,
+            Some(vec![sort_expr("d", &right_schema)]),
+        );
+        let not_prunable_filter = not_prunable_filter(
+            col_indices("a", &left_schema, JoinSide::Left),
+            col_indices("d", &right_schema, JoinSide::Right),
+        );
+        let on = vec![(
+            Column::new_with_schema("c", &left_schema)?,
+            Column::new_with_schema("c", &right_schema)?,
+        )];
+        let join = hash_join_exec(
+            left_input,
+            right_input,
+            on,
+            Some(not_prunable_filter),
+            &JoinType::Inner,
+        )?;
+        let physical_plan = sort_exec(vec![sort_expr("d", &join.schema())], join);
+
+        let expected_input = [
+            "SortExec: expr=[d@3 ASC]",
+            "  HashJoinExec: mode=Partitioned, join_type=Inner, on=[(c@2, c@2)], filter=0@0 + 10",
+            "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+        ];
+        let expected_optimized = [
+            "SortExec: expr=[d@3 ASC]",
+            "  SymmetricHashJoinExec: mode=Partitioned, join_type=Inner, on=[(c@2, c@2)], filter=0@0 + 10",
+            "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+        ];
+
+        assert_original_plan!(expected_input, physical_plan.clone());
+        assert_join_selection_enforce_sorting!(expected_optimized, physical_plan.clone());
+        // TODO: Make the SymmetricHashJoin swap order preserving to use EnforceSorting before the JoinSelection rule
+        //  assert_enforce_sorting_join_selection!(expected_optimized, physical_plan);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_remove_unnecessary_sort_by_projection() -> Result<()> {
+        let left_schema = create_test_schema()?;
+        let right_schema = create_test_schema2()?;
+        let left_input =
+            streaming_table_exec(&left_schema, Some(vec![sort_expr("a", &left_schema)]));
+        let right_input = streaming_table_exec(
+            &right_schema,
+            Some(vec![sort_expr("d", &right_schema)]),
+        );
+        let prunable_filter = prunable_filter(
+            col_indices("a", &left_schema, JoinSide::Left),
+            col_indices("d", &right_schema, JoinSide::Right),
+        );
+        let on = vec![(
+            Column::new_with_schema("c", &left_schema)?,
+            Column::new_with_schema("c", &right_schema)?,
+        )];
+        let join = hash_join_exec(
+            left_input,
+            right_input,
+            on,
+            Some(prunable_filter),
+            &JoinType::Inner,
+        )?;
+        let physical_plan = sort_exec(vec![sort_expr("a", &join.schema())], join);
+
+        let expected_input = [
+            "SortExec: expr=[a@0 ASC]",
+            "  HashJoinExec: mode=Partitioned, join_type=Inner, on=[(c@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+        ];
+        let expected_optimized = [
+            "ProjectionExec: expr=[a@3 as a, b@4 as b, c@5 as c, d@0 as d, e@1 as e, c@2 as c]",
+            "  SlidingHashJoinExec: join_type=Inner, on=[(c@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+            "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+        ];
+        assert_original_plan!(expected_input, physical_plan.clone());
+        assert_join_selection_enforce_sorting!(expected_optimized, physical_plan.clone());
+        assert_enforce_sorting_join_selection!(expected_optimized, physical_plan);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_remove_unnecessary_sort_bounded_window_by_projection() -> Result<()> {
+        let left_schema = create_test_schema()?;
+        let right_schema = create_test_schema2()?;
+        let left_input =
+            streaming_table_exec(&left_schema, Some(vec![sort_expr("a", &left_schema)]));
+        let right_input = streaming_table_exec(
+            &right_schema,
+            Some(vec![sort_expr("d", &right_schema)]),
+        );
+        let prunable_filter = prunable_filter(
+            col_indices("a", &left_schema, JoinSide::Left),
+            col_indices("d", &right_schema, JoinSide::Right),
+        );
+        let on = vec![(
+            Column::new_with_schema("c", &left_schema)?,
+            Column::new_with_schema("c", &right_schema)?,
+        )];
+        let join = hash_join_exec(
+            left_input,
+            right_input,
+            on,
+            Some(prunable_filter),
+            &JoinType::Inner,
+        )?;
+        let join_schema = join.schema();
+        let window_sort_expr = vec![sort_expr("d", &join_schema)];
+        let sort = sort_exec(window_sort_expr.clone(), join);
+        let physical_plan = bounded_window_exec("b", window_sort_expr, sort);
+
+        let expected_input = [
+            "BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
+            "  SortExec: expr=[d@3 ASC]",
+            "    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(c@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "      StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "      StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+        ];
+        let expected_optimized = [
+            "BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
+            "  SlidingHashJoinExec: join_type=Inner, on=[(c@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+        ];
+        assert_original_plan!(expected_input, physical_plan.clone());
+        assert_join_selection_enforce_sorting!(expected_optimized, physical_plan.clone());
+        assert_enforce_sorting_join_selection!(expected_optimized, physical_plan);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_multilayer_joins() -> Result<()> {
+        let left_schema = create_test_schema()?;
+        let right_schema = create_test_schema2()?;
+        let left_input =
+            streaming_table_exec(&left_schema, Some(vec![sort_expr("a", &left_schema)]));
+        let right_input = streaming_table_exec(
+            &right_schema,
+            Some(vec![sort_expr("d", &right_schema)]),
+        );
+        let filter = prunable_filter(
+            col_indices("a", &left_schema, JoinSide::Left),
+            col_indices("d", &right_schema, JoinSide::Right),
+        );
+        let on = vec![(
+            Column::new_with_schema("c", &left_schema)?,
+            Column::new_with_schema("c", &right_schema)?,
+        )];
+        let join = hash_join_exec(
+            left_input,
+            right_input,
+            on.clone(),
+            Some(filter),
+            &JoinType::Inner,
+        )?;
+        let join_schema = join.schema();
+        let window_sort_expr = vec![sort_expr("d", &join_schema)];
+        let sort = sort_exec(window_sort_expr.clone(), join);
+        // Second layer
+        let left_input =
+            streaming_table_exec(&left_schema, Some(vec![sort_expr("a", &left_schema)]));
+        let right_input = bounded_window_exec("b", window_sort_expr, sort);
+        let right_schema = right_input.schema();
+
+        let filter = prunable_filter(
+            col_indices("a", &left_schema, JoinSide::Left),
+            col_indices("d", &right_schema, JoinSide::Right),
+        );
+        let join =
+            hash_join_exec(left_input, right_input, on, Some(filter), &JoinType::Inner)?;
+        let join_schema = join.schema();
+        let window_sort_expr = vec![sort_expr("d", &join_schema)];
+        let physical_plan = sort_exec(window_sort_expr, join);
+
+        let expected_input = [
+            "SortExec: expr=[d@6 ASC]",
+            "  HashJoinExec: mode=Partitioned, join_type=Inner, on=[(c@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "    BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
+            "      SortExec: expr=[d@3 ASC]",
+            "        HashJoinExec: mode=Partitioned, join_type=Inner, on=[(c@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "          StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "          StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+        ];
+        let expected_optimized = [
+            "SlidingHashJoinExec: join_type=Inner, on=[(c@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "  StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "  BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
+            "    SlidingHashJoinExec: join_type=Inner, on=[(c@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "      StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "      StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+        ];
+        assert_original_plan!(expected_input, physical_plan.clone());
+        assert_join_selection_enforce_sorting!(expected_optimized, physical_plan.clone());
+        assert_enforce_sorting_join_selection!(expected_optimized, physical_plan);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_multilayer_joins_with_sort_preserve_with_sliding_hash() -> Result<()> {
+        let left_schema = create_test_schema()?;
+        let right_schema = create_test_schema2()?;
+        let left_input =
+            streaming_table_exec(&left_schema, Some(vec![sort_expr("a", &left_schema)]));
+        let right_input = streaming_table_exec(
+            &right_schema,
+            Some(vec![sort_expr("d", &right_schema)]),
+        );
+        let filter = prunable_filter(
+            col_indices("a", &left_schema, JoinSide::Left),
+            col_indices("d", &right_schema, JoinSide::Right),
+        );
+        let on = vec![(
+            Column::new_with_schema("c", &left_schema)?,
+            Column::new_with_schema("c", &right_schema)?,
+        )];
+        let join = hash_join_exec(
+            left_input,
+            right_input,
+            on.clone(),
+            Some(filter),
+            &JoinType::Inner,
+        )?;
+        let join_schema = join.schema();
+        let window_sort_expr = vec![sort_expr("d", &join_schema)];
+        let sort = sort_exec(window_sort_expr.clone(), join);
+        // Second layer
+        let left_input =
+            streaming_table_exec(&left_schema, Some(vec![sort_expr("a", &left_schema)]));
+        let right_input = bounded_window_exec("b", window_sort_expr, sort);
+        let right_schema = right_input.schema();
+
+        let filter = prunable_filter(
+            col_indices("a", &left_schema, JoinSide::Left),
+            col_indices("d", &right_schema, JoinSide::Right),
+        );
+        let join =
+            hash_join_exec(left_input, right_input, on, Some(filter), &JoinType::Inner)?;
+        let join_schema = join.schema();
+        let window_sort_expr = vec![sort_expr("d", &join_schema)];
+        let sort = sort_exec(window_sort_expr, join);
+        let physical_plan = filter_exec(
+            Arc::new(NotExpr::new(col("d", join_schema.as_ref()).unwrap())),
+            sort,
+        );
+
+        let expected_input = [
+            "FilterExec: NOT d@6",
+            "  SortExec: expr=[d@6 ASC]",
+            "    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(c@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "      StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "      BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
+            "        SortExec: expr=[d@3 ASC]",
+            "          HashJoinExec: mode=Partitioned, join_type=Inner, on=[(c@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "            StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "            StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+        ];
+        let expected_optimized = [
+            "FilterExec: NOT d@6",
+            "  SlidingHashJoinExec: join_type=Inner, on=[(c@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "    BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
+            "      SlidingHashJoinExec: join_type=Inner, on=[(c@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "        StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "        StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+        ];
+        assert_original_plan!(expected_input, physical_plan.clone());
+        assert_join_selection_enforce_sorting!(expected_optimized, physical_plan.clone());
+        assert_enforce_sorting_join_selection!(expected_optimized, physical_plan);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_multiple_options_for_joins() -> Result<()> {
+        let left_schema = create_test_schema()?;
+        let right_table_schema = create_test_schema2()?;
+        let left_input =
+            streaming_table_exec(&left_schema, Some(vec![sort_expr("a", &left_schema)]));
+        let right_input = streaming_table_exec(
+            &right_table_schema,
+            Some(vec![sort_expr("d", &right_table_schema)]),
+        );
+        let filter = prunable_filter(
+            col_indices("a", &left_schema, JoinSide::Left),
+            col_indices("d", &right_table_schema, JoinSide::Right),
+        );
+        let on = vec![(
+            Column::new_with_schema("c", &left_schema)?,
+            Column::new_with_schema("c", &right_table_schema)?,
+        )];
+        let join = hash_join_exec(
+            left_input,
+            right_input,
+            on.clone(),
+            Some(filter),
+            &JoinType::Inner,
+        )?;
+        let join_schema = join.schema();
+        let window_sort_expr = vec![sort_expr("d", &join_schema)];
+        let sort = sort_exec(window_sort_expr.clone(), join);
+        // Second layer
+        let left_input =
+            streaming_table_exec(&left_schema, Some(vec![sort_expr("a", &left_schema)]));
+        let right_input = bounded_window_exec("b", window_sort_expr, sort);
+        let right_schema = right_input.schema();
+        let filter = prunable_filter(
+            col_indices("a", &left_schema, JoinSide::Left),
+            col_indices("d", &right_schema, JoinSide::Right),
+        );
+        let join = hash_join_exec(
+            left_input,
+            right_input,
+            on.clone(),
+            Some(filter),
+            &JoinType::Inner,
+        )?;
+
+        // Third layer
+        let left_input = join.clone();
+        let left_schema = join.schema();
+        let right_input = streaming_table_exec(
+            &right_table_schema,
+            Some(vec![sort_expr("e", &right_table_schema)]),
+        );
+        let filter = prunable_filter(
+            col_indices("a", &left_schema, JoinSide::Left),
+            col_indices("e", &right_table_schema, JoinSide::Right),
+        );
+        let join =
+            hash_join_exec(left_input, right_input, on, Some(filter), &JoinType::Inner)?;
+        let join_schema = join.schema();
+        // Third join
+        let window_sort_expr = vec![sort_expr("a", &join_schema)];
+        let sort = sort_exec(window_sort_expr.clone(), join);
+        let physical_plan = bounded_window_exec("b", window_sort_expr, sort);
+
+        let expected_input = [
+            "BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
+            "  SortExec: expr=[a@0 ASC]",
+            "    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(c@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "      HashJoinExec: mode=Partitioned, join_type=Inner, on=[(c@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "        StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "        BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
+            "          SortExec: expr=[d@3 ASC]",
+            "            HashJoinExec: mode=Partitioned, join_type=Inner, on=[(c@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "              StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "              StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+            "      StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[e@1 ASC]",
+        ];
+        let expected_optimized = [
+            "BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
+            "  ProjectionExec: expr=[a@3 as a, b@4 as b, c@5 as c, a@6 as a, b@7 as b, c@8 as c, d@9 as d, e@10 as e, c@11 as c, count@12 as count, d@0 as d, e@1 as e, c@2 as c]",
+            "    SlidingHashJoinExec: join_type=Inner, on=[(c@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "      StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[e@1 ASC]",
+            "      ProjectionExec: expr=[a@7 as a, b@8 as b, c@9 as c, a@0 as a, b@1 as b, c@2 as c, d@3 as d, e@4 as e, c@5 as c, count@6 as count]",
+            "        SlidingHashJoinExec: join_type=Inner, on=[(c@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "          BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
+            "            SlidingHashJoinExec: join_type=Inner, on=[(c@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "              StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "              StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+            "          StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+        ];
+        assert_original_plan!(expected_input, physical_plan.clone());
+        assert_join_selection_enforce_sorting!(expected_optimized, physical_plan.clone());
+        assert_enforce_sorting_join_selection!(expected_optimized, physical_plan);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_not_add_sort_bounded_window_by_projection() -> Result<()> {
+        let left_schema = create_test_schema()?;
+        let right_schema = create_test_schema2()?;
+        let left_input =
+            streaming_table_exec(&left_schema, Some(vec![sort_expr("a", &left_schema)]));
+        let right_input = streaming_table_exec(
+            &right_schema,
+            Some(vec![sort_expr("d", &right_schema)]),
+        );
+        let prunable_filter = prunable_filter(
+            col_indices("a", &left_schema, JoinSide::Left),
+            col_indices("d", &right_schema, JoinSide::Right),
+        );
+        let on = vec![(
+            Column::new_with_schema("c", &left_schema)?,
+            Column::new_with_schema("c", &right_schema)?,
+        )];
+        let join = hash_join_exec(
+            left_input,
+            right_input,
+            on,
+            Some(prunable_filter),
+            &JoinType::Inner,
+        )?;
+        let join_schema = join.schema();
+        let window_sort_expr = vec![sort_expr("d", &join_schema)];
+        let physical_plan = bounded_window_exec("b", window_sort_expr, join);
+
+        let expected_input = [
+            "BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
+            "  HashJoinExec: mode=Partitioned, join_type=Inner, on=[(c@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+        ];
+        let expected_optimized = [
+            "BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
+            "  SlidingHashJoinExec: join_type=Inner, on=[(c@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+        ];
+        assert_original_plan!(expected_input, physical_plan.clone());
+        assert_join_selection_enforce_sorting!(expected_optimized, physical_plan.clone());
+        assert_enforce_sorting_join_selection!(expected_optimized, physical_plan);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_remove_unnecessary_sort_nested() -> Result<()> {
+        let left_schema = create_test_schema()?;
+        let right_schema = create_test_schema2()?;
+        let left_input =
+            streaming_table_exec(&left_schema, Some(vec![sort_expr("a", &left_schema)]));
+        let right_input = streaming_table_exec(
+            &right_schema,
+            Some(vec![sort_expr("d", &right_schema)]),
+        );
+        let prunable_filter = prunable_filter(
+            col_indices("a", &left_schema, JoinSide::Left),
+            col_indices("d", &right_schema, JoinSide::Right),
+        );
+        let join = nested_loop_join_exec(
+            left_input,
+            right_input,
+            Some(prunable_filter),
+            &JoinType::Inner,
+        )?;
+        let physical_plan = sort_exec(vec![sort_expr("d", &join.schema())], join);
+
+        let expected_input = [
+            "SortExec: expr=[d@3 ASC]",
+            "  NestedLoopJoinExec: join_type=Inner, filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+        ];
+        let expected_optimized = [
+            "SlidingNestedLoopJoinExec: join_type=Inner, filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "  StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "  StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+        ];
+        assert_original_plan!(expected_input, physical_plan.clone());
+        assert_join_selection_enforce_sorting!(expected_optimized, physical_plan.clone());
+        assert_enforce_sorting_join_selection!(expected_optimized, physical_plan);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_can_not_remove_unnecessary_sort_nested_loop() -> Result<()> {
+        let left_schema = create_test_schema()?;
+        let right_schema = create_test_schema2()?;
+        let left_input =
+            streaming_table_exec(&left_schema, Some(vec![sort_expr("a", &left_schema)]));
+        let right_input = streaming_table_exec(
+            &right_schema,
+            Some(vec![sort_expr("d", &right_schema)]),
+        );
+        let not_prunable_filter = not_prunable_filter(
+            col_indices("a", &left_schema, JoinSide::Left),
+            col_indices("d", &right_schema, JoinSide::Right),
+        );
+        let join = nested_loop_join_exec(
+            left_input,
+            right_input,
+            Some(not_prunable_filter),
+            &JoinType::Inner,
+        )?;
+        let physical_plan = sort_exec(vec![sort_expr("d", &join.schema())], join);
+
+        let expected_input = [
+            "SortExec: expr=[d@3 ASC]",
+            "  NestedLoopJoinExec: join_type=Inner, filter=0@0 + 10",
+            "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+        ];
+        let expected_optimized = [
+            "SortExec: expr=[d@3 ASC]",
+            "  NestedLoopJoinExec: join_type=Inner, filter=0@0 + 10",
+            "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+        ];
+        assert_original_plan!(expected_input, physical_plan.clone());
+        assert_join_selection_enforce_sorting!(expected_optimized, physical_plan.clone());
+        assert_enforce_sorting_join_selection!(expected_optimized, physical_plan);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_remove_unnecessary_sort_by_projection_nested_loop() -> Result<()> {
+        let left_schema = create_test_schema()?;
+        let right_schema = create_test_schema2()?;
+        let left_input =
+            streaming_table_exec(&left_schema, Some(vec![sort_expr("a", &left_schema)]));
+        let right_input = streaming_table_exec(
+            &right_schema,
+            Some(vec![sort_expr("d", &right_schema)]),
+        );
+        let prunable_filter = prunable_filter(
+            col_indices("a", &left_schema, JoinSide::Left),
+            col_indices("d", &right_schema, JoinSide::Right),
+        );
+        let join = nested_loop_join_exec(
+            left_input,
+            right_input,
+            Some(prunable_filter),
+            &JoinType::Inner,
+        )?;
+        let physical_plan = sort_exec(vec![sort_expr("a", &join.schema())], join);
+
+        let expected_input = [
+            "SortExec: expr=[a@0 ASC]",
+            "  NestedLoopJoinExec: join_type=Inner, filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+        ];
+        let expected_optimized = [
+            "ProjectionExec: expr=[a@3 as a, b@4 as b, c@5 as c, d@0 as d, e@1 as e, c@2 as c]",
+            "  SlidingNestedLoopJoinExec: join_type=Inner, filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+            "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+        ];
+        assert_original_plan!(expected_input, physical_plan.clone());
+        assert_join_selection_enforce_sorting!(expected_optimized, physical_plan.clone());
+        assert_enforce_sorting_join_selection!(expected_optimized, physical_plan);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_remove_unnecessary_sort_bounded_window_by_projection_nested_loop(
+    ) -> Result<()> {
+        let left_schema = create_test_schema()?;
+        let right_schema = create_test_schema2()?;
+        let left_input =
+            streaming_table_exec(&left_schema, Some(vec![sort_expr("a", &left_schema)]));
+        let right_input = streaming_table_exec(
+            &right_schema,
+            Some(vec![sort_expr("d", &right_schema)]),
+        );
+        let prunable_filter = prunable_filter(
+            col_indices("a", &left_schema, JoinSide::Left),
+            col_indices("d", &right_schema, JoinSide::Right),
+        );
+        let join = nested_loop_join_exec(
+            left_input,
+            right_input,
+            Some(prunable_filter),
+            &JoinType::Inner,
+        )?;
+        let join_schema = join.schema();
+        let window_sort_expr = vec![sort_expr("d", &join_schema)];
+        let sort = sort_exec(window_sort_expr.clone(), join);
+        let physical_plan = bounded_window_exec("b", window_sort_expr, sort);
+
+        let expected_input = [
+            "BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
+            "  SortExec: expr=[d@3 ASC]",
+            "    NestedLoopJoinExec: join_type=Inner, filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "      StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "      StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+        ];
+        let expected_optimized = [
+            "BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
+            "  SlidingNestedLoopJoinExec: join_type=Inner, filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+        ];
+        assert_original_plan!(expected_input, physical_plan.clone());
+        assert_join_selection_enforce_sorting!(expected_optimized, physical_plan.clone());
+        assert_enforce_sorting_join_selection!(expected_optimized, physical_plan);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_multilayer_joins_nested_loop() -> Result<()> {
+        let left_schema = create_test_schema()?;
+        let right_schema = create_test_schema2()?;
+        let left_input =
+            streaming_table_exec(&left_schema, Some(vec![sort_expr("a", &left_schema)]));
+        let right_input = streaming_table_exec(
+            &right_schema,
+            Some(vec![sort_expr("d", &right_schema)]),
+        );
+        let filter = prunable_filter(
+            col_indices("a", &left_schema, JoinSide::Left),
+            col_indices("d", &right_schema, JoinSide::Right),
+        );
+        let join = nested_loop_join_exec(
+            left_input,
+            right_input,
+            Some(filter),
+            &JoinType::Inner,
+        )?;
+        let join_schema = join.schema();
+        let window_sort_expr = vec![sort_expr("d", &join_schema)];
+        let sort = sort_exec(window_sort_expr.clone(), join);
+        // Second layer
+        let left_input =
+            streaming_table_exec(&left_schema, Some(vec![sort_expr("a", &left_schema)]));
+        let right_input = bounded_window_exec("b", window_sort_expr, sort);
+        let right_schema = right_input.schema();
+
+        let filter = prunable_filter(
+            col_indices("a", &left_schema, JoinSide::Left),
+            col_indices("d", &right_schema, JoinSide::Right),
+        );
+        let join = nested_loop_join_exec(
+            left_input,
+            right_input,
+            Some(filter),
+            &JoinType::Inner,
+        )?;
+        let join_schema = join.schema();
+        let window_sort_expr = vec![sort_expr("d", &join_schema)];
+        let physical_plan = sort_exec(window_sort_expr, join);
+
+        let expected_input = [
+            "SortExec: expr=[d@6 ASC]",
+            "  NestedLoopJoinExec: join_type=Inner, filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "    BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
+            "      SortExec: expr=[d@3 ASC]",
+            "        NestedLoopJoinExec: join_type=Inner, filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "          StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "          StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+        ];
+        let expected_optimized = [
+            "SlidingNestedLoopJoinExec: join_type=Inner, filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "  StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "  BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
+            "    SlidingNestedLoopJoinExec: join_type=Inner, filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "      StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "      StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+        ];
+        assert_original_plan!(expected_input, physical_plan.clone());
+        assert_join_selection_enforce_sorting!(expected_optimized, physical_plan.clone());
+        assert_enforce_sorting_join_selection!(expected_optimized, physical_plan);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_multilayer_joins_with_sort_preserve_nested_loop() -> Result<()> {
+        let left_schema = create_test_schema()?;
+        let right_schema = create_test_schema2()?;
+        let left_input =
+            streaming_table_exec(&left_schema, Some(vec![sort_expr("a", &left_schema)]));
+        let right_input = streaming_table_exec(
+            &right_schema,
+            Some(vec![sort_expr("d", &right_schema)]),
+        );
+        let filter = prunable_filter(
+            col_indices("a", &left_schema, JoinSide::Left),
+            col_indices("d", &right_schema, JoinSide::Right),
+        );
+        let join = nested_loop_join_exec(
+            left_input,
+            right_input,
+            Some(filter),
+            &JoinType::Inner,
+        )?;
+        let join_schema = join.schema();
+        let window_sort_expr = vec![sort_expr("d", &join_schema)];
+        let sort = sort_exec(window_sort_expr.clone(), join);
+        // Second layer
+        let left_input =
+            streaming_table_exec(&left_schema, Some(vec![sort_expr("a", &left_schema)]));
+        let right_input = bounded_window_exec("b", window_sort_expr, sort);
+        let right_schema = right_input.schema();
+
+        let filter = prunable_filter(
+            col_indices("a", &left_schema, JoinSide::Left),
+            col_indices("d", &right_schema, JoinSide::Right),
+        );
+        let join = nested_loop_join_exec(
+            left_input,
+            right_input,
+            Some(filter),
+            &JoinType::Inner,
+        )?;
+        let join_schema = join.schema();
+        let window_sort_expr = vec![sort_expr("d", &join_schema)];
+        let sort = sort_exec(window_sort_expr, join);
+        let physical_plan = filter_exec(
+            Arc::new(NotExpr::new(col("d", join_schema.as_ref()).unwrap())),
+            sort,
+        );
+
+        let expected_input = [
+            "FilterExec: NOT d@6",
+            "  SortExec: expr=[d@6 ASC]",
+            "    NestedLoopJoinExec: join_type=Inner, filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "      StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "      BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
+            "        SortExec: expr=[d@3 ASC]",
+            "          NestedLoopJoinExec: join_type=Inner, filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "            StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "            StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+        ];
+        let expected_optimized = [
+            "FilterExec: NOT d@6",
+            "  SlidingNestedLoopJoinExec: join_type=Inner, filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "    BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
+            "      SlidingNestedLoopJoinExec: join_type=Inner, filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "        StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "        StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+        ];
+        assert_original_plan!(expected_input, physical_plan.clone());
+        assert_join_selection_enforce_sorting!(expected_optimized, physical_plan.clone());
+        assert_enforce_sorting_join_selection!(expected_optimized, physical_plan);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_multiple_options_for_joins_nested_loop() -> Result<()> {
+        let left_schema = create_test_schema()?;
+        let right_table_schema = create_test_schema2()?;
+        let left_input =
+            streaming_table_exec(&left_schema, Some(vec![sort_expr("a", &left_schema)]));
+        let right_input = streaming_table_exec(
+            &right_table_schema,
+            Some(vec![sort_expr("d", &right_table_schema)]),
+        );
+        let filter = prunable_filter(
+            col_indices("a", &left_schema, JoinSide::Left),
+            col_indices("d", &right_table_schema, JoinSide::Right),
+        );
+        let join = nested_loop_join_exec(
+            left_input,
+            right_input,
+            Some(filter),
+            &JoinType::Inner,
+        )?;
+        let join_schema = join.schema();
+        let window_sort_expr = vec![sort_expr("d", &join_schema)];
+        let sort = sort_exec(window_sort_expr.clone(), join);
+        // Second layer
+        let left_input =
+            streaming_table_exec(&left_schema, Some(vec![sort_expr("a", &left_schema)]));
+        let right_input = bounded_window_exec("b", window_sort_expr, sort);
+        let right_schema = right_input.schema();
+        let filter = prunable_filter(
+            col_indices("a", &left_schema, JoinSide::Left),
+            col_indices("d", &right_schema, JoinSide::Right),
+        );
+        let join = nested_loop_join_exec(
+            left_input,
+            right_input,
+            Some(filter),
+            &JoinType::Inner,
+        )?;
+
+        // Third layer
+        let left_input = join.clone();
+        let left_schema = join.schema();
+        let right_input = streaming_table_exec(
+            &right_table_schema,
+            Some(vec![sort_expr("e", &right_table_schema)]),
+        );
+        let filter = prunable_filter(
+            col_indices("a", &left_schema, JoinSide::Left),
+            col_indices("e", &right_table_schema, JoinSide::Right),
+        );
+        let join = nested_loop_join_exec(
+            left_input,
+            right_input,
+            Some(filter),
+            &JoinType::Inner,
+        )?;
+        let join_schema = join.schema();
+        // Third join
+        let window_sort_expr = vec![sort_expr("a", &join_schema)];
+        let sort = sort_exec(window_sort_expr.clone(), join);
+        let physical_plan = bounded_window_exec("b", window_sort_expr, sort);
+
+        let expected_input = [
+            "BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
+            "  SortExec: expr=[a@0 ASC]",
+            "    NestedLoopJoinExec: join_type=Inner, filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "      NestedLoopJoinExec: join_type=Inner, filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "        StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "        BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
+            "          SortExec: expr=[d@3 ASC]",
+            "            NestedLoopJoinExec: join_type=Inner, filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "              StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "              StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+            "      StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[e@1 ASC]",
+        ];
+        let expected_optimized = [
+            "BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
+            "  ProjectionExec: expr=[a@3 as a, b@4 as b, c@5 as c, a@6 as a, b@7 as b, c@8 as c, d@9 as d, e@10 as e, c@11 as c, count@12 as count, d@0 as d, e@1 as e, c@2 as c]",
+            "    SlidingNestedLoopJoinExec: join_type=Inner, filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "      StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[e@1 ASC]",
+            "      ProjectionExec: expr=[a@7 as a, b@8 as b, c@9 as c, a@0 as a, b@1 as b, c@2 as c, d@3 as d, e@4 as e, c@5 as c, count@6 as count]",
+            "        SlidingNestedLoopJoinExec: join_type=Inner, filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "          BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
+            "            SlidingNestedLoopJoinExec: join_type=Inner, filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "              StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "              StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+            "          StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+        ];
+        assert_original_plan!(expected_input, physical_plan.clone());
+        assert_join_selection_enforce_sorting!(expected_optimized, physical_plan.clone());
+        assert_enforce_sorting_join_selection!(expected_optimized, physical_plan);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_not_add_sort_bounded_window_by_projection_nested_loop() -> Result<()> {
+        let left_schema = create_test_schema()?;
+        let right_schema = create_test_schema2()?;
+        let left_input =
+            streaming_table_exec(&left_schema, Some(vec![sort_expr("a", &left_schema)]));
+        let right_input = streaming_table_exec(
+            &right_schema,
+            Some(vec![sort_expr("d", &right_schema)]),
+        );
+        let prunable_filter = prunable_filter(
+            col_indices("a", &left_schema, JoinSide::Left),
+            col_indices("d", &right_schema, JoinSide::Right),
+        );
+        let join = nested_loop_join_exec(
+            left_input,
+            right_input,
+            Some(prunable_filter),
+            &JoinType::Inner,
+        )?;
+        let join_schema = join.schema();
+        let window_sort_expr = vec![sort_expr("d", &join_schema)];
+        let physical_plan = bounded_window_exec("b", window_sort_expr, join);
+
+        let expected_input = [
+            "BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
+            "  NestedLoopJoinExec: join_type=Inner, filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+        ];
+        let expected_optimized = [
+            "BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
+            "  SlidingNestedLoopJoinExec: join_type=Inner, filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+        ];
+        assert_original_plan!(expected_input, physical_plan.clone());
+        assert_join_selection_enforce_sorting!(expected_optimized, physical_plan.clone());
+        assert_enforce_sorting_join_selection!(expected_optimized, physical_plan);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_multilayer_joins_mixed() -> Result<()> {
+        let left_schema = create_test_schema()?;
+        let right_schema = create_test_schema2()?;
+        let left_input =
+            streaming_table_exec(&left_schema, Some(vec![sort_expr("a", &left_schema)]));
+        let right_input = streaming_table_exec(
+            &right_schema,
+            Some(vec![sort_expr("d", &right_schema)]),
+        );
+        let filter = prunable_filter(
+            col_indices("a", &left_schema, JoinSide::Left),
+            col_indices("d", &right_schema, JoinSide::Right),
+        );
+        let on = vec![(
+            Column::new_with_schema("c", &left_schema)?,
+            Column::new_with_schema("c", &right_schema)?,
+        )];
+        let join =
+            hash_join_exec(left_input, right_input, on, Some(filter), &JoinType::Inner)?;
+        let join_schema = join.schema();
+        let window_sort_expr = vec![sort_expr("d", &join_schema)];
+        let sort = sort_exec(window_sort_expr.clone(), join);
+        // Second layer
+        let left_input =
+            streaming_table_exec(&left_schema, Some(vec![sort_expr("a", &left_schema)]));
+        let right_input = bounded_window_exec("b", window_sort_expr, sort);
+        let right_schema = right_input.schema();
+
+        let filter = prunable_filter(
+            col_indices("a", &left_schema, JoinSide::Left),
+            col_indices("d", &right_schema, JoinSide::Right),
+        );
+        let join = nested_loop_join_exec(
+            left_input,
+            right_input,
+            Some(filter),
+            &JoinType::Inner,
+        )?;
+        let join_schema = join.schema();
+        let window_sort_expr = vec![sort_expr("d", &join_schema)];
+        let physical_plan = sort_exec(window_sort_expr, join);
+
+        let expected_input = [
+            "SortExec: expr=[d@6 ASC]",
+            "  NestedLoopJoinExec: join_type=Inner, filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "    BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
+            "      SortExec: expr=[d@3 ASC]",
+            "        HashJoinExec: mode=Partitioned, join_type=Inner, on=[(c@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "          StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "          StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+        ];
+        let expected_optimized = [
+            "SlidingNestedLoopJoinExec: join_type=Inner, filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "  StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "  BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
+            "    SlidingHashJoinExec: join_type=Inner, on=[(c@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "      StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "      StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+        ];
+        assert_original_plan!(expected_input, physical_plan.clone());
+        assert_join_selection_enforce_sorting!(expected_optimized, physical_plan.clone());
+        assert_enforce_sorting_join_selection!(expected_optimized, physical_plan);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_multilayer_joins_with_sort_preserve_mixed() -> Result<()> {
+        let left_schema = create_test_schema()?;
+        let right_schema = create_test_schema2()?;
+        let left_input =
+            streaming_table_exec(&left_schema, Some(vec![sort_expr("a", &left_schema)]));
+        let right_input = streaming_table_exec(
+            &right_schema,
+            Some(vec![sort_expr("d", &right_schema)]),
+        );
+        let filter = prunable_filter(
+            col_indices("a", &left_schema, JoinSide::Left),
+            col_indices("d", &right_schema, JoinSide::Right),
+        );
+        let on = vec![(
+            Column::new_with_schema("c", &left_schema)?,
+            Column::new_with_schema("c", &right_schema)?,
+        )];
+        let join = nested_loop_join_exec(
+            left_input,
+            right_input,
+            Some(filter),
+            &JoinType::Inner,
+        )?;
+        let join_schema = join.schema();
+        let window_sort_expr = vec![sort_expr("d", &join_schema)];
+        let sort = sort_exec(window_sort_expr.clone(), join);
+        // Second layer
+        let left_input =
+            streaming_table_exec(&left_schema, Some(vec![sort_expr("a", &left_schema)]));
+        let right_input = bounded_window_exec("b", window_sort_expr, sort);
+        let right_schema = right_input.schema();
+
+        let filter = prunable_filter(
+            col_indices("a", &left_schema, JoinSide::Left),
+            col_indices("d", &right_schema, JoinSide::Right),
+        );
+        let join =
+            hash_join_exec(left_input, right_input, on, Some(filter), &JoinType::Inner)?;
+        let join_schema = join.schema();
+        let window_sort_expr = vec![sort_expr("d", &join_schema)];
+        let sort = sort_exec(window_sort_expr, join);
+        let physical_plan = filter_exec(
+            Arc::new(NotExpr::new(col("d", join_schema.as_ref()).unwrap())),
+            sort,
+        );
+
+        let expected_input = [
+            "FilterExec: NOT d@6",
+            "  SortExec: expr=[d@6 ASC]",
+            "    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(c@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "      StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "      BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
+            "        SortExec: expr=[d@3 ASC]",
+            "          NestedLoopJoinExec: join_type=Inner, filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "            StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "            StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+        ];
+        let expected_optimized = [
+            "FilterExec: NOT d@6",
+            "  SlidingHashJoinExec: join_type=Inner, on=[(c@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "    BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
+            "      SlidingNestedLoopJoinExec: join_type=Inner, filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "        StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "        StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+        ];
+        assert_original_plan!(expected_input, physical_plan.clone());
+        assert_join_selection_enforce_sorting!(expected_optimized, physical_plan.clone());
+        assert_enforce_sorting_join_selection!(expected_optimized, physical_plan);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_multiple_options_for_joins_mixed() -> Result<()> {
+        let left_schema = create_test_schema()?;
+        let right_table_schema = create_test_schema2()?;
+        let left_input =
+            streaming_table_exec(&left_schema, Some(vec![sort_expr("a", &left_schema)]));
+        let right_input = streaming_table_exec(
+            &right_table_schema,
+            Some(vec![sort_expr("d", &right_table_schema)]),
+        );
+        let filter = prunable_filter(
+            col_indices("a", &left_schema, JoinSide::Left),
+            col_indices("d", &right_table_schema, JoinSide::Right),
+        );
+        let on = vec![(
+            Column::new_with_schema("c", &left_schema)?,
+            Column::new_with_schema("c", &right_table_schema)?,
+        )];
+        let join = hash_join_exec(
+            left_input,
+            right_input,
+            on.clone(),
+            Some(filter),
+            &JoinType::Inner,
+        )?;
+        let join_schema = join.schema();
+        let window_sort_expr = vec![sort_expr("d", &join_schema)];
+        let sort = sort_exec(window_sort_expr.clone(), join);
+        // Second layer
+        let left_input =
+            streaming_table_exec(&left_schema, Some(vec![sort_expr("a", &left_schema)]));
+        let right_input = bounded_window_exec("b", window_sort_expr, sort);
+        let right_schema = right_input.schema();
+        let filter = prunable_filter(
+            col_indices("a", &left_schema, JoinSide::Left),
+            col_indices("d", &right_schema, JoinSide::Right),
+        );
+        let join = nested_loop_join_exec(
+            left_input,
+            right_input,
+            Some(filter),
+            &JoinType::Inner,
+        )?;
+
+        // Third layer
+        let left_input = join.clone();
+        let left_schema = join.schema();
+        let right_input = streaming_table_exec(
+            &right_table_schema,
+            Some(vec![sort_expr("e", &right_table_schema)]),
+        );
+        let filter = prunable_filter(
+            col_indices("a", &left_schema, JoinSide::Left),
+            col_indices("e", &right_table_schema, JoinSide::Right),
+        );
+        let join =
+            hash_join_exec(left_input, right_input, on, Some(filter), &JoinType::Inner)?;
+        let join_schema = join.schema();
+        // Third join
+        let window_sort_expr = vec![sort_expr("a", &join_schema)];
+        let sort = sort_exec(window_sort_expr.clone(), join);
+        let physical_plan = bounded_window_exec("b", window_sort_expr, sort);
+
+        let expected_input = [
+            "BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
+            "  SortExec: expr=[a@0 ASC]",
+            "    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(c@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "      NestedLoopJoinExec: join_type=Inner, filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "        StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "        BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
+            "          SortExec: expr=[d@3 ASC]",
+            "            HashJoinExec: mode=Partitioned, join_type=Inner, on=[(c@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "              StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "              StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+            "      StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[e@1 ASC]",
+        ];
+        let expected_optimized = [
+            "BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
+            "  ProjectionExec: expr=[a@3 as a, b@4 as b, c@5 as c, a@6 as a, b@7 as b, c@8 as c, d@9 as d, e@10 as e, c@11 as c, count@12 as count, d@0 as d, e@1 as e, c@2 as c]",
+            "    SlidingHashJoinExec: join_type=Inner, on=[(c@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "      StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[e@1 ASC]",
+            "      ProjectionExec: expr=[a@7 as a, b@8 as b, c@9 as c, a@0 as a, b@1 as b, c@2 as c, d@3 as d, e@4 as e, c@5 as c, count@6 as count]",
+            "        SlidingNestedLoopJoinExec: join_type=Inner, filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "          BoundedWindowAggExec: wdw=[count: Ok(Field { name: \"count\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(NULL), end_bound: CurrentRow }], mode=[Sorted]",
+            "            SlidingHashJoinExec: join_type=Inner, on=[(c@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
+            "              StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "              StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+            "          StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+        ];
+        assert_original_plan!(expected_input, physical_plan.clone());
+        assert_join_selection_enforce_sorting!(expected_optimized, physical_plan.clone());
+        assert_enforce_sorting_join_selection!(expected_optimized, physical_plan);
         Ok(())
     }
 }

@@ -22,7 +22,7 @@ use std::fmt::Formatter;
 use std::sync::Arc;
 
 use crate::physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use crate::physical_plan::joins::HashJoinExec;
+use crate::physical_plan::joins::{HashJoinExec, NestedLoopJoinExec};
 use crate::physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use crate::physical_plan::repartition::RepartitionExec;
 use crate::physical_plan::sorts::sort::SortExec;
@@ -158,6 +158,11 @@ pub fn is_repartition(plan: &Arc<dyn ExecutionPlan>) -> bool {
 /// Checks whether the given operator is a [`HashJoinExec`].
 pub fn is_hash_join(plan: &Arc<dyn ExecutionPlan>) -> bool {
     plan.as_any().is::<HashJoinExec>()
+}
+
+/// Checks whether the given operator is a [`NestedLoopJoinExec`].
+pub fn is_nested_loop_join(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    plan.as_any().is::<NestedLoopJoinExec>()
 }
 
 /// Utility function yielding a string representation of the given [`ExecutionPlan`].
