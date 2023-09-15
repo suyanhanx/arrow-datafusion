@@ -199,7 +199,7 @@ pub(crate) fn swap_reverting_projection(
 }
 
 /// Swaps join sides for filter column indices and produces new JoinFilter
-fn swap_filter(filter: &JoinFilter) -> JoinFilter {
+pub(crate) fn swap_filter(filter: &JoinFilter) -> JoinFilter {
     let column_indices = filter
         .column_indices()
         .iter()
@@ -232,10 +232,7 @@ impl PhysicalOptimizerRule for JoinSelection {
         let plan_with_hash_joins = crate::physical_optimizer::join_pipeline_selection::PlanWithCorrespondingHashJoin::new(plan);
         let state = plan_with_hash_joins
             .transform_up(&|p| crate::physical_optimizer::join_pipeline_selection::select_joins_to_preserve_order_subrule(p, config))?;
-        // Finalize the order-preserving join selection procedure by inspecting
-        // the root of the plan tree:
-        let plan = crate::physical_optimizer::join_pipeline_selection::finalize_order_preserving_joins_at_root(state, config)?;
-        let pipeline = PipelineStatePropagator::new(plan);
+        let pipeline = PipelineStatePropagator::new(state.plan);
         // Next, we make pipeline-fixing modifications to joins so as to accommodate
         // unbounded inputs. Each pipeline-fixing subrule, which is a function
         // of type `PipelineFixerSubrule`, takes a single [`PipelineStatePropagator`]

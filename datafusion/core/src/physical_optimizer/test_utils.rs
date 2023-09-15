@@ -27,7 +27,9 @@ use crate::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use crate::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use crate::physical_plan::filter::FilterExec;
 use crate::physical_plan::joins::utils::{ColumnIndex, JoinFilter, JoinOn};
-use crate::physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoinExec};
+use crate::physical_plan::joins::{
+    HashJoinExec, NestedLoopJoinExec, PartitionMode, SortMergeJoinExec,
+};
 use crate::physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use crate::physical_plan::memory::MemoryExec;
 use crate::physical_plan::repartition::RepartitionExec;
@@ -43,7 +45,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef, SortOptions};
 use datafusion_common::{JoinType, ScalarValue, Statistics};
 use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_expr::{AggregateFunction, Operator, WindowFrame, WindowFunction};
-use datafusion_physical_expr::expressions::col;
+use datafusion_physical_expr::expressions::{col, BinaryExpr, Literal};
 use datafusion_physical_expr::intervals::test_utils::gen_conjunctive_numerical_expr;
 use datafusion_physical_expr::{PhysicalExpr, PhysicalSortExpr};
 
@@ -219,6 +221,17 @@ pub fn hash_join_exec(
     )?))
 }
 
+pub fn nested_loop_join_exec(
+    left: Arc<dyn ExecutionPlan>,
+    right: Arc<dyn ExecutionPlan>,
+    filter: Option<JoinFilter>,
+    join_type: &JoinType,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    Ok(Arc::new(NestedLoopJoinExec::try_new(
+        left, right, filter, join_type,
+    )?))
+}
+
 pub fn bounded_window_exec(
     col_name: &str,
     sort_exprs: impl IntoIterator<Item = PhysicalSortExpr>,
@@ -384,6 +397,24 @@ pub fn prunable_filter(left_index: ColumnIndex, right_index: ColumnIndex) -> Joi
     );
     JoinFilter::new(filter_expr, column_indices, intermediate_schema)
 }
+pub fn not_prunable_filter(
+    left_index: ColumnIndex,
+    right_index: ColumnIndex,
+) -> JoinFilter {
+    // Filter columns, ensure first batches will have matching rows.
+    let intermediate_schema = Schema::new(vec![
+        Field::new("0", DataType::Int32, true),
+        Field::new("1", DataType::Int32, true),
+    ]);
+    let column_indices = vec![left_index, right_index];
+    let filter_expr = Arc::new(BinaryExpr::new(
+        col("0", &intermediate_schema).unwrap(),
+        Operator::Plus,
+        Arc::new(Literal::new(ScalarValue::Int32(Some(10)))),
+    ));
+
+    JoinFilter::new(filter_expr, column_indices, intermediate_schema)
+}
 
 pub fn memory_exec_with_sort(
     schema: &SchemaRef,
@@ -460,5 +491,72 @@ macro_rules! assert_optimized_orthogonal {
             "\n**EnforceSorting - JoinSelection Optimized Plan Mismatch\n\nexpected:\n\n{expected_optimized_lines:#?}\nactual:\n\n{actual:#?}\n\n"
         );
 
+    };
+}
+
+// Assertion for "Original Plan"
+#[macro_export]
+macro_rules! assert_original_plan {
+    ($EXPECTED_PLAN_LINES: expr, $PLAN: expr) => {
+        let physical_plan = $PLAN;
+        let formatted = displayable(physical_plan.as_ref()).indent(true).to_string();
+        let actual: Vec<&str> = formatted.trim().lines().collect();
+
+        let expected_plan_lines: Vec<&str> = $EXPECTED_PLAN_LINES.iter().map(|s| *s).collect();
+
+        assert_eq!(
+            expected_plan_lines, actual,
+            "\n**Original Plan Mismatch\n\nexpected:\n\n{expected_plan_lines:#?}\nactual:\n\n{actual:#?}\n\n"
+        );
+    };
+}
+
+// Assertion after "JoinSelection - EnforceSorting" optimization
+#[macro_export]
+macro_rules! assert_join_selection_enforce_sorting {
+    ($EXPECTED_OPTIMIZED_PLAN_LINES: expr, $PLAN: expr) => {
+        let session_ctx = SessionContext::new();
+        let state = session_ctx.state();
+
+        let physical_plan = $PLAN;
+
+        let expected_optimized_lines: Vec<&str> = $EXPECTED_OPTIMIZED_PLAN_LINES.iter().map(|s| *s).collect();
+        let optimized_physical_plan = GlobalOrderRequire::new_add_mode().optimize(physical_plan.clone(), state.config_options())?;
+        let optimized_physical_plan = JoinSelection::new().optimize(optimized_physical_plan, state.config_options())?;
+        let optimized_physical_plan = EnforceSorting::new().optimize(optimized_physical_plan, state.config_options())?;
+        let optimized_physical_plan = GlobalOrderRequire::new_remove_mode().optimize(optimized_physical_plan, state.config_options())?;
+
+        assert_eq!(physical_plan.schema(), optimized_physical_plan.schema());
+
+        let actual = get_plan_string(&optimized_physical_plan);
+        assert_eq!(
+            expected_optimized_lines, actual,
+            "\n**JoinSelection - EnforceSorting Optimized Plan Mismatch\n\nexpected:\n\n{expected_optimized_lines:#?}\nactual:\n\n{actual:#?}\n\n"
+        );
+    };
+}
+
+// Assertion after "EnforceSorting - JoinSelection" optimization
+#[macro_export]
+macro_rules! assert_enforce_sorting_join_selection {
+    ($EXPECTED_OPTIMIZED_PLAN_LINES: expr, $PLAN: expr) => {
+        let session_ctx = SessionContext::new();
+        let state = session_ctx.state();
+
+        let physical_plan = $PLAN;
+
+        let expected_optimized_lines: Vec<&str> = $EXPECTED_OPTIMIZED_PLAN_LINES.iter().map(|s| *s).collect();
+        let optimized_physical_plan = GlobalOrderRequire::new_add_mode().optimize(physical_plan.clone(), state.config_options())?;
+        let optimized_physical_plan = EnforceSorting::new().optimize(optimized_physical_plan, state.config_options())?;
+        let optimized_physical_plan = JoinSelection::new().optimize(optimized_physical_plan, state.config_options())?;
+        let optimized_physical_plan = GlobalOrderRequire::new_remove_mode().optimize(optimized_physical_plan, state.config_options())?;
+
+        assert_eq!(physical_plan.schema(), optimized_physical_plan.schema());
+
+        let actual = get_plan_string(&optimized_physical_plan);
+        assert_eq!(
+            expected_optimized_lines, actual,
+            "\n**EnforceSorting - JoinSelection Optimized Plan Mismatch\n\nexpected:\n\n{expected_optimized_lines:#?}\nactual:\n\n{actual:#?}\n\n"
+        );
     };
 }
