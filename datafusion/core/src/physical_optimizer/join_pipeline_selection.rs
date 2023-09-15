@@ -113,8 +113,8 @@ impl PlanWithCorrespondingHashJoin {
 
 impl TreeNode for PlanWithCorrespondingHashJoin {
     fn apply_children<F>(&self, op: &mut F) -> Result<VisitRecursion>
-        where
-            F: FnMut(&Self) -> Result<VisitRecursion>,
+    where
+        F: FnMut(&Self) -> Result<VisitRecursion>,
     {
         for child in self.children() {
             match op(&child)? {
@@ -128,8 +128,8 @@ impl TreeNode for PlanWithCorrespondingHashJoin {
     }
 
     fn map_children<F>(self, transform: F) -> Result<Self>
-        where
-            F: FnMut(Self) -> Result<Self>,
+    where
+        F: FnMut(Self) -> Result<Self>,
     {
         let children = self.children();
         if children.is_empty() {
@@ -536,9 +536,9 @@ fn check_hash_join_convertable(
                 // Check if the indices are equal and the sort options are aligned:
                 if left_indices == right_indices
                     && left_satisfied
-                    .iter()
-                    .zip(right_satisfied.iter())
-                    .all(|(l, r)| l == r)
+                        .iter()
+                        .zip(right_satisfied.iter())
+                        .all(|(l, r)| l == r)
                 {
                     let adjusted_keys = left_indices
                         .iter()
@@ -783,9 +783,9 @@ pub fn select_joins_to_preserve_order_subrule(
 mod order_preserving_join_swap_tests {
     use std::sync::Arc;
 
+    use crate::physical_optimizer::enforce_sorting::EnforceSorting;
     use crate::physical_optimizer::global_order_require::GlobalOrderRequire;
     use crate::physical_optimizer::join_selection::JoinSelection;
-    use crate::physical_optimizer::enforce_sorting::EnforceSorting;
     use crate::physical_optimizer::test_utils::{
         memory_exec_with_sort, nested_loop_join_exec, not_prunable_filter,
         sort_expr_options,
@@ -1136,13 +1136,13 @@ mod order_preserving_join_swap_tests {
                     Arc::new(WindowFrame::new(true)),
                     schema.as_ref(),
                 )
-                    .unwrap()],
+                .unwrap()],
                 input.clone(),
                 input.schema(),
                 vec![],
                 crate::physical_plan::windows::PartitionSearchMode::Sorted,
             )
-                .unwrap(),
+            .unwrap(),
         )
     }
 
