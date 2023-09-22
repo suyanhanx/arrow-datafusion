@@ -3,30 +3,28 @@
 
 use std::sync::Arc;
 
-use crate::physical_optimizer::join_selection::{
-    swap_filter, swap_join_type, swap_reverting_projection,
-};
 use crate::physical_optimizer::utils::{is_hash_join, is_nested_loop_join, is_sort};
-use crate::physical_plan::joins::utils::{is_filter_expr_prunable, JoinOn};
+use crate::physical_plan::joins::utils::is_filter_expr_prunable;
 use crate::physical_plan::joins::{
     HashJoinExec, NestedLoopJoinExec, SlidingHashJoinExec, SlidingNestedLoopJoinExec,
     SortMergeJoinExec, StreamJoinPartitionMode,
 };
-use crate::physical_plan::projection::ProjectionExec;
 use crate::physical_plan::sorts::sort::SortExec;
 use crate::physical_plan::{with_new_children_if_necessary, ExecutionPlan};
+use datafusion_physical_plan::joins::utils::swap_join_type;
 
-use arrow_schema::SortOptions;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::{Transformed, TreeNode, VisitRecursion};
-use datafusion_common::{DataFusionError, JoinType, Result};
-use datafusion_physical_expr::expressions::Column;
+use datafusion_common::{JoinType, Result};
 use datafusion_physical_expr::utils::{
     get_indices_of_matching_sort_exprs_with_order_eq,
     ordering_satisfy_requirement_concrete,
 };
 use datafusion_physical_expr::PhysicalSortRequirement;
 
+use datafusion_physical_plan::joins::{
+    swap_sliding_hash_join, swap_sliding_nested_loop_join, swap_sort_merge_join,
+};
 use itertools::{iproduct, izip, Itertools};
 
 /// This object is used within the JoinSelection rule to track the closest
@@ -144,42 +142,6 @@ impl TreeNode for PlanWithCorrespondingHashJoin {
                 self.plan,
             )
         }
-    }
-}
-
-/// This function swaps the inputs of the given SMJ operator.
-fn swap_sort_merge_join(
-    hash_join: &HashJoinExec,
-    keys: Vec<(Column, Column)>,
-    sort_options: Vec<SortOptions>,
-) -> Result<Arc<dyn ExecutionPlan>> {
-    let left = hash_join.left();
-    let right = hash_join.right();
-    let swapped_join_type = swap_join_type(hash_join.join_type);
-    if matches!(swapped_join_type, JoinType::RightSemi) {
-        return Err(DataFusionError::Plan(
-            "RightSemi is not supported for SortMergeJoin".to_owned(),
-        ));
-    }
-    let new_join = SortMergeJoinExec::try_new(
-        Arc::clone(right),
-        Arc::clone(left),
-        keys.iter().map(|(l, r)| (r.clone(), l.clone())).collect(),
-        swap_join_type(hash_join.join_type),
-        sort_options,
-        hash_join.null_equals_null,
-    )?;
-    if matches!(
-        hash_join.join_type,
-        JoinType::LeftSemi | JoinType::LeftAnti | JoinType::RightAnti
-    ) {
-        Ok(Arc::new(new_join))
-    } else {
-        let proj = ProjectionExec::try_new(
-            swap_reverting_projection(&left.schema(), &right.schema()),
-            Arc::new(new_join),
-        )?;
-        Ok(Arc::new(proj))
     }
 }
 
@@ -335,104 +297,6 @@ fn create_join_cases_local_preserve_order(
         .collect();
 
     Ok(plans)
-}
-
-/// Swaps join columns.
-fn swap_join_on(on: &JoinOn) -> JoinOn {
-    on.iter().map(|(l, r)| (r.clone(), l.clone())).collect()
-}
-
-/// This function swaps the inputs of the given join operator.
-fn swap_sliding_hash_join(join: &SlidingHashJoinExec) -> Result<Arc<dyn ExecutionPlan>> {
-    let err_msg = || {
-        DataFusionError::Internal(
-            "SlidingHashJoinExec needs left and right side ordered.".to_owned(),
-        )
-    };
-    let left = join.left.clone();
-    let right = join.right.clone();
-    let left_sort_expr = left
-        .output_ordering()
-        .map(|order| order.to_vec())
-        .ok_or_else(err_msg)?;
-    let right_sort_expr = right
-        .output_ordering()
-        .map(|order| order.to_vec())
-        .ok_or_else(err_msg)?;
-
-    let new_join = SlidingHashJoinExec::try_new(
-        right.clone(),
-        left.clone(),
-        swap_join_on(&join.on),
-        swap_filter(&join.filter),
-        &swap_join_type(join.join_type),
-        join.null_equals_null,
-        right_sort_expr,
-        left_sort_expr,
-        join.mode,
-    )?;
-    if matches!(
-        join.join_type,
-        JoinType::LeftSemi
-            | JoinType::RightSemi
-            | JoinType::LeftAnti
-            | JoinType::RightAnti
-    ) {
-        Ok(Arc::new(new_join))
-    } else {
-        // TODO: Avoid adding ProjectionExec again and again, only add one final projection.
-        let proj = ProjectionExec::try_new(
-            swap_reverting_projection(&left.schema(), &right.schema()),
-            Arc::new(new_join),
-        )?;
-        Ok(Arc::new(proj))
-    }
-}
-
-/// This function swaps the inputs of the given join operator.
-pub fn swap_sliding_nested_loop_join(
-    join: &SlidingNestedLoopJoinExec,
-) -> Result<Arc<dyn ExecutionPlan>> {
-    let err_msg = || {
-        DataFusionError::Internal(
-            "SlidingNestedLoopJoinExec needs left and right side ordered.".to_owned(),
-        )
-    };
-    let left = join.left.clone();
-    let right = join.right.clone();
-    let left_sort_expr = left
-        .output_ordering()
-        .map(|order| order.to_vec())
-        .ok_or_else(err_msg)?;
-    let right_sort_expr = right
-        .output_ordering()
-        .map(|order| order.to_vec())
-        .ok_or_else(err_msg)?;
-
-    let new_join = SlidingNestedLoopJoinExec::try_new(
-        right.clone(),
-        left.clone(),
-        swap_filter(&join.filter),
-        &swap_join_type(join.join_type),
-        right_sort_expr,
-        left_sort_expr,
-    )?;
-    if matches!(
-        join.join_type,
-        JoinType::LeftSemi
-            | JoinType::RightSemi
-            | JoinType::LeftAnti
-            | JoinType::RightAnti
-    ) {
-        Ok(Arc::new(new_join))
-    } else {
-        // TODO: Avoid adding ProjectionExec again and again, only add one final projection.
-        let proj = ProjectionExec::try_new(
-            swap_reverting_projection(&left.schema(), &right.schema()),
-            Arc::new(new_join),
-        )?;
-        Ok(Arc::new(proj))
-    }
 }
 
 /// Checks if a given `HashJoinExec` can be converted into another form of execution plans,
@@ -602,10 +466,10 @@ fn check_nested_loop_join_convertable(
             if left_prunable && right_prunable {
                 let sliding_nested_loop_join =
                     Arc::new(SlidingNestedLoopJoinExec::try_new(
-                        nested_loop_join.left.clone(),
-                        nested_loop_join.right.clone(),
+                        nested_loop_join.left().clone(),
+                        nested_loop_join.right().clone(),
                         filter.clone(),
-                        &nested_loop_join.join_type,
+                        nested_loop_join.join_type(),
                         left_order.to_vec(),
                         right_order.to_vec(),
                     )?);

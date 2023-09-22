@@ -19,6 +19,8 @@
 //! related functionality, used both in join calculations and optimization rules.
 
 use std::collections::{HashMap, VecDeque};
+use std::fmt::{Debug, Display, Formatter};
+use std::ops::IndexMut;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::usize;
@@ -26,6 +28,10 @@ use std::usize;
 use crate::joins::utils::{JoinFilter, JoinHashMapType};
 use crate::metrics::{ExecutionPlanMetricsSet, MetricBuilder};
 use crate::{handle_async_state, metrics};
+use crate::joins::utils::{
+    get_filter_representation_of_build_side,
+    get_filter_representation_schema_of_build_side, JoinSide,
+};
 
 use arrow::compute::concat_batches;
 use arrow_array::{ArrowPrimitiveType, NativeAdapter, PrimitiveArray, RecordBatch};
@@ -284,7 +290,7 @@ pub fn build_filter_input_order(
 ) -> Result<Vec<SortedFilterExpr>> {
     let mut additional_sort_exprs: HashSet<PhysicalSortExpr> = HashSet::new();
     additional_sort_exprs.insert(sort_expr.clone());
-    for class in ordering_equivalence_properties.classes() {
+    if let Some(class) = ordering_equivalence_properties.oeq_class() {
         for ordering in class.iter() {
             additional_sort_exprs.insert(ordering[0].clone());
         }
@@ -1467,7 +1473,8 @@ pub mod tests {
         let filter = JoinFilter::new(filter_expr, column_indices, intermediate_schema);
 
         let empty_eq = EquivalenceProperties::new(Arc::new(Schema::empty()));
-        let empty_order_eq = EquivalenceProperties::new(Arc::new(Schema::empty()));
+        let empty_order_eq =
+            OrderingEquivalenceProperties::new(Arc::new(Schema::empty()));
         let left_sort_filter_exprs = build_filter_input_order(
             JoinSide::Left,
             &filter,

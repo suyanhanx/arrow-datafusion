@@ -20,9 +20,11 @@
 pub use cross_join::CrossJoinExec;
 pub use hash_join::HashJoinExec;
 pub use nested_loop_join::NestedLoopJoinExec;
-pub use sliding_hash_join::SlidingHashJoinExec;
-pub use sliding_nested_loop_join::SlidingNestedLoopJoinExec;
-pub use sort_merge_join::SortMergeJoinExec;
+pub use sliding_hash_join::{swap_sliding_hash_join, SlidingHashJoinExec};
+pub use sliding_nested_loop_join::{
+    swap_sliding_nested_loop_join, SlidingNestedLoopJoinExec,
+};
+pub use sort_merge_join::{swap_sort_merge_join, SortMergeJoinExec};
 pub use symmetric_hash_join::SymmetricHashJoinExec;
 mod cross_join;
 mod hash_join;
