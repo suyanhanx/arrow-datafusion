@@ -33,7 +33,9 @@ use std::task::{Context, Poll};
 use crate::expressions::{Column, PhysicalSortExpr};
 use crate::joins::utils::{
     build_join_schema, calculate_join_output_ordering, check_join_is_valid,
-    estimate_join_statistics, partitioned_join_output_partitioning, JoinOn,
+    combine_join_equivalence_properties, combine_join_ordering_equivalence_properties,
+    estimate_join_statistics, partitioned_join_output_partitioning, swap_join_type,
+    swap_reverting_projection, JoinOn, JoinSide,
 };
 use crate::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
 use crate::{
@@ -54,6 +56,8 @@ use datafusion_execution::TaskContext;
 use datafusion_physical_expr::equivalence::join_equivalence_properties;
 use datafusion_physical_expr::{EquivalenceProperties, PhysicalSortRequirement};
 
+use crate::joins::HashJoinExec;
+use crate::projection::ProjectionExec;
 use futures::{Stream, StreamExt};
 
 /// join execution plan executes partitions in parallel and combines them into a set of
@@ -381,6 +385,42 @@ impl ExecutionPlan for SortMergeJoinExec {
             &self.join_type,
             &self.schema,
         )
+    }
+}
+
+/// This function swaps the inputs of the given SMJ operator.
+pub fn swap_sort_merge_join(
+    hash_join: &HashJoinExec,
+    keys: Vec<(Column, Column)>,
+    sort_options: Vec<SortOptions>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let left = hash_join.left();
+    let right = hash_join.right();
+    let swapped_join_type = swap_join_type(hash_join.join_type);
+    if matches!(swapped_join_type, JoinType::RightSemi) {
+        return Err(DataFusionError::Plan(
+            "RightSemi is not supported for SortMergeJoin".to_owned(),
+        ));
+    }
+    let new_join = SortMergeJoinExec::try_new(
+        Arc::clone(right),
+        Arc::clone(left),
+        keys.iter().map(|(l, r)| (r.clone(), l.clone())).collect(),
+        swap_join_type(hash_join.join_type),
+        sort_options,
+        hash_join.null_equals_null,
+    )?;
+    if matches!(
+        hash_join.join_type,
+        JoinType::LeftSemi | JoinType::LeftAnti | JoinType::RightAnti
+    ) {
+        Ok(Arc::new(new_join))
+    } else {
+        let proj = ProjectionExec::try_new(
+            swap_reverting_projection(&left.schema(), &right.schema()),
+            Arc::new(new_join),
+        )?;
+        Ok(Arc::new(proj))
     }
 }
 

@@ -21,11 +21,9 @@ use std::vec;
 use std::{any::Any, usize};
 use std::{fmt, mem};
 
-use crate::error::{DataFusionError, Result};
-use crate::logical_expr::JoinType;
-use crate::physical_plan::common::SharedMemoryReservation;
-use crate::physical_plan::expressions::{Column, PhysicalSortExpr};
-use crate::physical_plan::joins::{
+use crate::common::SharedMemoryReservation;
+use crate::expressions::{Column, PhysicalSortExpr};
+use crate::joins::{
     hash_join::build_equal_condition_join_indices,
     hash_join_utils::{
         calculate_filter_expr_intervals, combine_two_batches, record_visited_indices,
@@ -48,22 +46,25 @@ use crate::physical_plan::joins::{
     },
     StreamJoinPartitionMode,
 };
-use crate::physical_plan::metrics::{
-    self, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
-};
-use crate::physical_plan::{
+use crate::metrics::{self, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
+use crate::{DataFusionError, Result};
+use crate::{
     DisplayAs, DisplayFormatType, Distribution, EquivalenceProperties, ExecutionPlan,
     Partitioning, RecordBatchStream, SendableRecordBatchStream, Statistics,
 };
 
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use datafusion_common::{internal_err, plan_err};
+use datafusion_common::{internal_err, plan_err, JoinType};
 use datafusion_execution::memory_pool::MemoryConsumer;
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::intervals::ExprIntervalGraph;
 use datafusion_physical_expr::{OrderingEquivalenceProperties, PhysicalSortRequirement};
 
+use crate::joins::utils::{
+    swap_filter, swap_join_on, swap_join_type, swap_reverting_projection,
+};
+use crate::projection::ProjectionExec;
 use ahash::RandomState;
 use futures::{ready, Stream, StreamExt};
 use parking_lot::Mutex;
@@ -465,14 +466,10 @@ impl ExecutionPlan for SlidingHashJoinExec {
         )) =
             prepare_sorted_exprs(
                 &self.filter,
-                &self.left.schema(),
-                &self.right.schema(),
+                &self.left,
+                &self.right,
                 &self.left_sort_exprs,
-                &self.left.equivalence_properties(),
-                &self.left.ordering_equivalence_properties(),
                 &self.right_sort_exprs,
-                &self.right.equivalence_properties(),
-                &self.right.ordering_equivalence_properties(),
             )? {
             (left_sorted_filter_expr, right_sorted_filter_expr, graph)
         } else {
@@ -522,6 +519,55 @@ impl ExecutionPlan for SlidingHashJoinExec {
     fn statistics(&self) -> Statistics {
         // TODO stats: it is not possible in general to know the output size of joins
         Statistics::default()
+    }
+}
+
+/// This function swaps the inputs of the given join operator.
+pub fn swap_sliding_hash_join(
+    join: &SlidingHashJoinExec,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let err_msg = || {
+        DataFusionError::Internal(
+            "SlidingHashJoinExec needs left and right side ordered.".to_owned(),
+        )
+    };
+    let left = join.left.clone();
+    let right = join.right.clone();
+    let left_sort_expr = left
+        .output_ordering()
+        .map(|order| order.to_vec())
+        .ok_or_else(err_msg)?;
+    let right_sort_expr = right
+        .output_ordering()
+        .map(|order| order.to_vec())
+        .ok_or_else(err_msg)?;
+
+    let new_join = SlidingHashJoinExec::try_new(
+        right.clone(),
+        left.clone(),
+        swap_join_on(&join.on),
+        swap_filter(&join.filter),
+        &swap_join_type(join.join_type),
+        join.null_equals_null,
+        right_sort_expr,
+        left_sort_expr,
+        join.mode,
+    )?;
+    if matches!(
+        join.join_type,
+        JoinType::LeftSemi
+            | JoinType::RightSemi
+            | JoinType::LeftAnti
+            | JoinType::RightAnti
+    ) {
+        Ok(Arc::new(new_join))
+    } else {
+        // TODO: Avoid adding ProjectionExec again and again, only add one final projection.
+        let proj = ProjectionExec::try_new(
+            swap_reverting_projection(&left.schema(), &right.schema()),
+            Arc::new(new_join),
+        )?;
+        Ok(Arc::new(proj))
     }
 }
 
@@ -1129,25 +1175,24 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::execution::context::SessionConfig;
-    use crate::physical_plan::joins::hash_join_utils::tests::{
+    use crate::joins::hash_join_utils::tests::{
         complicated_4_column_exprs, complicated_filter,
     };
-    use crate::physical_plan::joins::test_utils::{
+    use crate::joins::test_utils::{
         build_sides_record_batches, compare_batches, create_memory_table,
         join_expr_tests_fixture_i32, partitioned_hash_join_with_filter,
         split_record_batches,
     };
-    use crate::physical_plan::joins::utils::JoinOn;
-    use crate::physical_plan::repartition::RepartitionExec;
-    use crate::physical_plan::{common, expressions::Column, joins::utils::JoinSide};
-    use crate::prelude::SessionContext;
+    use crate::joins::utils::JoinOn;
+    use crate::repartition::RepartitionExec;
+    use crate::{common, expressions::Column, joins::utils::JoinSide};
 
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow_schema::SortOptions;
     use datafusion_expr::Operator;
     use datafusion_physical_expr::expressions::{binary, col};
 
+    use datafusion_execution::config::SessionConfig;
     use rstest::*;
 
     pub async fn partitioned_swhj_join_with_filter(
@@ -1269,8 +1314,11 @@ mod tests {
         #[values(0, 1, 2, 3, 4, 5, 6, 7)] case_expr: usize,
         #[values(13, 10)] batch_size: usize,
     ) -> Result<()> {
-        let session_ctx = SessionContext::new();
-        let task_ctx = session_ctx.task_ctx();
+        // let cfg = SessionConfig::new();
+        // TaskContext::default()
+        // cfg.co
+        // let session_ctx = SessionContext::new();
+        let task_ctx = Arc::new(TaskContext::default());
         let (left_partition, right_partition) =
             get_or_create_table(cardinality, batch_size)?;
         let left_schema = &left_partition[0].schema();
@@ -1326,8 +1374,9 @@ mod tests {
         let join_type = JoinType::Inner;
         let cardinality = (4, 5);
         let case_expr = 1;
-        let session_ctx = SessionContext::new();
-        let task_ctx = session_ctx.task_ctx();
+        // let session_ctx = SessionContext::new();
+        // let task_ctx = session_ctx.task_ctx();
+        let task_ctx = Arc::new(TaskContext::default());
         let (left_partition, right_partition) = get_or_create_table(cardinality, 8)?;
         let left_schema = &left_partition[0].schema();
         let right_schema = &right_partition[0].schema();
@@ -1383,8 +1432,9 @@ mod tests {
         let cardinality = (10, 11);
         let case_expr = 1;
         let config = SessionConfig::new().with_repartition_joins(false);
-        let session_ctx = SessionContext::with_config(config);
-        let task_ctx = session_ctx.task_ctx();
+        // let session_ctx = SessionContext::with_config(config);
+        // let task_ctx = session_ctx.task_ctx();
+        let task_ctx = Arc::new(TaskContext::default().with_session_config(config));
         let (left_partition, right_partition) = get_or_create_table(cardinality, 8)?;
         let left_schema = &left_partition[0].schema();
         let right_schema = &right_partition[0].schema();
@@ -1445,8 +1495,9 @@ mod tests {
         let cardinality = (10, 11);
         let case_expr = 1;
         let config = SessionConfig::new().with_repartition_joins(false);
-        let session_ctx = SessionContext::with_config(config);
-        let task_ctx = session_ctx.task_ctx();
+        // let session_ctx = SessionContext::with_config(config);
+        // let task_ctx = session_ctx.task_ctx();
+        let task_ctx = Arc::new(TaskContext::default().with_session_config(config));
         let (left_partition, right_partition) = get_or_create_table(cardinality, 8)?;
         let left_schema = &left_partition[0].schema();
         let right_schema = &right_partition[0].schema();
@@ -1524,8 +1575,9 @@ mod tests {
         cardinality: (i32, i32),
         #[values(0, 1, 2, 3, 4, 5, 6)] case_expr: usize,
     ) -> Result<()> {
-        let session_ctx = SessionContext::new();
-        let task_ctx = session_ctx.task_ctx();
+        // let session_ctx = SessionContext::new();
+        // let task_ctx = session_ctx.task_ctx();
+        let task_ctx = Arc::new(TaskContext::default());
         let (left_partition, right_partition) = get_or_create_table(cardinality, 8)?;
         let left_schema = &left_partition[0].schema();
         let right_schema = &right_partition[0].schema();
@@ -1603,8 +1655,9 @@ mod tests {
         cardinality: (i32, i32),
     ) -> Result<()> {
         // a + b > c + 10 AND a + b < c + 100
-        let session_ctx = SessionContext::new();
-        let task_ctx = session_ctx.task_ctx();
+        // let session_ctx = SessionContext::new();
+        // let task_ctx = session_ctx.task_ctx();
+        let task_ctx = Arc::new(TaskContext::default());
         let (left_partition, right_partition) = get_or_create_table(cardinality, 8)?;
         let left_schema = &left_partition[0].schema();
         let right_schema = &right_partition[0].schema();
@@ -1683,8 +1736,9 @@ mod tests {
         cardinality: (i32, i32),
         #[values(0, 1, 2)] case_expr: usize,
     ) -> Result<()> {
-        let session_ctx = SessionContext::new();
-        let task_ctx = session_ctx.task_ctx();
+        // let session_ctx = // SessionContext::new();
+        // let task_ctx = session_ctx.task_ctx();
+        let task_ctx = Arc::new(TaskContext::default());
         let (left_partition, right_partition) = get_or_create_table(cardinality, 8)?;
         let left_schema = &left_partition[0].schema();
         let right_schema = &right_partition[0].schema();

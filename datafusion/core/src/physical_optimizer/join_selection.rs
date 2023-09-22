@@ -29,7 +29,6 @@ use crate::config::ConfigOptions;
 use crate::error::Result;
 use crate::physical_optimizer::pipeline_checker::PipelineStatePropagator;
 use crate::physical_optimizer::PhysicalOptimizerRule;
-use crate::physical_plan::joins::utils::{ColumnIndex, JoinFilter};
 use crate::physical_plan::joins::{
     CrossJoinExec, HashJoinExec, PartitionMode, StreamJoinPartitionMode,
     SymmetricHashJoinExec,
@@ -37,12 +36,12 @@ use crate::physical_plan::joins::{
 use crate::physical_plan::projection::ProjectionExec;
 use crate::physical_plan::ExecutionPlan;
 
-use arrow_schema::Schema;
 use datafusion_common::internal_err;
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{DataFusionError, JoinType};
-use datafusion_physical_expr::expressions::Column;
-use datafusion_physical_expr::PhysicalExpr;
+use datafusion_physical_plan::joins::utils::{
+    swap_join_filter, swap_join_type, swap_reverting_projection,
+};
 
 /// The [`JoinSelection`] rule tries to modify a given plan so that it can
 /// accommodate infinite sources and optimize joins in the plan according to
@@ -120,21 +119,6 @@ fn supports_swap(join_type: JoinType) -> bool {
     )
 }
 
-/// This function returns the new join type we get after swapping the given
-/// join's inputs.
-pub(crate) fn swap_join_type(join_type: JoinType) -> JoinType {
-    match join_type {
-        JoinType::Inner => JoinType::Inner,
-        JoinType::Full => JoinType::Full,
-        JoinType::Left => JoinType::Right,
-        JoinType::Right => JoinType::Left,
-        JoinType::LeftSemi => JoinType::RightSemi,
-        JoinType::RightSemi => JoinType::LeftSemi,
-        JoinType::LeftAnti => JoinType::RightAnti,
-        JoinType::RightAnti => JoinType::LeftAnti,
-    }
-}
-
 /// This function swaps the inputs of the given join operator.
 fn swap_hash_join(
     hash_join: &HashJoinExec,
@@ -171,54 +155,6 @@ fn swap_hash_join(
         )?;
         Ok(Arc::new(proj))
     }
-}
-
-/// When the order of the join is changed by the optimizer, the columns in
-/// the output should not be impacted. This function creates the expressions
-/// that will allow to swap back the values from the original left as the first
-/// columns and those on the right next.
-pub(crate) fn swap_reverting_projection(
-    left_schema: &Schema,
-    right_schema: &Schema,
-) -> Vec<(Arc<dyn PhysicalExpr>, String)> {
-    let right_cols = right_schema.fields().iter().enumerate().map(|(i, f)| {
-        (
-            Arc::new(Column::new(f.name(), i)) as Arc<dyn PhysicalExpr>,
-            f.name().to_owned(),
-        )
-    });
-    let right_len = right_cols.len();
-    let left_cols = left_schema.fields().iter().enumerate().map(|(i, f)| {
-        (
-            Arc::new(Column::new(f.name(), right_len + i)) as Arc<dyn PhysicalExpr>,
-            f.name().to_owned(),
-        )
-    });
-
-    left_cols.chain(right_cols).collect()
-}
-
-/// Swaps join sides for filter column indices and produces new JoinFilter
-pub(crate) fn swap_filter(filter: &JoinFilter) -> JoinFilter {
-    let column_indices = filter
-        .column_indices()
-        .iter()
-        .map(|idx| ColumnIndex {
-            index: idx.index,
-            side: idx.side.negate(),
-        })
-        .collect();
-
-    JoinFilter::new(
-        filter.expression().clone(),
-        column_indices,
-        filter.schema().clone(),
-    )
-}
-
-/// Swaps join sides for filter column indices and produces new `JoinFilter` (if exists).
-fn swap_join_filter(filter: Option<&JoinFilter>) -> Option<JoinFilter> {
-    filter.map(swap_filter)
 }
 
 impl PhysicalOptimizerRule for JoinSelection {
@@ -1248,7 +1184,6 @@ mod util_tests {
 #[cfg(test)]
 mod hash_join_tests {
     use super::*;
-    use crate::physical_optimizer::join_selection::swap_join_type;
     use crate::physical_optimizer::test_utils::SourceType;
     use crate::physical_plan::expressions::Column;
     use crate::physical_plan::joins::PartitionMode;

@@ -1,7 +1,7 @@
 // Copyright (C) Synnada, Inc. - All Rights Reserved.
 // This file does not contain any Apache Software Foundation copyrighted code.
 
-use crate::physical_plan::joins::{
+use crate::joins::{
     hash_join_utils::{
         get_pruning_anti_indices, get_pruning_semi_indices, SortedFilterExpr,
     },
@@ -515,7 +515,7 @@ pub(crate) fn update_filter_expr_bounds(
 
 #[cfg(test)]
 mod tests {
-    use crate::physical_plan::joins::sliding_window_join_utils::append_probe_indices_in_order;
+    use crate::joins::sliding_window_join_utils::append_probe_indices_in_order;
     use arrow_array::{UInt32Array, UInt64Array};
 
     #[test]

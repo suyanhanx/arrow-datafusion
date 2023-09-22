@@ -52,13 +52,21 @@ use datafusion_common::{
 };
 use datafusion_expr::interval_arithmetic::Interval;
 use datafusion_physical_expr::equivalence::add_offset_to_expr;
-use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::intervals::cp_solver::ExprIntervalGraph;
 use datafusion_physical_expr::utils::merge_vectors;
+use datafusion_physical_expr::expressions::{BinaryExpr, Column};
 use datafusion_physical_expr::{
-    LexOrdering, LexOrderingRef, PhysicalExpr, PhysicalSortExpr,
+    add_offset_to_lex_ordering, EquivalentClass, LexOrdering, LexOrderingRef,
+    OrderingEquivalenceProperties, OrderingEquivalentClass, PhysicalExpr,
+    PhysicalSortExpr, SortProperties,
 };
 
+use crate::joins::hash_join_utils::{build_filter_input_order, SortedFilterExpr};
+use datafusion_expr::Operator;
+use datafusion_physical_expr::intervals::{ExprIntervalGraph, Interval, IntervalBound};
+use datafusion_physical_expr::utils::{
+    collect_columns, get_indices_of_matching_sort_exprs_with_order_eq, merge_vectors,
+};
 use futures::future::{BoxFuture, Shared};
 use futures::{ready, FutureExt};
 use hashbrown::raw::RawTable;
@@ -1850,7 +1858,7 @@ fn merge_equivalence_classes_for_intermediate_schema<
     right_ordering_equal_properties: F4,
 ) -> (EquivalenceProperties, OrderingEquivalenceProperties) {
     let (left_eq, right_eq) = (left_equal_properties(), right_equal_properties());
-    let new_eq = EquivalenceProperties::<Column>::new(Arc::new(filter_schema.clone()));
+    let new_eq = EquivalenceProperties::new(Arc::new(filter_schema.clone()));
     let new_eq =
         add_new_equivalences(&left_eq, left_indices, filter_schema.fields(), new_eq);
     let new_eq =
@@ -1962,7 +1970,8 @@ fn transform_orders(
                             Ok(Transformed::No(expr))
                         })
                         .unwrap();
-                    normalize_sort_expr_with_equivalence_properties(order, eq.classes())
+                    eq.normalize_sort_exprs(&[order])[0].clone()
+                    // normalize_sort_expr_with_equivalence_properties(order, eq.classes())
                 })
         })
         .collect()
@@ -1981,13 +1990,13 @@ fn transform_orders(
 ///
 /// This function handles the first two steps of these operations.
 fn add_ordering_head_class(
-    oeq: &EquivalenceProperties<LexOrdering>,
+    oeq: &OrderingEquivalenceProperties,
     indices: &[(usize, &ColumnIndex)],
     fields: &Fields,
     eq: &EquivalenceProperties,
     new_oeq_vec: &mut Vec<Vec<PhysicalSortExpr>>,
 ) {
-    if let Some(class) = oeq.classes().first() {
+    if let Some(class) = oeq.oeq_class() {
         let head_orderings = transform_orders(class.head(), indices, fields, eq);
         new_oeq_vec.push(head_orderings);
     }
@@ -2006,13 +2015,13 @@ fn add_ordering_head_class(
 ///
 /// This function handles the last two steps of these operations.
 fn add_ordering_other_classes(
-    oeq: &EquivalenceProperties<LexOrdering>,
+    oeq: &OrderingEquivalenceProperties,
     indices: &[(usize, &ColumnIndex)],
     fields: &Fields,
     eq: &EquivalenceProperties,
     new_oeq_vec: &mut Vec<Vec<PhysicalSortExpr>>,
 ) {
-    if let Some(class) = oeq.classes().first() {
+    if let Some(class) = oeq.oeq_class() {
         for class in class.others() {
             let orderings = transform_orders(class, indices, fields, eq);
             new_oeq_vec.push(orderings);
@@ -2028,14 +2037,14 @@ fn add_ordering_other_classes(
 /// original table. `schema` and `eq` are the schema and equivalence class of
 /// the intermediate schema.
 fn new_ordering_equivalences_for_join(
-    left_oeq: &EquivalenceProperties<LexOrdering>,
-    right_oeq: &EquivalenceProperties<LexOrdering>,
+    left_oeq: &OrderingEquivalenceProperties,
+    right_oeq: &OrderingEquivalenceProperties,
     left_indices: &[(usize, &ColumnIndex)],
     right_indices: &[(usize, &ColumnIndex)],
     schema: &Schema,
     eq: &EquivalenceProperties,
-) -> EquivalenceProperties<LexOrdering> {
-    let mut new_oeq = EquivalenceProperties::<LexOrdering>::new(Arc::new(schema.clone()));
+) -> OrderingEquivalenceProperties {
+    let mut new_oeq = OrderingEquivalenceProperties::new(Arc::new(schema.clone()));
     let mut new_oeq_vec = vec![];
 
     let left_right_oeq_ind = [(left_oeq, left_indices), (right_oeq, right_indices)];
@@ -2214,33 +2223,29 @@ pub type SortedFilterInformation = (
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_sorted_exprs(
     filter: &JoinFilter,
-    left_schema: &SchemaRef,
-    right_schema: &SchemaRef,
+    left: &Arc<dyn ExecutionPlan>,
+    right: &Arc<dyn ExecutionPlan>,
     left_sort_exprs: &[PhysicalSortExpr],
-    left_equivalence_properties: &EquivalenceProperties,
-    left_ordering_equivalence_properties: &OrderingEquivalenceProperties,
     right_sort_exprs: &[PhysicalSortExpr],
-    right_equivalence_properties: &EquivalenceProperties,
-    right_ordering_equivalence_properties: &OrderingEquivalenceProperties,
 ) -> Result<Option<SortedFilterInformation>> {
     // Build the filter order for the left side:
     let left_temp_sorted_filter_expr = build_filter_input_order(
         JoinSide::Left,
         filter,
-        left_schema,
+        &left.schema(),
         &left_sort_exprs[0],
-        left_equivalence_properties,
-        left_ordering_equivalence_properties,
+        &left.equivalence_properties(),
+        &left.ordering_equivalence_properties(),
     )?;
 
     // Build the filter order for the right side:
     let right_temp_sorted_filter_expr = build_filter_input_order(
         JoinSide::Right,
         filter,
-        right_schema,
+        &right.schema(),
         &right_sort_exprs[0],
-        right_equivalence_properties,
-        right_ordering_equivalence_properties,
+        &right.equivalence_properties(),
+        &right.ordering_equivalence_properties(),
     )?;
 
     if !left_temp_sorted_filter_expr.is_empty()
@@ -2333,6 +2338,74 @@ macro_rules! handle_async_state {
 pub enum StatefulStreamResult<T> {
     Ready(T),
     Continue,
+}
+
+/// Swaps join columns.
+pub fn swap_join_on(on: &JoinOn) -> JoinOn {
+    on.iter().map(|(l, r)| (r.clone(), l.clone())).collect()
+}
+
+/// Swaps join sides for filter column indices and produces new JoinFilter
+pub(crate) fn swap_filter(filter: &JoinFilter) -> JoinFilter {
+    let column_indices = filter
+        .column_indices()
+        .iter()
+        .map(|idx| ColumnIndex {
+            index: idx.index,
+            side: idx.side.negate(),
+        })
+        .collect();
+
+    JoinFilter::new(
+        filter.expression().clone(),
+        column_indices,
+        filter.schema().clone(),
+    )
+}
+
+/// Swaps join sides for filter column indices and produces new `JoinFilter` (if exists).
+pub fn swap_join_filter(filter: Option<&JoinFilter>) -> Option<JoinFilter> {
+    filter.map(swap_filter)
+}
+
+/// This function returns the new join type we get after swapping the given
+/// join's inputs.
+pub fn swap_join_type(join_type: JoinType) -> JoinType {
+    match join_type {
+        JoinType::Inner => JoinType::Inner,
+        JoinType::Full => JoinType::Full,
+        JoinType::Left => JoinType::Right,
+        JoinType::Right => JoinType::Left,
+        JoinType::LeftSemi => JoinType::RightSemi,
+        JoinType::RightSemi => JoinType::LeftSemi,
+        JoinType::LeftAnti => JoinType::RightAnti,
+        JoinType::RightAnti => JoinType::LeftAnti,
+    }
+}
+
+/// When the order of the join is changed by the optimizer, the columns in
+/// the output should not be impacted. This function creates the expressions
+/// that will allow to swap back the values from the original left as the first
+/// columns and those on the right next.
+pub fn swap_reverting_projection(
+    left_schema: &Schema,
+    right_schema: &Schema,
+) -> Vec<(Arc<dyn PhysicalExpr>, String)> {
+    let right_cols = right_schema.fields().iter().enumerate().map(|(i, f)| {
+        (
+            Arc::new(Column::new(f.name(), i)) as Arc<dyn PhysicalExpr>,
+            f.name().to_owned(),
+        )
+    });
+    let right_len = right_cols.len();
+    let left_cols = left_schema.fields().iter().enumerate().map(|(i, f)| {
+        (
+            Arc::new(Column::new(f.name(), right_len + i)) as Arc<dyn PhysicalExpr>,
+            f.name().to_owned(),
+        )
+    });
+
+    left_cols.chain(right_cols).collect()
 }
 
 #[cfg(test)]
@@ -3068,7 +3141,7 @@ mod tests {
             OrderingEquivalenceProperties::new(Arc::new(left_schema));
         let left_ordering_equal_properties = || left_ordering_equal_properties.clone();
         let right_ordering_equal_properties =
-            EquivalenceProperties::new(Arc::new(right_schema));
+            OrderingEquivalenceProperties::new(Arc::new(right_schema));
         let right_ordering_equal_properties = || right_ordering_equal_properties.clone();
         let (eq, oeq) = merge_equivalence_classes_for_intermediate_schema(
             &left_indices,
@@ -3092,7 +3165,7 @@ mod tests {
         ];
 
         assert_eq!(2, eq.classes().len());
-        assert_eq!(0, oeq.classes().len());
+        assert!(oeq.oeq_class().is_none());
         assert_eq!(expected_eq_classes[0].head(), eq.classes()[0].head());
         assert_eq!(expected_eq_classes[1].head(), eq.classes()[1].head());
         assert_eq!(expected_eq_classes[0].others(), eq.classes()[0].others());
@@ -3186,7 +3259,7 @@ mod tests {
         ));
         let left_ordering_equal_properties = || left_ordering_equal_properties.clone();
         let mut right_ordering_equal_properties =
-            EquivalenceProperties::new(Arc::new(right_schema));
+            OrderingEquivalenceProperties::new(Arc::new(right_schema));
         right_ordering_equal_properties.add_equal_conditions((
             &vec![PhysicalSortExpr {
                 expr: Arc::new(Column::new("b", 0)),
@@ -3236,9 +3309,10 @@ mod tests {
         );
 
         assert_eq!(0, eq.classes().len());
-        assert_eq!(1, oeq.classes().len());
-        assert_eq!(expected_oeq_classes.head(), oeq.classes()[0].head());
-        assert_eq!(expected_oeq_classes.others(), oeq.classes()[0].others());
+        assert!(oeq.oeq_class().is_some());
+        let oeq_class = oeq.oeq_class().unwrap();
+        assert_eq!(expected_oeq_classes.head(), oeq_class.head());
+        assert_eq!(expected_oeq_classes.others(), oeq_class.others());
 
         Ok(())
     }
@@ -3342,7 +3416,7 @@ mod tests {
         ));
         let left_ordering_equal_properties = || left_ordering_equal_properties.clone();
         let mut right_ordering_equal_properties =
-            EquivalenceProperties::new(Arc::new(right_schema));
+            OrderingEquivalenceProperties::new(Arc::new(right_schema));
         right_ordering_equal_properties.add_equal_conditions((
             &vec![PhysicalSortExpr {
                 expr: Arc::new(Column::new("c", 0)),
@@ -3395,11 +3469,12 @@ mod tests {
         );
 
         assert_eq!(1, eq.classes().len());
-        assert_eq!(1, oeq.classes().len());
+        assert!(oeq.oeq_class().is_some());
+        let oeq_class = oeq.oeq_class().unwrap();
         assert_eq!(expected_eq_classes.head(), eq.classes()[0].head());
         assert_eq!(expected_eq_classes.others(), eq.classes()[0].others());
-        assert_eq!(expected_oeq_classes.head(), oeq.classes()[0].head());
-        assert_eq!(expected_oeq_classes.others(), oeq.classes()[0].others());
+        assert_eq!(expected_oeq_classes.head(), oeq_class.head());
+        assert_eq!(expected_oeq_classes.others(), oeq_class.others());
 
         Ok(())
     }

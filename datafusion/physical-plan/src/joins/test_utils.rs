@@ -20,12 +20,15 @@
 use std::sync::Arc;
 use std::usize;
 
+use crate::joins::nested_loop_join::distribution_from_join_type;
 use crate::joins::utils::{JoinFilter, JoinOn};
 use crate::joins::{
-    HashJoinExec, PartitionMode, StreamJoinPartitionMode, SymmetricHashJoinExec,
+    HashJoinExec, NestedLoopJoinExec, PartitionMode, SlidingNestedLoopJoinExec,
+    StreamJoinPartitionMode, SymmetricHashJoinExec,
 };
 use crate::memory::MemoryExec;
 use crate::repartition::RepartitionExec;
+use crate::Distribution;
 use crate::{common, ExecutionPlan, Partitioning};
 
 use arrow::util::pretty::pretty_format_batches;
@@ -627,6 +630,11 @@ pub async fn partitioned_sliding_nested_join_with_filter(
         );
     }
     Ok(batches)
+}
+
+/// Returns the column names on the schema
+pub fn columns(schema: &Schema) -> Vec<String> {
+    schema.fields().iter().map(|f| f.name().clone()).collect()
 }
 
 pub async fn partitioned_nested_join_with_filter(

@@ -140,12 +140,12 @@ datafusion/wasmtest/pkg/*
 SYNNADA-CONTRIBUTIONS.txt
 SYNNADA-README.md
 SYNNADA-NOTICE.txt
-datafusion/core/src/physical_optimizer/join_pipeline_selection.rs
-datafusion/core/src/physical_plan/joins/sliding_window_join_utils.rs
-datafusion/core/src/physical_plan/joins/sliding_nested_loop_join.rs
-datafusion/core/src/physical_plan/joins/sliding_hash_join.rs
 datafusion/core/src/physical_optimizer/global_order_require.rs
-datafusion/core/src/physical_plan/joins/utils.rs
+datafusion/core/src/physical_optimizer/join_pipeline_selection.rs
 datafusion/physical-expr/src/expressions/binary.rs
+datafusion/physical-plan/src/joins/sliding_window_join_utils.rs
+datafusion/physical-plan/src/joins/sliding_nested_loop_join.rs
+datafusion/physical-plan/src/joins/sliding_hash_join.rs
+datafusion/physical-plan/src/joins/utils.rs
 force_push_main.sh
 generate_synnada_commits.sh

@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 
+use crate::common::{AbortOnDropMany, AbortOnDropSingle};
 use crate::displayable;
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
 use datafusion_common::DataFusionError;

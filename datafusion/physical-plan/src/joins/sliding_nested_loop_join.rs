@@ -11,27 +11,28 @@ use std::mem;
 use std::sync::Arc;
 use std::task::Poll;
 
-use crate::physical_plan::common::AbortOnDropMany;
-use crate::physical_plan::joins::hash_join_utils::{
+use crate::common::AbortOnDropMany;
+use crate::joins::hash_join_utils::{
     calculate_filter_expr_intervals, combine_two_batches, record_visited_indices,
     SortedFilterExpr,
 };
-use crate::physical_plan::joins::nested_loop_join::distribution_from_join_type;
-use crate::physical_plan::joins::sliding_window_join_utils::{
+use crate::joins::nested_loop_join::distribution_from_join_type;
+use crate::joins::sliding_window_join_utils::{
     adjust_probe_side_indices_by_join_type, calculate_build_outer_indices_by_join_type,
     calculate_the_necessary_build_side_range, check_if_sliding_window_condition_is_met,
     get_probe_batch, is_batch_suitable_interval_calculation, JoinStreamState,
 };
-use crate::physical_plan::joins::utils::{
+use crate::joins::utils::{
     apply_join_filter_to_indices, build_batch_from_indices, build_join_schema,
     calculate_join_output_ordering, calculate_prune_length_with_probe_batch_helper,
     combine_join_equivalence_properties, combine_join_ordering_equivalence_properties,
     estimate_join_statistics, partitioned_join_output_partitioning, prepare_sorted_exprs,
-    ColumnIndex, JoinFilter, JoinSide,
+    swap_filter, swap_join_type, swap_reverting_projection, ColumnIndex, JoinFilter,
+    JoinSide,
 };
-use crate::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
-use crate::physical_plan::stream::RecordBatchBroadcastStreamsBuilder;
-use crate::physical_plan::{
+use crate::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
+use crate::stream::RecordBatchBroadcastStreamsBuilder;
+use crate::{
     metrics, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning,
     RecordBatchStream, SendableRecordBatchStream,
 };
@@ -50,6 +51,7 @@ use datafusion_physical_expr::{
     PhysicalSortRequirement,
 };
 
+use crate::projection::ProjectionExec;
 use futures::{ready, Stream, StreamExt};
 use hashbrown::HashSet;
 use parking_lot::Mutex;
@@ -445,14 +447,10 @@ impl ExecutionPlan for SlidingNestedLoopJoinExec {
         )) =
             prepare_sorted_exprs(
                 &self.filter,
-                &self.left.schema(),
-                &self.right.schema(),
+                &self.left,
+                &self.right,
                 &self.left_sort_exprs,
-                &self.left.equivalence_properties(),
-                &self.left.ordering_equivalence_properties(),
                 &self.right_sort_exprs,
-                &self.right.equivalence_properties(),
-                &self.right.ordering_equivalence_properties(),
             )? {
             (left_sorted_filter_expr, right_sorted_filter_expr, graph)
         } else {
@@ -492,6 +490,52 @@ impl ExecutionPlan for SlidingNestedLoopJoinExec {
             vec![],
             &self.join_type,
         )
+    }
+}
+
+/// This function swaps the inputs of the given join operator.
+pub fn swap_sliding_nested_loop_join(
+    join: &SlidingNestedLoopJoinExec,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let err_msg = || {
+        DataFusionError::Internal(
+            "SlidingNestedLoopJoinExec needs left and right side ordered.".to_owned(),
+        )
+    };
+    let left = join.left.clone();
+    let right = join.right.clone();
+    let left_sort_expr = left
+        .output_ordering()
+        .map(|order| order.to_vec())
+        .ok_or_else(err_msg)?;
+    let right_sort_expr = right
+        .output_ordering()
+        .map(|order| order.to_vec())
+        .ok_or_else(err_msg)?;
+
+    let new_join = SlidingNestedLoopJoinExec::try_new(
+        right.clone(),
+        left.clone(),
+        swap_filter(&join.filter),
+        &swap_join_type(join.join_type),
+        right_sort_expr,
+        left_sort_expr,
+    )?;
+    if matches!(
+        join.join_type,
+        JoinType::LeftSemi
+            | JoinType::RightSemi
+            | JoinType::LeftAnti
+            | JoinType::RightAnti
+    ) {
+        Ok(Arc::new(new_join))
+    } else {
+        // TODO: Avoid adding ProjectionExec again and again, only add one final projection.
+        let proj = ProjectionExec::try_new(
+            swap_reverting_projection(&left.schema(), &right.schema()),
+            Arc::new(new_join),
+        )?;
+        Ok(Arc::new(proj))
     }
 }
 
@@ -1181,15 +1225,15 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::physical_plan::joins::hash_join_utils::tests::{
+    use crate::joins::hash_join_utils::tests::{
         complicated_4_column_exprs, complicated_filter,
     };
-    use crate::physical_plan::joins::test_utils::{
+    use crate::joins::test_utils::{
         build_sides_record_batches, compare_batches, create_memory_table,
         join_expr_tests_fixture_i32, partitioned_nested_join_with_filter,
         partitioned_sliding_nested_join_with_filter, split_record_batches,
     };
-    use crate::physical_plan::joins::utils::JoinSide;
+    use crate::joins::utils::JoinSide;
 
     use arrow::datatypes::{DataType, Field};
     use arrow_schema::SortOptions;
@@ -1228,7 +1272,6 @@ mod tests {
 
     const TABLE_SIZE: i32 = 30;
 
-    use crate::prelude::SessionContext;
     use once_cell::sync::Lazy;
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -1289,8 +1332,9 @@ mod tests {
         #[values(0, 1, 2, 3, 4, 5, 6, 7)] case_expr: usize,
         #[values(13, 15, 33, 100, 101, 123)] batch_size: usize,
     ) -> Result<()> {
-        let session_ctx = SessionContext::new();
-        let task_ctx = session_ctx.task_ctx();
+        // let session_ctx = SessionContext::new();
+        // let task_ctx = session_ctx.task_ctx();
+        let task_ctx = Arc::new(TaskContext::default());
         let (left_partition, right_partition) = get_or_create_table((4, 5), batch_size)?;
 
         let left_schema = &left_partition[0].schema();
@@ -1352,8 +1396,9 @@ mod tests {
         join_type: JoinType,
         #[values(0, 1, 2)] case_expr: usize,
     ) -> Result<()> {
-        let session_ctx = SessionContext::new();
-        let task_ctx = session_ctx.task_ctx();
+        // let session_ctx = SessionContext::new();
+        // let task_ctx = session_ctx.task_ctx();
+        let task_ctx = Arc::new(TaskContext::default());
         let (left_partition, right_partition) = get_or_create_table((4, 5), 8)?;
 
         let left_schema = &left_partition[0].schema();
@@ -1422,8 +1467,9 @@ mod tests {
         let cardinality = (10, 11);
         let case_expr = 1;
         let config = SessionConfig::new().with_repartition_joins(false);
-        let session_ctx = SessionContext::with_config(config);
-        let task_ctx = session_ctx.task_ctx();
+        // let session_ctx = SessionContext::with_config(config);
+        // let task_ctx = session_ctx.task_ctx();
+        let task_ctx = Arc::new(TaskContext::default().with_session_config(config));
         let (left_partition, right_partition) = get_or_create_table(cardinality, 8)?;
 
         let left_schema = &left_partition[0].schema();
@@ -1480,8 +1526,9 @@ mod tests {
         let cardinality = (10, 11);
         let case_expr = 1;
         let config = SessionConfig::new().with_repartition_joins(false);
-        let session_ctx = SessionContext::with_config(config);
-        let task_ctx = session_ctx.task_ctx();
+        // let session_ctx = SessionContext::with_config(config);
+        // let task_ctx = session_ctx.task_ctx();
+        let task_ctx = Arc::new(TaskContext::default().with_session_config(config));
         let (left_partition, right_partition) = get_or_create_table(cardinality, 8)?;
 
         let left_schema = &left_partition[0].schema();
@@ -1548,8 +1595,9 @@ mod tests {
         join_type: JoinType,
         #[values(0, 1, 2, 3, 4, 5, 6)] case_expr: usize,
     ) -> Result<()> {
-        let session_ctx = SessionContext::new();
-        let task_ctx = session_ctx.task_ctx();
+        // let session_ctx = SessionContext::new();
+        // let task_ctx = session_ctx.task_ctx();
+        let task_ctx = Arc::new(TaskContext::default());
         let (left_partition, right_partition) = get_or_create_table((4, 5), 8)?;
 
         let left_schema = &left_partition[0].schema();
@@ -1604,8 +1652,9 @@ mod tests {
     async fn join_all_one_descending_numeric_particular_v2() -> Result<()> {
         let join_type = JoinType::Inner;
         let case_expr = 1;
-        let session_ctx = SessionContext::new();
-        let task_ctx = session_ctx.task_ctx();
+        // let session_ctx = SessionContext::new();
+        // let task_ctx = session_ctx.task_ctx();
+        let task_ctx = Arc::new(TaskContext::default());
         let (left_partition, right_partition) = get_or_create_table((4, 5), 8)?;
 
         let left_schema = &left_partition[0].schema();
@@ -1672,8 +1721,9 @@ mod tests {
         join_type: JoinType,
     ) -> Result<()> {
         // a + b > c + 10 AND a + b < c + 100
-        let session_ctx = SessionContext::new();
-        let task_ctx = session_ctx.task_ctx();
+        // let session_ctx = SessionContext::new();
+        // let task_ctx = session_ctx.task_ctx();
+        let task_ctx = Arc::new(TaskContext::default());
         let (left_partition, right_partition) = get_or_create_table((4, 5), 8)?;
 
         let left_schema = &left_partition[0].schema();

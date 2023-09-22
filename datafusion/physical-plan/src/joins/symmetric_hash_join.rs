@@ -34,7 +34,7 @@ use std::{usize, vec};
 use crate::common::SharedMemoryReservation;
 use crate::joins::hash_join::{build_equal_condition_join_indices, update_hash};
 use crate::joins::stream_join_utils::{
-    calculate_filter_expr_intervals, combine_two_batches,
+    calculate_filter_expr_intervals, combine_two_batches, build_filter_input_order,
     convert_sort_expr_with_filter_schema, get_pruning_anti_indices,
     get_pruning_semi_indices, record_visited_indices, EagerJoinStream,
     EagerJoinStreamState, PruningJoinHashMap, SortedFilterExpr, StreamJoinMetrics,
@@ -440,14 +440,17 @@ impl ExecutionPlan for SymmetricHashJoinExec {
             &self.filter,
         ) {
             (Some(left_sort_exprs), Some(right_sort_exprs), Some(filter)) => {
-                let (left, right, graph) = prepare_sorted_exprs(
+                if let Some((left, right, graph)) = prepare_sorted_exprs(
                     filter,
                     &self.left,
                     &self.right,
                     left_sort_exprs,
                     right_sort_exprs,
-                )?;
-                (Some(left), Some(right), Some(graph))
+                )? {
+                    (Some(left), Some(right), Some(graph))
+                } else {
+                    (None, None, None)
+                }
             }
             // If `filter_state` or `filter` is not present, then return None for all three values:
             _ => (None, None, None),
@@ -1178,6 +1181,18 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use arrow::compute::SortOptions;
+    use arrow::datatypes::{DataType, Field, IntervalUnit, Schema, TimeUnit};
+    use datafusion_execution::config::SessionConfig;
+    use rstest::*;
+
+    use datafusion_expr::Operator;
+    use datafusion_physical_expr::expressions::{binary, col, Column};
+
+    use crate::joins::stream_join_utils::tests::{
+        complicated_4_column_exprs, complicated_filter,
+    };
+
     use crate::joins::test_utils::{
         build_sides_record_batches, compare_batches, complicated_filter,
         create_memory_table, join_expr_tests_fixture_f64, join_expr_tests_fixture_i32,
@@ -1191,7 +1206,6 @@ mod tests {
     use datafusion_expr::Operator;
     use datafusion_physical_expr::expressions::{binary, col, Column};
 
-    use crate::prelude::SessionContext;
     use once_cell::sync::Lazy;
     use rstest::*;
 
@@ -1365,8 +1379,9 @@ mod tests {
         cardinality: (i32, i32),
         #[values(0, 1, 2)] case_expr: usize,
     ) -> Result<()> {
-        let session_ctx = SessionContext::new();
-        let task_ctx = session_ctx.task_ctx();
+        // let session_ctx = SessionContext::new();
+        // let task_ctx = session_ctx.task_ctx();
+        let task_ctx = Arc::new(TaskContext::default());
 
         let (left_partition, right_partition) = get_or_create_table(cardinality, 8)?;
         let left_schema = &left_partition[0].schema();
@@ -1908,8 +1923,9 @@ mod tests {
 
         // a + b > c + 10 AND a + b < c + 100
         let config = SessionConfig::new().with_repartition_joins(false);
-        let session_ctx = SessionContext::with_config(config);
-        let task_ctx = session_ctx.task_ctx();
+        // let session_ctx = SessionContext::with_config(config);
+        // let task_ctx = session_ctx.task_ctx();
+        let task_ctx = Arc::new(TaskContext::default().with_session_config(config));
         let (left_partition, right_partition) = get_or_create_table(cardinality, 8)?;
         let left_schema = &left_partition[0].schema();
         let right_schema = &right_partition[0].schema();
