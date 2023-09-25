@@ -1,0 +1,560 @@
+# Copyright (C) Synnada, Inc. - All Rights Reserved.
+# This file does not contain any Apache Software Foundation copyrighted code.
+
+
+# Once the PRIMARY KEY is supported, "sn" INTEGER PRIMARY KEY, will be replaced, WITH ORDER (sn ASC) line will be deleted.
+statement ok
+CREATE UNBOUNDED EXTERNAL TABLE sales_us (
+    "ts" TIMESTAMP,
+    "sn" INTEGER,
+    "amount" INTEGER,
+    "currency" VARCHAR NOT NULL
+)
+STORED AS CSV
+WITH HEADER ROW
+WITH ORDER (ts ASC)
+WITH ORDER (sn ASC)
+LOCATION '../core/tests/data/sales_us.csv';
+
+statement ok
+CREATE UNBOUNDED EXTERNAL TABLE sales_global (
+    "ts" TIMESTAMP,
+    "sn" INTEGER,
+    "amount" INTEGER,
+    "currency" VARCHAR NOT NULL
+)
+STORED AS CSV
+WITH HEADER ROW
+WITH ORDER (ts ASC)
+WITH ORDER (sn ASC)
+LOCATION '../core/tests/data/sales_global.csv';
+
+statement ok
+CREATE UNBOUNDED EXTERNAL TABLE exchange_rates (
+  "ts" TIMESTAMP,
+  "sn" INTEGER,
+  "currency_from" VARCHAR NOT NULL,
+  "currency_to" VARCHAR NOT NULL,
+  "rate" FLOAT
+)
+STORED AS CSV
+WITH HEADER ROW
+WITH ORDER (ts ASC)
+WITH ORDER (sn ASC)
+LOCATION '../core/tests/data/exchange_rates.csv';
+
+
+# Annotating Streams with Aggregations
+
+statement ok
+SELECT s.*, SUM(amount) OVER (ORDER BY sn)
+INTO annotated_sales_us
+FROM sales_us AS s
+ORDER BY sn
+
+query TT
+EXPLAIN SELECT s.*, SUM(amount) OVER (ORDER BY sn)
+FROM sales_us AS s
+ORDER BY sn
+----
+logical_plan
+Sort: s.sn ASC NULLS LAST
+--WindowAggr: windowExpr=[[SUM(CAST(s.amount AS Int64)) ORDER BY [s.sn ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]
+----SubqueryAlias: s
+------TableScan: sales_us projection=[ts, sn, amount, currency]
+physical_plan
+BoundedWindowAggExec: wdw=[SUM(s.amount) ORDER BY [s.sn ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW: Ok(Field { name: "SUM(s.amount) ORDER BY [s.sn ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(Int32(NULL)), end_bound: CurrentRow }], mode=[Sorted]
+--CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/sales_us.csv]]}, projection=[ts, sn, amount, currency], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST], has_header=true
+
+query PIITI
+SELECT * from annotated_sales_us
+LIMIT 5
+----
+2000-01-01T00:00:00 0 83 EUR 83
+2000-01-01T00:00:15 1 40 TRY 123
+2000-01-01T00:00:30 2 73 TRY 196
+2000-01-01T00:00:45 3 54 EUR 250
+2000-01-01T00:01:00 4 31 EUR 281
+
+statement ok
+drop table annotated_sales_us;
+
+
+statement ok
+SELECT s.*, SUM(amount) OVER running_window
+INTO annotated_sales_us
+FROM sales_us AS s
+WINDOW running_window AS (ORDER BY sn)
+ORDER BY sn
+
+query TT
+EXPLAIN SELECT s.*, SUM(amount) OVER running_window
+FROM sales_us AS s
+WINDOW running_window AS (ORDER BY sn)
+ORDER BY sn
+----
+logical_plan
+Sort: s.sn ASC NULLS LAST
+--WindowAggr: windowExpr=[[SUM(CAST(s.amount AS Int64)) ORDER BY [s.sn ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]
+----SubqueryAlias: s
+------TableScan: sales_us projection=[ts, sn, amount, currency]
+physical_plan
+BoundedWindowAggExec: wdw=[SUM(s.amount) ORDER BY [s.sn ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW: Ok(Field { name: "SUM(s.amount) ORDER BY [s.sn ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(Int32(NULL)), end_bound: CurrentRow }], mode=[Sorted]
+--CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/sales_us.csv]]}, projection=[ts, sn, amount, currency], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST], has_header=true
+
+query PIITI
+SELECT * from annotated_sales_us
+LIMIT 5
+----
+2000-01-01T00:00:00 0 83 EUR 83
+2000-01-01T00:00:15 1 40 TRY 123
+2000-01-01T00:00:30 2 73 TRY 196
+2000-01-01T00:00:45 3 54 EUR 250
+2000-01-01T00:01:00 4 31 EUR 281
+
+statement ok
+drop table annotated_sales_us;
+
+
+statement ok
+SELECT s.*, AVG(amount) OVER sliding_window
+INTO annotated_sales_us
+FROM sales_us AS s
+WINDOW sliding_window AS (ORDER BY sn ROWS 100 PRECEDING)
+ORDER BY sn
+
+query TT
+EXPLAIN SELECT s.*, AVG(amount) OVER sliding_window
+FROM sales_us AS s
+WINDOW sliding_window AS (ORDER BY sn ROWS 100 PRECEDING)
+ORDER BY sn
+----
+logical_plan
+Sort: s.sn ASC NULLS LAST
+--WindowAggr: windowExpr=[[AVG(CAST(s.amount AS Float64)) ORDER BY [s.sn ASC NULLS LAST] ROWS BETWEEN 100 PRECEDING AND CURRENT ROW]]
+----SubqueryAlias: s
+------TableScan: sales_us projection=[ts, sn, amount, currency]
+physical_plan
+BoundedWindowAggExec: wdw=[AVG(s.amount) ORDER BY [s.sn ASC NULLS LAST] ROWS BETWEEN 100 PRECEDING AND CURRENT ROW: Ok(Field { name: "AVG(s.amount) ORDER BY [s.sn ASC NULLS LAST] ROWS BETWEEN 100 PRECEDING AND CURRENT ROW", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Rows, start_bound: Preceding(UInt64(100)), end_bound: CurrentRow }], mode=[Sorted]
+--CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/sales_us.csv]]}, projection=[ts, sn, amount, currency], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST], has_header=true
+
+query PIITR
+SELECT * from annotated_sales_us
+LIMIT 5
+----
+2000-01-01T00:00:00 0 83 EUR 83
+2000-01-01T00:00:15 1 40 TRY 61.5
+2000-01-01T00:00:30 2 73 TRY 65.333333333333
+2000-01-01T00:00:45 3 54 EUR 62.5
+2000-01-01T00:01:00 4 31 EUR 56.2
+
+statement ok
+drop table annotated_sales_us;
+
+# WINDOW sliding_window AS (ORDER BY ts RANGE INTERVAL '10' MINUTE PRECEDING) is not supported.
+# It also gives an error in Postgre
+
+
+# Merging Timelines
+
+query IPTI
+SELECT ROW_NUMBER() OVER (ORDER BY ts) AS sn, u.*
+FROM (
+  SELECT ts, currency, amount FROM sales_us
+  UNION ALL
+  SELECT ts, currency, amount FROM sales_global
+  ORDER BY ts
+) AS u
+ORDER BY sn
+LIMIT 5
+----
+1 2000-01-01T00:00:00 EUR 83
+2 2000-01-01T00:00:00 EUR 83
+3 2000-01-01T00:00:15 TRY 40
+4 2000-01-01T00:00:15 TRY 40
+5 2000-01-01T00:00:30 TRY 73
+
+query TT
+EXPLAIN SELECT ROW_NUMBER() OVER (ORDER BY ts) AS sn, u.*
+FROM (
+  SELECT ts, currency, amount FROM sales_us
+  UNION ALL
+  SELECT ts, currency, amount FROM sales_global
+  ORDER BY ts
+) AS u
+ORDER BY sn
+----
+logical_plan
+Sort: sn ASC NULLS LAST
+--Projection: ROW_NUMBER() ORDER BY [u.ts ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW AS sn, u.ts, u.currency, u.amount
+----WindowAggr: windowExpr=[[ROW_NUMBER() ORDER BY [u.ts ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]
+------SubqueryAlias: u
+--------Sort: sales_us.ts ASC NULLS LAST
+----------Union
+------------Projection: sales_us.ts, sales_us.currency, sales_us.amount
+--------------TableScan: sales_us projection=[ts, amount, currency]
+------------Projection: sales_global.ts, sales_global.currency, sales_global.amount
+--------------TableScan: sales_global projection=[ts, amount, currency]
+physical_plan
+ProjectionExec: expr=[ROW_NUMBER() ORDER BY [u.ts ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW@3 as sn, ts@0 as ts, currency@1 as currency, amount@2 as amount]
+--BoundedWindowAggExec: wdw=[ROW_NUMBER() ORDER BY [u.ts ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW: Ok(Field { name: "ROW_NUMBER() ORDER BY [u.ts ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW", data_type: UInt64, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(IntervalMonthDayNano("NULL")), end_bound: CurrentRow }], mode=[Sorted]
+----SortPreservingMergeExec: [ts@0 ASC NULLS LAST]
+------UnionExec
+--------ProjectionExec: expr=[ts@0 as ts, currency@2 as currency, amount@1 as amount]
+----------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/sales_us.csv]]}, projection=[ts, amount, currency], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST], has_header=true
+--------ProjectionExec: expr=[ts@0 as ts, currency@2 as currency, amount@1 as amount]
+----------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/sales_global.csv]]}, projection=[ts, amount, currency], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST], has_header=true
+
+query PIT
+SELECT * EXCLUDE(sn) FROM sales_us LIMIT 5
+----
+2000-01-01T00:00:00 83 EUR
+2000-01-01T00:00:15 40 TRY
+2000-01-01T00:00:30 73 TRY
+2000-01-01T00:00:45 54 EUR
+2000-01-01T00:01:00 31 EUR
+
+query TT
+EXPLAIN SELECT * EXCLUDE(sn) FROM sales_us
+----
+logical_plan TableScan: sales_us projection=[ts, amount, currency]
+physical_plan CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/sales_us.csv]]}, projection=[ts, amount, currency], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST], has_header=true
+
+
+# Joining Streams
+ 
+# (ARRAY_AGG(e.rate ORDER BY e.sn DESC))[1] breaks the pipeline
+# SELECT s.*, s.amount * (ARRAY_AGG(e.rate ORDER BY e.sn DESC))[1] AS amount_usd
+# INTO sales_global_converted
+# FROM sales_global AS s
+# JOIN exchange_rates AS e
+# ON s.currency = e.currency_from AND
+#    e.currency_to = 'USD' AND
+#    s.ts >= e.ts
+# GROUP BY s.sn
+# ORDER BY s.sn
+
+# s.ts cannot be resolved
+# SELECT s.*, s.amount * LAST_VALUE(e.rate ORDER BY e.sn) AS amount_usd
+# INTO sales_global_converted
+# FROM sales_global AS s
+# JOIN exchange_rates AS e
+# ON s.currency = e.currency_from AND
+#    e.currency_to = 'USD' AND
+#    s.ts >= e.ts
+# GROUP BY s.sn
+# ORDER BY s.sn
+
+# s.ts cannot be resolved
+# SELECT s.*, s.amount * LAST_VALUE(e.rate ORDER BY e.sn) AS amount_usd
+# INTO sales_global_converted
+# FROM sales_global AS s,
+#      exchange_rates AS e
+# WHERE s.currency = e.currency_from AND
+#       e.currency_to = 'USD' AND
+#       s.ts >= e.ts
+# GROUP BY s.sn
+# ORDER BY s.sn
+
+# Scalar Subquery not supported
+# SELECT s.*,
+#        s.amount * (
+#          SELECT e.rate
+#          FROM exchange_rates AS e
+#          WHERE s.currency = e.currency_from AND
+#    		         e.currency_to = 'USD' AND
+#   		         s.ts >= e.ts
+#          ORDER BY e.ts DESC
+#          LIMIT 1
+#        ) AS amount_usd
+# FROM sales_global AS s
+# ORDER BY s.sn;
+
+# No field named s.currency! 
+# SELECT s.*, s.amount * q.rate AS amount_usd
+# INTO sales_global_converted
+# FROM sales_global AS s
+# JOIN LATERAL (
+#   SELECT *
+#   FROM exchange_rates AS e
+#   WHERE s.currency = e.currency_from AND
+#    		  e.currency_to = 'USD' AND
+#   		  s.ts >= e.ts
+#   ORDER BY e.ts DESC
+#   LIMIT 1
+# ) AS q
+# ON TRUE -- logically unnecessary, but join conditions are mandatory in SQL.
+# ORDER BY s.sn
+
+# s.ts cannot be resolved
+# SELECT s.*, s.amount * FIRST_VALUE(e.rate ORDER BY e.sn) AS amount_usd
+# INTO sales_global_converted_counterfactual
+# FROM sales_global AS s,
+#      exchange_rates AS e
+# WHERE s.currency = e.currency_from AND
+# 			e.currency_to = 'USD' AND
+# 			s.ts >= e.ts AND
+#       e.ts >= s.ts - INTERVAL '7' DAY
+# GROUP BY s.sn
+# ORDER BY s.sn
+
+
+# Outer Joins
+
+# s.ts cannot be resolved
+# SELECT s.*, s.amount * AVG(e.rate) AS amount_usd
+# INTO sales_global_converted
+# FROM sales_global AS s
+# LEFT JOIN exchange_rates AS e
+# ON s.currency = e.currency_from AND
+#    e.currency_to = 'USD' AND
+#    s.ts >= e.ts AND
+#    e.ts >= s.ts - INTERVAL '10' MINUTE
+# GROUP BY s.sn
+# ORDER BY s.sn
+
+
+# Explicit Windows in Joins
+
+# Sort is not removed!
+# SELECT e.*,
+#        AVG(rate) OVER sliding_window AS avg_rate
+# INTO avg_exchange_rates
+# FROM exchange_rates AS e
+# WINDOW sliding_window AS (
+# 	PARTITION BY currency_from, currency_to
+# 	ORDER BY ts RANGE INTERVAL '10' MINUTE PRECEDING
+# )
+# ORDER BY sn
+
+
+# Machine Learning via User-Defined Functions (UDFs)
+
+# SELECT e.*,
+#        FORECAST('model-name', -- forecast algorithm
+#                 INTERVAL '2' MINUTE, -- forecast horizon
+#                 ts,
+# 								rate) OVER sliding_window AS predicted_rate
+# INTO predicted_exchange_rates
+# FROM exchange_rates AS e
+# WINDOW sliding_window AS (
+# 	PARTITION BY currency_from, currency_to
+# 	ORDER BY ts RANGE INTERVAL '10' MINUTE PRECEDING
+# )
+# ORDER BY sn
+
+# SELECT e.*,
+#        FORECAST('model-name', -- forecast algorithm
+#                 INTERVAL '2' MINUTE, -- forecast horizon
+#                 ts,
+# 								rate) OVER running_window AS predicted_rate
+# INTO predicted_exchange_rates
+# FROM exchange_rates AS e
+# WINDOW running_window AS (
+# 	PARTITION BY currency_from, currency_to
+# 	ORDER BY sn
+# )
+# ORDER BY sn
+
+# CREATE OR REPLACE FUNCTION IP_STATE(prev_state numeric,
+#                                     e1 numeric,
+#                                     e2 numeric)
+# RETURNS numeric LANGUAGE SQL IMMUTABLE AS
+# 'SELECT COALESCE($1, 0) + COALESCE($2 * $3, 0);';
+# CREATE AGGREGATE INNER_PRODUCT(numeric, numeric)(
+#     SFUNC = IP_STATE,
+#     STYPE = numeric,
+#     INITCOND = 0
+# )
+
+# SELECT e.*,
+#        SUPERVISED_MODEL('model-name', ts, rate) OVER sliding_window AS model
+# INTO exchange_models
+# FROM exchange_rates AS e
+# WINDOW sliding_window AS (
+# 	PARTITION BY currency_from, currency_to
+# 	ORDER BY ts RANGE INTERVAL '10' MINUTE PRECEDING
+# )
+# ORDER BY sn
+
+# SELECT s.*,
+#        s.amount * PREDICT(LAST(e.model ORDER BY e.ts),
+#                           s.ts + INTERVAL '2' MINUTE) AS amount_usd_prediction
+# INTO sales_global_predictions
+# FROM sales_global AS s,
+#      exchange_models AS e
+# WHERE s.currency = e.currency_from AND
+#       e.currency_to = 'USD' AND
+#       s.ts >= e.ts
+# GROUP BY s.sn
+# ORDER BY s.sn
+
+
+# Symmetric Joins on Combined Timelines
+
+# SELECT ROW_NUMBER() OVER (ORDER BY ts) AS sn, u.*
+# INTO gas_superheats
+# FROM (
+# 	SELECT t.ts,
+# 	       SUPERHEAT('CO2',
+# 	                 t.temperature,
+# 	                 LAST(p.pressure ORDER BY p.sn)) AS superheat
+# 	FROM gas_temperatures AS t, gas_pressures AS p
+# 	WHERE t.ts >= p.ts
+# 	GROUP BY t.sn
+# 	UNION ALL
+# 	SELECT p.ts,
+# 	       SUPERHEAT('CO2',
+# 	                 LAST(t.temperature ORDER BY t.sn),
+# 	                 p.pressure) AS superheat
+# 	FROM gas_temperatures AS t, gas_pressures AS p
+# 	WHERE p.ts >= t.ts
+# 	GROUP BY p.sn
+# 	ORDER BY ts
+# ) AS u
+# ORDER BY sn
+
+
+# Jumping Windows
+
+# SELECT t.*, AVG(temperature) OVER jumping_window AS avg_temperature
+# INTO gas_avg_temperatures_jumping
+# FROM gas_temperatures AS t
+# WINDOW jumping_window AS (
+#   PARTITION BY DATE_BIN(INTERVAL '15' MINUTE, ts, '2000-01-01')
+#   ORDER BY sn
+# )
+# ORDER BY sn;
+
+# SELECT t.*, AVG(temperature) OVER jumping_window AS avg_temperature
+# INTO gas_avg_temperatures_jumping
+# FROM gas_temperatures AS t
+# WINDOW jumping_window AS (
+#   PARTITION BY (sn - 1) / 10
+#   ORDER BY sn
+# )
+# ORDER BY sn;
+
+# SELECT
+#   t.*, (
+#     SELECT AVG(temperature)
+#     FROM gas_temperatures
+#     WHERE sn <= t.sn AND ts >= DATE_BIN(INTERVAL '15' MINUTE, t.ts, '2000-01-01')
+#   ) AS avg_temperature
+# INTO gas_avg_temperatures_jumping
+# FROM gas_temperatures AS t
+# ORDER BY sn
+
+# SELECT
+#   t.*, (
+#     SELECT AVG(temperature)
+#     FROM gas_temperatures
+#     WHERE sn <= t.sn AND sn > 10 * ((t.sn - 1) / 10)
+#   ) AS avg_temperature
+# INTO gas_avg_temperatures_jumping
+# FROM gas_temperatures AS t
+# ORDER BY sn
+
+# SELECT
+#   ROW_NUMBER() OVER (ORDER BY slot) AS sn,
+#   slot AS ts,
+#   avg_temperature
+# INTO gas_avg_temperatures_quarterly
+# FROM (
+#   SELECT
+#     DATE_BIN(INTERVAL '15' MINUTE, ts, '2000-01-01') AS slot,
+#     AVG(temperature) AS avg_temperature
+#   FROM gas_temperatures
+#   GROUP BY slot
+# ) AS t
+# ORDER BY sn
+
+# SELECT
+#   ROW_NUMBER() OVER (ORDER BY slot) AS sn,
+#   ts,
+#   avg_temperature
+# INTO gas_avg_temperatures_every_ten_samples
+# FROM (
+#   SELECT
+#     (sn - 1) / 10 AS slot,
+#     MAX(ts) AS ts,
+#     AVG(temperature) AS avg_temperature
+#   FROM gas_temperatures
+#   GROUP BY slot
+# ) AS t
+# ORDER BY sn
+
+
+# Interpolating Missing Data
+
+# SELECT t.*, LAST_VALUE(temperature) IGNORE NULLS OVER running_window,
+# INTO gas_temperatures_zoh
+# FROM gas_temperatures AS t
+# WINDOW running_window AS (ORDER BY sn)
+# ORDER BY sn
+
+# SELECT t.*,
+#        COALESCE(temperature,
+#                 LERP(ts, prev_ts, next_ts, prev_val, next_val)) AS temperature
+# INTO gas_temperatures_lerp
+# FROM (
+# 	SELECT
+#     ts,
+# 		LAG(ts) OVER running_window AS prev_ts,
+# 		LEAD(ts) OVER running_window AS next_ts,
+# 		LAG(temperature) IGNORE NULLS OVER running_window AS prev_val,
+# 		LEAD(temperature) IGNORE NULLS OVER running_window AS next_val,
+# 	FROM gas_temperatures
+# 	WINDOW running_window AS (ORDER BY sn)
+# ) AS t
+# ORDER BY sn
+
+
+# Example: SRE Agent with Binning
+
+# SELECT logs.*
+# 			 LAST(metrics.* ORDER BY metrics.sn)
+# INTO logs_with_metrics
+# FROM log_stream AS logs, metrics_stream AS metrics
+# WHERE logs.ts >= metrics.ts
+# GROUP BY logs.sn;
+
+# SELECT ARRAY_AGG([logs.msg, logs.cpu, logs.memory]) OVER jumping_window AS collected_logs_metrics
+# INTO agent_contexts
+# FROM logs_with_metrics AS logs
+# WINDOW window AS (
+#   PARTITION BY DATE_BIN(INTERVAL '1' HOUR, ts, '2000-01-01')
+#   ORDER BY sn
+# )
+# ORDER BY sn;
+
+# SELECT RUN_AGENT('SRE', 'summarize', collected_logs_metrics)
+# INTO agent_detections
+# FROM agent_contexts;
+
+
+# Example: Cybersecurity
+
+# SELECT e.*,
+#        NOVELTY_DETECTION_MODEL('model-name', ts, e.vector) OVER running_window AS model
+# INTO log_anomaly_models
+# FROM normal_log_embeddings AS e
+# WINDOW running_window AS (
+# 	PARTITION BY service
+# 	ORDER BY sn
+# )
+# ORDER BY sn
+
+# SELECT txs.*,
+#        CLUSTER('SPECTRAL', -- clustering technique
+# 								ARRAY [ -- transaction attributes
+# 									txs.foo,
+# 									txs.bar
+# 								]) OVER sliding_window AS cluster_info
+# INTO contract_cluster_stream
+# FROM contract_tx_stream AS txs
+# WINDOW sliding_window AS (
+# 	PARTITION BY contract_id
+# 	ORDER BY ts RANGE INTERVAL '1' DAY PRECEDING
+# )
+# ORDER BY sn
