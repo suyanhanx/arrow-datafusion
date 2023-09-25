@@ -149,3 +149,7 @@ datafusion/physical-plan/src/joins/sliding_hash_join.rs
 datafusion/physical-plan/src/joins/utils.rs
 force_push_main.sh
 generate_synnada_commits.sh
+datafusion/sqllogictest/test_files/stream.slt
+datafusion/core/tests/data/exchange_rates.csv
+datafusion/core/tests/data/sales_global.csv
+datafusion/core/tests/data/sales_us.csv
