@@ -179,6 +179,19 @@ impl BoundedWindowAggExec {
             }
         })
     }
+
+    /// Constructs either `WindowAggExec` or `BoundedWindowExec` for the given input
+    /// according to specifications of the `window_exprs`.
+    /// `None` represents that with the given input (and its ordering), there is no way to
+    /// construct a window exec. Existing ordering should be changed to be able to run window exec.
+    /// `Some(window exec)` contains the optimal window exec (WindowAggExec or BoundedWindowExec) for the
+    /// given input.
+    pub fn get_window_for_the_input(
+        &self,
+        input: &Arc<dyn ExecutionPlan>,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        get_window_for_the_input(self.window_expr(), input)
+    }
 }
 
 impl DisplayAs for BoundedWindowAggExec {

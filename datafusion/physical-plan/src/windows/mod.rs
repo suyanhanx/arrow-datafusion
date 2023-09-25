@@ -501,7 +501,7 @@ mod tests {
     use crate::streaming::StreamingTableExec;
     use crate::test::assert_is_pending;
     use crate::test::exec::{assert_strong_count_converges_to_zero, BlockingExec};
-
+    use crate::windows::PartitionSearchMode::{Linear, PartiallySorted, Sorted};
     use arrow::compute::SortOptions;
     use arrow::datatypes::{DataType, Field, SchemaRef};
     use datafusion_execution::TaskContext;

@@ -164,10 +164,3 @@ pub fn is_hash_join(plan: &Arc<dyn ExecutionPlan>) -> bool {
 pub fn is_nested_loop_join(plan: &Arc<dyn ExecutionPlan>) -> bool {
     plan.as_any().is::<NestedLoopJoinExec>()
 }
-
-/// Utility function yielding a string representation of the given [`ExecutionPlan`].
-pub fn get_plan_string(plan: &Arc<dyn ExecutionPlan>) -> Vec<String> {
-    let formatted = displayable(plan.as_ref()).indent(true).to_string();
-    let actual: Vec<&str> = formatted.trim().lines().collect();
-    actual.iter().map(|elem| elem.to_string()).collect()
-}
