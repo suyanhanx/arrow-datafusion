@@ -162,9 +162,9 @@ pub struct SlidingHashJoinExec {
     /// If null_equals_null is true, null == null else null != null
     pub(crate) null_equals_null: bool,
     /// Left side sort expression(s)
-    left_sort_exprs: Vec<PhysicalSortExpr>,
+    pub(crate) left_sort_exprs: Vec<PhysicalSortExpr>,
     /// Right side sort expression(s)
-    right_sort_exprs: Vec<PhysicalSortExpr>,
+    pub(crate) right_sort_exprs: Vec<PhysicalSortExpr>,
     /// The output ordering
     output_ordering: Option<Vec<PhysicalSortExpr>>,
     /// Partition mode
@@ -308,6 +308,50 @@ impl SlidingHashJoinExec {
                     | JoinType::RightSemi
             ),
         ]
+    }
+    /// left (build) side which gets hashed
+    pub fn left(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.left
+    }
+
+    /// right (probe) side which are filtered by the hash table
+    pub fn right(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.right
+    }
+
+    /// Set of common columns used to join on
+    pub fn on(&self) -> &[(Column, Column)] {
+        &self.on
+    }
+
+    /// Filters applied before join output
+    pub fn filter(&self) -> &JoinFilter {
+        &self.filter
+    }
+
+    /// How the join is performed
+    pub fn join_type(&self) -> &JoinType {
+        &self.join_type
+    }
+
+    /// The partitioning mode of this hash join
+    pub fn partition_mode(&self) -> &StreamJoinPartitionMode {
+        &self.mode
+    }
+
+    /// Get null_equals_null
+    pub fn null_equals_null(&self) -> bool {
+        self.null_equals_null
+    }
+
+    /// Get left_sort_exprs
+    pub fn left_sort_exprs(&self) -> &Vec<PhysicalSortExpr> {
+        &self.left_sort_exprs
+    }
+
+    /// Get right_sort_exprs
+    pub fn right_sort_exprs(&self) -> &Vec<PhysicalSortExpr> {
+        &self.right_sort_exprs
     }
 }
 

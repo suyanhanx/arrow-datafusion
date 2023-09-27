@@ -40,7 +40,8 @@ use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::insert::FileSinkExec;
 use datafusion::physical_plan::joins::utils::{ColumnIndex, JoinFilter};
 use datafusion::physical_plan::joins::{
-    CrossJoinExec, NestedLoopJoinExec, StreamJoinPartitionMode, SymmetricHashJoinExec,
+    CrossJoinExec, NestedLoopJoinExec, SlidingHashJoinExec, SlidingNestedLoopJoinExec,
+    StreamJoinPartitionMode, SymmetricHashJoinExec,
 };
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion::physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
@@ -628,7 +629,7 @@ impl AsExecutionPlan for PhysicalPlanNode {
                             .map(|i| {
                                 let side = protobuf::JoinSide::try_from(i.side)
                                     .map_err(|_| proto_error(format!(
-                                        "Received a HashJoinNode message with JoinSide in Filter {}",
+                                        "Received a SymmetricHashJoin message with JoinSide in Filter {}",
                                         i.side))
                                     )?;
 
@@ -1107,10 +1108,8 @@ impl AsExecutionPlan for PhysicalPlanNode {
                         filter,
                     },
                 ))),
-            });
-        }
-
-        if let Some(exec) = plan.downcast_ref::<SymmetricHashJoinExec>() {
+            })
+        } else if let Some(exec) = plan.downcast_ref::<HashJoinExec>() {
             let left = protobuf::PhysicalPlanNode::try_from_physical_plan(
                 exec.left().to_owned(),
                 extension_codec,
@@ -1119,7 +1118,75 @@ impl AsExecutionPlan for PhysicalPlanNode {
                 exec.right().to_owned(),
                 extension_codec,
             )?;
-            let on = exec
+            let on: Vec<protobuf::JoinOn> = exec
+                .on()
+                .iter()
+                .map(|tuple| protobuf::JoinOn {
+                    left: Some(protobuf::PhysicalColumn {
+                        name: tuple.0.name().to_string(),
+                        index: tuple.0.index() as u32,
+                    }),
+                    right: Some(protobuf::PhysicalColumn {
+                        name: tuple.1.name().to_string(),
+                        index: tuple.1.index() as u32,
+                    }),
+                })
+                .collect();
+            let join_type: protobuf::JoinType = exec.join_type().to_owned().into();
+            let filter = exec
+                .filter()
+                .as_ref()
+                .map(|f| {
+                    let expression = f.expression().to_owned().try_into()?;
+                    let column_indices = f
+                        .column_indices()
+                        .iter()
+                        .map(|i| {
+                            let side: protobuf::JoinSide = i.side.to_owned().into();
+                            protobuf::ColumnIndex {
+                                index: i.index as u32,
+                                side: side.into(),
+                            }
+                        })
+                        .collect();
+                    let schema = f.schema().try_into()?;
+                    Ok(protobuf::JoinFilter {
+                        expression: Some(expression),
+                        column_indices,
+                        schema: Some(schema),
+                    })
+                })
+                .map_or(Ok(None), |v: Result<protobuf::JoinFilter>| v.map(Some))?;
+
+            let partition_mode = match exec.partition_mode() {
+                PartitionMode::CollectLeft => protobuf::PartitionMode::CollectLeft,
+                PartitionMode::Partitioned => protobuf::PartitionMode::Partitioned,
+                PartitionMode::Auto => protobuf::PartitionMode::Auto,
+            };
+
+            Ok(protobuf::PhysicalPlanNode {
+                physical_plan_type: Some(PhysicalPlanType::HashJoin(Box::new(
+                    protobuf::HashJoinExecNode {
+                        left: Some(Box::new(left)),
+                        right: Some(Box::new(right)),
+                        on,
+                        join_type: join_type.into(),
+                        partition_mode: partition_mode.into(),
+                        null_equals_null: exec.null_equals_null(),
+                        filter,
+                    },
+                ))),
+            })
+        } else if let Some(exec) = plan.downcast_ref::<SymmetricHashJoinExec>() {
+            let left = protobuf::PhysicalPlanNode::try_from_physical_plan(
+                exec.left().to_owned(),
+                extension_codec,
+            )?;
+            let right = protobuf::PhysicalPlanNode::try_from_physical_plan(
+                exec.right().to_owned(),
+                extension_codec,
+            )?;
+            let on: Vec<protobuf::JoinOn> = exec
                 .on()
                 .iter()
                 .map(|tuple| protobuf::JoinOn {
@@ -1168,7 +1235,7 @@ impl AsExecutionPlan for PhysicalPlanNode {
                 }
             };
 
-            return Ok(protobuf::PhysicalPlanNode {
+            Ok(protobuf::PhysicalPlanNode {
                 physical_plan_type: Some(PhysicalPlanType::SymmetricHashJoin(Box::new(
                     protobuf::SymmetricHashJoinExecNode {
                         left: Some(Box::new(left)),
@@ -1180,10 +1247,185 @@ impl AsExecutionPlan for PhysicalPlanNode {
                         filter,
                     },
                 ))),
-            });
-        }
+            })
+        } else if let Some(exec) = plan.downcast_ref::<SlidingHashJoinExec>() {
+            let left = protobuf::PhysicalPlanNode::try_from_physical_plan(
+                exec.left().to_owned(),
+                extension_codec,
+            )?;
+            let right = protobuf::PhysicalPlanNode::try_from_physical_plan(
+                exec.right().to_owned(),
+                extension_codec,
+            )?;
+            let on: Vec<protobuf::JoinOn> = exec
+                .on()
+                .iter()
+                .map(|tuple| protobuf::JoinOn {
+                    left: Some(protobuf::PhysicalColumn {
+                        name: tuple.0.name().to_string(),
+                        index: tuple.0.index() as u32,
+                    }),
+                    right: Some(protobuf::PhysicalColumn {
+                        name: tuple.1.name().to_string(),
+                        index: tuple.1.index() as u32,
+                    }),
+                })
+                .collect();
+            let join_type: protobuf::JoinType = exec.join_type().to_owned().into();
+            let f = exec.filter();
+            let expression = f.expression().to_owned().try_into()?;
+            let column_indices = f
+                .column_indices()
+                .iter()
+                .map(|i| {
+                    let side: protobuf::JoinSide = i.side.to_owned().into();
+                    protobuf::ColumnIndex {
+                        index: i.index as u32,
+                        side: side.into(),
+                    }
+                })
+                .collect();
+            let filter_schema = f.schema().try_into()?;
+            let filter = protobuf::JoinFilter {
+                expression: Some(expression),
+                column_indices,
+                schema: Some(filter_schema),
+            };
+            let partition_mode = match exec.partition_mode() {
+                StreamJoinPartitionMode::SinglePartition => {
+                    protobuf::StreamPartitionMode::SinglePartition
+                }
+                StreamJoinPartitionMode::Partitioned => {
+                    protobuf::StreamPartitionMode::PartitionedExec
+                }
+            };
 
-        if let Some(exec) = plan.downcast_ref::<CrossJoinExec>() {
+            let left_sort_exprs = exec
+                .left_sort_exprs()
+                .iter()
+                .map(|expr| {
+                    let sort_expr = Box::new(protobuf::PhysicalSortExprNode {
+                        expr: Some(Box::new(expr.expr.to_owned().try_into()?)),
+                        asc: !expr.options.descending,
+                        nulls_first: expr.options.nulls_first,
+                    });
+                    Ok(protobuf::PhysicalExprNode {
+                        expr_type: Some(protobuf::physical_expr_node::ExprType::Sort(
+                            sort_expr,
+                        )),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            let right_sort_exprs = exec
+                .right_sort_exprs()
+                .iter()
+                .map(|expr| {
+                    let sort_expr = Box::new(protobuf::PhysicalSortExprNode {
+                        expr: Some(Box::new(expr.expr.to_owned().try_into()?)),
+                        asc: !expr.options.descending,
+                        nulls_first: expr.options.nulls_first,
+                    });
+                    Ok(protobuf::PhysicalExprNode {
+                        expr_type: Some(protobuf::physical_expr_node::ExprType::Sort(
+                            sort_expr,
+                        )),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            Ok(protobuf::PhysicalPlanNode {
+                physical_plan_type: Some(PhysicalPlanType::SlidingHashJoin(Box::new(
+                    protobuf::SlidingHashJoinExecNode {
+                        left: Some(Box::new(left)),
+                        right: Some(Box::new(right)),
+                        on,
+                        join_type: join_type.into(),
+                        partition_mode: partition_mode.into(),
+                        null_equals_null: exec.null_equals_null(),
+                        filter: Some(filter),
+                        left_sort_exprs,
+                        right_sort_exprs,
+                    },
+                ))),
+            })
+        } else if let Some(exec) = plan.downcast_ref::<SlidingNestedLoopJoinExec>() {
+            let left = protobuf::PhysicalPlanNode::try_from_physical_plan(
+                exec.left().to_owned(),
+                extension_codec,
+            )?;
+            let right = protobuf::PhysicalPlanNode::try_from_physical_plan(
+                exec.right().to_owned(),
+                extension_codec,
+            )?;
+            let join_type: protobuf::JoinType = exec.join_type().to_owned().into();
+            let f = exec.filter();
+            let expression = f.expression().to_owned().try_into()?;
+            let column_indices = f
+                .column_indices()
+                .iter()
+                .map(|i| {
+                    let side: protobuf::JoinSide = i.side.to_owned().into();
+                    protobuf::ColumnIndex {
+                        index: i.index as u32,
+                        side: side.into(),
+                    }
+                })
+                .collect();
+            let filter_schema = f.schema().try_into()?;
+            let filter = protobuf::JoinFilter {
+                expression: Some(expression),
+                column_indices,
+                schema: Some(filter_schema),
+            };
+
+            let left_sort_exprs = exec
+                .left_sort_exprs()
+                .iter()
+                .map(|expr| {
+                    let sort_expr = Box::new(protobuf::PhysicalSortExprNode {
+                        expr: Some(Box::new(expr.expr.to_owned().try_into()?)),
+                        asc: !expr.options.descending,
+                        nulls_first: expr.options.nulls_first,
+                    });
+                    Ok(protobuf::PhysicalExprNode {
+                        expr_type: Some(protobuf::physical_expr_node::ExprType::Sort(
+                            sort_expr,
+                        )),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            let right_sort_exprs = exec
+                .right_sort_exprs()
+                .iter()
+                .map(|expr| {
+                    let sort_expr = Box::new(protobuf::PhysicalSortExprNode {
+                        expr: Some(Box::new(expr.expr.to_owned().try_into()?)),
+                        asc: !expr.options.descending,
+                        nulls_first: expr.options.nulls_first,
+                    });
+                    Ok(protobuf::PhysicalExprNode {
+                        expr_type: Some(protobuf::physical_expr_node::ExprType::Sort(
+                            sort_expr,
+                        )),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            Ok(protobuf::PhysicalPlanNode {
+                physical_plan_type: Some(PhysicalPlanType::SlidingNestedLoopJoin(
+                    Box::new(protobuf::SlidingNestedLoopJoinExecNode {
+                        left: Some(Box::new(left)),
+                        right: Some(Box::new(right)),
+                        join_type: join_type.into(),
+                        filter: Some(filter),
+                        left_sort_exprs,
+                        right_sort_exprs,
+                    }),
+                )),
+            })
+        } else if let Some(exec) = plan.downcast_ref::<CrossJoinExec>() {
             let left = protobuf::PhysicalPlanNode::try_from_physical_plan(
                 exec.left().to_owned(),
                 extension_codec,

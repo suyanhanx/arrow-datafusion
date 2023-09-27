@@ -230,12 +230,12 @@ impl SlidingNestedLoopJoinExec {
         })
     }
 
-    /// left (build) side
+    /// left (build) side which gets hashed
     pub fn left(&self) -> &Arc<dyn ExecutionPlan> {
         &self.left
     }
 
-    /// right (probe) side
+    /// right (probe) side which are filtered by the hash table
     pub fn right(&self) -> &Arc<dyn ExecutionPlan> {
         &self.right
     }
@@ -248,6 +248,16 @@ impl SlidingNestedLoopJoinExec {
     /// How the join is performed
     pub fn join_type(&self) -> &JoinType {
         &self.join_type
+    }
+
+    /// Get left_sort_exprs
+    pub fn left_sort_exprs(&self) -> &Vec<PhysicalSortExpr> {
+        &self.left_sort_exprs
+    }
+
+    /// Get right_sort_exprs
+    pub fn right_sort_exprs(&self) -> &Vec<PhysicalSortExpr> {
+        &self.right_sort_exprs
     }
 
     /// Calculate order preservation flags for this join.

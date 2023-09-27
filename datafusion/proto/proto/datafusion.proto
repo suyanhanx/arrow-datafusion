@@ -1166,6 +1166,8 @@ message PhysicalPlanNode {
     SymmetricHashJoinExecNode symmetric_hash_join = 25;
     InterleaveExecNode  interleave = 26;
     PlaceholderRowExecNode placeholder_row = 27;
+    SlidingHashJoinExecNode sliding_hash_join = 2400;
+    SlidingNestedLoopJoinExecNode sliding_nested_loop_join = 2500;
   }
 }
 
@@ -1434,6 +1436,11 @@ enum PartitionMode {
   AUTO = 2;
 }
 
+enum StreamPartitionMode {
+  SINGLE_PARTITION = 0;
+  PARTITIONED_EXEC = 1;
+}
+
 message HashJoinExecNode {
   PhysicalPlanNode left = 1;
   PhysicalPlanNode right = 2;
@@ -1442,11 +1449,6 @@ message HashJoinExecNode {
   PartitionMode partition_mode = 6;
   bool null_equals_null = 7;
   JoinFilter filter = 8;
-}
-
-enum StreamPartitionMode {
-  SINGLE_PARTITION = 0;
-  PARTITIONED_EXEC = 1;
 }
 
 message SymmetricHashJoinExecNode {
@@ -1461,6 +1463,27 @@ message SymmetricHashJoinExecNode {
 
 message InterleaveExecNode {
   repeated PhysicalPlanNode inputs = 1;
+}
+
+message SlidingHashJoinExecNode {
+  PhysicalPlanNode left = 1;
+  PhysicalPlanNode right = 2;
+  repeated JoinOn on = 3;
+  JoinType join_type = 4;
+  StreamPartitionMode partition_mode = 6;
+  bool null_equals_null = 7;
+  JoinFilter filter = 8;
+  repeated PhysicalExprNode left_sort_exprs = 9;
+  repeated PhysicalExprNode right_sort_exprs = 10;
+}
+
+message SlidingNestedLoopJoinExecNode {
+  PhysicalPlanNode left = 1;
+  PhysicalPlanNode right = 2;
+  JoinType join_type = 3;
+  JoinFilter filter = 4;
+  repeated PhysicalExprNode left_sort_exprs = 5;
+  repeated PhysicalExprNode right_sort_exprs = 6;
 }
 
 message UnionExecNode {
