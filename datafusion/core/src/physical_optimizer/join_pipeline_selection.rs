@@ -648,8 +648,8 @@ mod order_preserving_join_swap_tests {
     use std::sync::Arc;
 
     use crate::physical_optimizer::enforce_sorting::EnforceSorting;
-    use crate::physical_optimizer::global_order_require::GlobalOrderRequire;
     use crate::physical_optimizer::join_selection::JoinSelection;
+    use crate::physical_optimizer::output_requirements::OutputRequirements;
     use crate::physical_optimizer::test_utils::{
         memory_exec_with_sort, nested_loop_join_exec, not_prunable_filter,
         sort_expr_options,

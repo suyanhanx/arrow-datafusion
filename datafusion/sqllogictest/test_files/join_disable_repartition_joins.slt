@@ -161,28 +161,19 @@ ProjectionExec: expr=[c_custkey@0 as c_custkey, c_nationkey@1 as c_nationkey, or
 ----------------ProjectionExec: expr=[c_custkey@0 as c_custkey, c_nationkey@1 as c_nationkey, o_orderkey@2 as o_orderkey]
 ------------------SortMergeJoin: join_type=Inner, on=[(o_orderkey@2, l_orderkey@0)]
 --------------------SortMergeJoin: join_type=Inner, on=[(c_custkey@0, o_orderkey@0)]
+----------------------ProjectionExec: expr=[c_custkey@0 as c_custkey, c_nationkey@1 as c_nationkey]
+------------------------CoalesceBatchesExec: target_batch_size=8192
+--------------------------FilterExec: c_acctbal@2 > Some(100000),15,2
+----------------------------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/customer.csv]]}, projection=[c_custkey, c_nationkey, c_acctbal], infinite_source=true, output_ordering=[c_custkey@0 ASC NULLS LAST], has_header=false
+----------------------ProjectionExec: expr=[o_orderkey@0 as o_orderkey]
+------------------------CoalesceBatchesExec: target_batch_size=8192
+--------------------------FilterExec: o_orderstatus@1 = F
+----------------------------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/orders.csv]]}, projection=[o_orderkey, o_orderstatus], infinite_source=true, output_ordering=[o_orderkey@0 ASC NULLS LAST], has_header=false
+--------------------ProjectionExec: expr=[l_orderkey@0 as l_orderkey]
 ----------------------CoalesceBatchesExec: target_batch_size=8192
-------------------------RepartitionExec: partitioning=Hash([c_custkey@0], 1), input_partitions=1
---------------------------ProjectionExec: expr=[c_custkey@0 as c_custkey, c_nationkey@1 as c_nationkey]
-----------------------------CoalesceBatchesExec: target_batch_size=8192
-------------------------------FilterExec: c_acctbal@2 > Some(100000),15,2
---------------------------------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/customer.csv]]}, projection=[c_custkey, c_nationkey, c_acctbal], infinite_source=true, output_ordering=[c_custkey@0 ASC NULLS LAST], has_header=false
-----------------------CoalesceBatchesExec: target_batch_size=8192
-------------------------RepartitionExec: partitioning=Hash([o_orderkey@0], 1), input_partitions=1
---------------------------ProjectionExec: expr=[o_orderkey@0 as o_orderkey]
-----------------------------CoalesceBatchesExec: target_batch_size=8192
-------------------------------FilterExec: o_orderstatus@1 = F
---------------------------------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/orders.csv]]}, projection=[o_orderkey, o_orderstatus], infinite_source=true, output_ordering=[o_orderkey@0 ASC NULLS LAST], has_header=false
---------------------CoalesceBatchesExec: target_batch_size=8192
-----------------------RepartitionExec: partitioning=Hash([l_orderkey@0], 1), input_partitions=1
-------------------------ProjectionExec: expr=[l_orderkey@0 as l_orderkey]
---------------------------CoalesceBatchesExec: target_batch_size=8192
-----------------------------FilterExec: l_returnflag@1 = R
-------------------------------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/lineitem.csv]]}, projection=[l_orderkey, l_returnflag], infinite_source=true, output_ordering=[l_orderkey@0 ASC NULLS LAST], has_header=false
-----CoalesceBatchesExec: target_batch_size=8192
-------RepartitionExec: partitioning=Hash([n_nationkey@0], 1), input_partitions=1
---------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/nation.csv]]}, projection=[n_nationkey, n_name], infinite_source=true, output_ordering=[n_nationkey@0 ASC NULLS LAST], has_header=false
-
+------------------------FilterExec: l_returnflag@1 = R
+--------------------------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/lineitem.csv]]}, projection=[l_orderkey, l_returnflag], infinite_source=true, output_ordering=[l_orderkey@0 ASC NULLS LAST], has_header=false
+----CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/nation.csv]]}, projection=[n_nationkey, n_name], infinite_source=true, output_ordering=[n_nationkey@0 ASC NULLS LAST], has_header=false
 
 query TT
 EXPLAIN SELECT
@@ -249,27 +240,19 @@ ProjectionExec: expr=[c_custkey@0 as c_custkey, c_nationkey@1 as c_nationkey, or
 ----------------ProjectionExec: expr=[c_custkey@0 as c_custkey, c_nationkey@1 as c_nationkey, o_orderkey@2 as o_orderkey]
 ------------------SortMergeJoin: join_type=Inner, on=[(o_orderkey@2, l_orderkey@0)]
 --------------------SortMergeJoin: join_type=Inner, on=[(c_custkey@0, o_orderkey@0)]
+----------------------ProjectionExec: expr=[c_custkey@0 as c_custkey, c_nationkey@1 as c_nationkey]
+------------------------CoalesceBatchesExec: target_batch_size=8192
+--------------------------FilterExec: c_acctbal@2 > Some(100000),15,2
+----------------------------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/customer.csv]]}, projection=[c_custkey, c_nationkey, c_acctbal], infinite_source=true, output_ordering=[c_custkey@0 ASC NULLS LAST], has_header=false
+----------------------ProjectionExec: expr=[o_orderkey@0 as o_orderkey]
+------------------------CoalesceBatchesExec: target_batch_size=8192
+--------------------------FilterExec: o_orderstatus@1 = F
+----------------------------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/orders.csv]]}, projection=[o_orderkey, o_orderstatus], infinite_source=true, output_ordering=[o_orderkey@0 ASC NULLS LAST], has_header=false
+--------------------ProjectionExec: expr=[l_orderkey@0 as l_orderkey]
 ----------------------CoalesceBatchesExec: target_batch_size=8192
-------------------------RepartitionExec: partitioning=Hash([c_custkey@0], 1), input_partitions=1
---------------------------ProjectionExec: expr=[c_custkey@0 as c_custkey, c_nationkey@1 as c_nationkey]
-----------------------------CoalesceBatchesExec: target_batch_size=8192
-------------------------------FilterExec: c_acctbal@2 > Some(100000),15,2
---------------------------------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/customer.csv]]}, projection=[c_custkey, c_nationkey, c_acctbal], infinite_source=true, output_ordering=[c_custkey@0 ASC NULLS LAST], has_header=false
-----------------------CoalesceBatchesExec: target_batch_size=8192
-------------------------RepartitionExec: partitioning=Hash([o_orderkey@0], 1), input_partitions=1
---------------------------ProjectionExec: expr=[o_orderkey@0 as o_orderkey]
-----------------------------CoalesceBatchesExec: target_batch_size=8192
-------------------------------FilterExec: o_orderstatus@1 = F
---------------------------------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/orders.csv]]}, projection=[o_orderkey, o_orderstatus], infinite_source=true, output_ordering=[o_orderkey@0 ASC NULLS LAST], has_header=false
---------------------CoalesceBatchesExec: target_batch_size=8192
-----------------------RepartitionExec: partitioning=Hash([l_orderkey@0], 1), input_partitions=1
-------------------------ProjectionExec: expr=[l_orderkey@0 as l_orderkey]
---------------------------CoalesceBatchesExec: target_batch_size=8192
-----------------------------FilterExec: l_returnflag@1 = R
-------------------------------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/lineitem.csv]]}, projection=[l_orderkey, l_returnflag], infinite_source=true, output_ordering=[l_orderkey@0 ASC NULLS LAST], has_header=false
-----CoalesceBatchesExec: target_batch_size=8192
-------RepartitionExec: partitioning=Hash([n_nationkey@0], 1), input_partitions=1
---------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/nation.csv]]}, projection=[n_nationkey, n_name], infinite_source=true, output_ordering=[n_nationkey@0 ASC NULLS LAST], has_header=false
+------------------------FilterExec: l_returnflag@1 = R
+--------------------------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/lineitem.csv]]}, projection=[l_orderkey, l_returnflag], infinite_source=true, output_ordering=[l_orderkey@0 ASC NULLS LAST], has_header=false
+----CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/nation.csv]]}, projection=[n_nationkey, n_name], infinite_source=true, output_ordering=[n_nationkey@0 ASC NULLS LAST], has_header=false
 
 query TT
 EXPLAIN SELECT
@@ -303,14 +286,10 @@ physical_plan
 ProjectionExec: expr=[c_custkey@2 as c_custkey, c_nationkey@3 as c_nationkey, price_rank@4 as price_rank, n_name@1 as n_name]
 --ProjectionExec: expr=[n_nationkey@3 as n_nationkey, n_name@4 as n_name, c_custkey@0 as c_custkey, c_nationkey@1 as c_nationkey, price_rank@2 as price_rank]
 ----SortMergeJoin: join_type=Inner, on=[(c_custkey@0, n_nationkey@0)]
-------CoalesceBatchesExec: target_batch_size=8192
---------RepartitionExec: partitioning=Hash([c_custkey@0], 1), input_partitions=1
-----------ProjectionExec: expr=[c_custkey@0 as c_custkey, c_nationkey@1 as c_nationkey, ROW_NUMBER() ORDER BY [customer.c_custkey ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW@2 as price_rank]
-------------BoundedWindowAggExec: wdw=[ROW_NUMBER() ORDER BY [customer.c_custkey ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW: Ok(Field { name: "ROW_NUMBER() ORDER BY [customer.c_custkey ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW", data_type: UInt64, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(Int64(NULL)), end_bound: CurrentRow }], mode=[Sorted]
---------------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/customer.csv]]}, projection=[c_custkey, c_nationkey], infinite_source=true, output_ordering=[c_custkey@0 ASC NULLS LAST], has_header=false
-------CoalesceBatchesExec: target_batch_size=8192
---------RepartitionExec: partitioning=Hash([n_nationkey@0], 1), input_partitions=1
-----------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/nation.csv]]}, projection=[n_nationkey, n_name], infinite_source=true, output_ordering=[n_nationkey@0 ASC NULLS LAST], has_header=false
+------ProjectionExec: expr=[c_custkey@0 as c_custkey, c_nationkey@1 as c_nationkey, ROW_NUMBER() ORDER BY [customer.c_custkey ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW@2 as price_rank]
+--------BoundedWindowAggExec: wdw=[ROW_NUMBER() ORDER BY [customer.c_custkey ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW: Ok(Field { name: "ROW_NUMBER() ORDER BY [customer.c_custkey ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW", data_type: UInt64, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(Int64(NULL)), end_bound: CurrentRow }], mode=[Sorted]
+----------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/customer.csv]]}, projection=[c_custkey, c_nationkey], infinite_source=true, output_ordering=[c_custkey@0 ASC NULLS LAST], has_header=false
+------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/nation.csv]]}, projection=[n_nationkey, n_name], infinite_source=true, output_ordering=[n_nationkey@0 ASC NULLS LAST], has_header=false
 
 query TT
 EXPLAIN SELECT
@@ -344,14 +323,10 @@ Sort: subquery.c_custkey ASC NULLS LAST, subquery.price_rank ASC NULLS LAST
 physical_plan
 ProjectionExec: expr=[c_custkey@0 as c_custkey, c_nationkey@1 as c_nationkey, price_rank@2 as price_rank, n_name@4 as n_name]
 --SortMergeJoin: join_type=Inner, on=[(price_rank@2, n_nationkey@0)]
-----CoalesceBatchesExec: target_batch_size=8192
-------RepartitionExec: partitioning=Hash([price_rank@2], 1), input_partitions=1
---------ProjectionExec: expr=[c_custkey@0 as c_custkey, c_nationkey@1 as c_nationkey, CAST(ROW_NUMBER() ORDER BY [customer.c_custkey ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW@2 AS Int64) as price_rank]
-----------BoundedWindowAggExec: wdw=[ROW_NUMBER() ORDER BY [customer.c_custkey ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW: Ok(Field { name: "ROW_NUMBER() ORDER BY [customer.c_custkey ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW", data_type: UInt64, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(Int64(NULL)), end_bound: CurrentRow }], mode=[Sorted]
-------------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/customer.csv]]}, projection=[c_custkey, c_nationkey], infinite_source=true, output_ordering=[c_custkey@0 ASC NULLS LAST], has_header=false
-----CoalesceBatchesExec: target_batch_size=8192
-------RepartitionExec: partitioning=Hash([n_nationkey@0], 1), input_partitions=1
---------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/nation.csv]]}, projection=[n_nationkey, n_name], infinite_source=true, output_ordering=[n_nationkey@0 ASC NULLS LAST], has_header=false
+----ProjectionExec: expr=[c_custkey@0 as c_custkey, c_nationkey@1 as c_nationkey, CAST(ROW_NUMBER() ORDER BY [customer.c_custkey ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW@2 AS Int64) as price_rank]
+------BoundedWindowAggExec: wdw=[ROW_NUMBER() ORDER BY [customer.c_custkey ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW: Ok(Field { name: "ROW_NUMBER() ORDER BY [customer.c_custkey ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW", data_type: UInt64, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(Int64(NULL)), end_bound: CurrentRow }], mode=[Sorted]
+--------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/customer.csv]]}, projection=[c_custkey, c_nationkey], infinite_source=true, output_ordering=[c_custkey@0 ASC NULLS LAST], has_header=false
+----CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/nation.csv]]}, projection=[n_nationkey, n_name], infinite_source=true, output_ordering=[n_nationkey@0 ASC NULLS LAST], has_header=false
 
 query TT
 EXPLAIN SELECT
@@ -409,12 +384,8 @@ SlidingNestedLoopJoinExec: join_type=Inner, filter=n_nationkey@1 > c_custkey@0 A
 ----------------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/lineitem.csv]]}, projection=[l_orderkey, l_returnflag, l_shipdate], infinite_source=true, output_ordering=[l_orderkey@0 ASC NULLS LAST], has_header=false
 ----------ProjectionExec: expr=[c_custkey@2 as c_custkey, c_nationkey@3 as c_nationkey, o_orderkey@0 as o_orderkey, o_orderdate@1 as o_orderdate]
 ------------SortMergeJoin: join_type=Inner, on=[(o_orderkey@0, c_custkey@0)]
---------------CoalesceBatchesExec: target_batch_size=8192
-----------------RepartitionExec: partitioning=Hash([o_orderkey@0], 1), input_partitions=1
-------------------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/orders.csv]]}, projection=[o_orderkey, o_orderdate], infinite_source=true, output_ordering=[o_orderkey@0 ASC NULLS LAST], has_header=false
---------------CoalesceBatchesExec: target_batch_size=8192
-----------------RepartitionExec: partitioning=Hash([c_custkey@0], 1), input_partitions=1
-------------------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/customer.csv]]}, projection=[c_custkey, c_nationkey], infinite_source=true, output_ordering=[c_custkey@0 ASC NULLS LAST], has_header=false
+--------------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/orders.csv]]}, projection=[o_orderkey, o_orderdate], infinite_source=true, output_ordering=[o_orderkey@0 ASC NULLS LAST], has_header=false
+--------------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/customer.csv]]}, projection=[c_custkey, c_nationkey], infinite_source=true, output_ordering=[c_custkey@0 ASC NULLS LAST], has_header=false
 --CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/nation.csv]]}, projection=[n_nationkey, n_name, n_regionkey, n_comment, n_rev], infinite_source=true, output_ordering=[n_nationkey@0 ASC NULLS LAST], has_header=false
 
 query TT
