@@ -26,7 +26,6 @@ pub mod coalesce_batches;
 pub mod combine_partial_final_agg;
 pub mod enforce_distribution;
 pub mod enforce_sorting;
-pub mod global_order_require;
 pub mod join_selection;
 pub mod limited_distinct_aggregation;
 pub mod optimizer;

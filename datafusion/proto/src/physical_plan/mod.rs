@@ -667,8 +667,304 @@ impl AsExecutionPlan for PhysicalPlanNode {
                     &join_type.into(),
                     sym_join.null_equals_null,
                     partition_mode,
-                )
-                .map(|e| Arc::new(e) as _)
+                )?))
+            }
+            PhysicalPlanType::SlidingHashJoin(sliding_hash_join) => {
+                let left: Arc<dyn ExecutionPlan> = into_physical_plan(
+                    &sliding_hash_join.left,
+                    registry,
+                    runtime,
+                    extension_codec,
+                )?;
+                let right: Arc<dyn ExecutionPlan> = into_physical_plan(
+                    &sliding_hash_join.right,
+                    registry,
+                    runtime,
+                    extension_codec,
+                )?;
+                let on: Vec<(Column, Column)> = sliding_hash_join
+                    .on
+                    .iter()
+                    .map(|col| {
+                        let left = into_required!(col.left)?;
+                        let right = into_required!(col.right)?;
+                        Ok((left, right))
+                    })
+                    .collect::<Result<_>>()?;
+                let join_type = protobuf::JoinType::try_from(sliding_hash_join.join_type)
+                    .map_err(|_| {
+                        proto_error(format!(
+                            "Received a HashJoinNode message with unknown JoinType {}",
+                            sliding_hash_join.join_type
+                        ))
+                    })?;
+                let ok_filter: Result<_> = sliding_hash_join
+                    .filter
+                    .as_ref()
+                    .map(|f| {
+                        let schema = f
+                            .schema
+                            .as_ref()
+                            .ok_or_else(|| proto_error("Missing JoinFilter schema"))?
+                            .try_into()?;
+
+                        let expression = parse_physical_expr(
+                            f.expression.as_ref().ok_or_else(|| {
+                                proto_error("Unexpected empty filter expression")
+                            })?,
+                            registry, &schema
+                        )?;
+                        let column_indices = f.column_indices
+                            .iter()
+                            .map(|i| {
+                                let side = protobuf::JoinSide::try_from(i.side)
+                                    .map_err(|_| proto_error(format!(
+                                        "Received a HashJoinNode message with JoinSide in Filter {}",
+                                        i.side))
+                                    )?;
+
+                                Ok(ColumnIndex{
+                                    index: i.index as usize,
+                                    side: side.into(),
+                                })
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+
+                        Ok(JoinFilter::new(expression, column_indices, schema))
+                    }).transpose();
+
+                let filter = ok_filter?.unwrap();
+
+                let partition_mode =
+                    protobuf::StreamPartitionMode::try_from(sliding_hash_join.partition_mode).map_err(|_| {
+                        proto_error(format!(
+                            "Received a SlidingHashJoin message with unknown PartitionMode {}",
+                            sliding_hash_join.partition_mode
+                        ))
+                    })?;
+                let partition_mode = match partition_mode {
+                    protobuf::StreamPartitionMode::SinglePartition => {
+                        StreamJoinPartitionMode::SinglePartition
+                    }
+                    protobuf::StreamPartitionMode::PartitionedExec => {
+                        StreamJoinPartitionMode::Partitioned
+                    }
+                };
+
+                let left_sort_exprs = sliding_hash_join
+                    .left_sort_exprs
+                    .iter()
+                    .map(|expr| {
+                        let expr = expr.expr_type.as_ref().ok_or_else(|| {
+                            proto_error(format!(
+                                "physical_plan::from_proto() Unexpected expr {self:?}"
+                            ))
+                        })?;
+                        if let protobuf::physical_expr_node::ExprType::Sort(sort_expr) = expr {
+                            let expr = sort_expr
+                                .expr
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    proto_error(format!(
+                                        "physical_plan::from_proto() Unexpected sort expr {self:?}"
+                                    ))
+                                })?
+                                .as_ref();
+                            Ok(PhysicalSortExpr {
+                                expr: parse_physical_expr(expr,registry, left.schema().as_ref())?,
+                                options: SortOptions {
+                                    descending: !sort_expr.asc,
+                                    nulls_first: sort_expr.nulls_first,
+                                },
+                            })
+                        } else {
+                            internal_err!(
+                                "physical_plan::from_proto() {self:?}"
+                            )
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                let right_sort_exprs = sliding_hash_join
+                    .right_sort_exprs
+                    .iter()
+                    .map(|expr| {
+                        let expr = expr.expr_type.as_ref().ok_or_else(|| {
+                            proto_error(format!(
+                                "physical_plan::from_proto() Unexpected expr {self:?}"
+                            ))
+                        })?;
+                        if let protobuf::physical_expr_node::ExprType::Sort(sort_expr) = expr {
+                            let expr = sort_expr
+                                .expr
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    proto_error(format!(
+                                        "physical_plan::from_proto() Unexpected sort expr {self:?}"
+                                    ))
+                                })?
+                                .as_ref();
+                            Ok(PhysicalSortExpr {
+                                expr: parse_physical_expr(expr,registry, right.schema().as_ref())?,
+                                options: SortOptions {
+                                    descending: !sort_expr.asc,
+                                    nulls_first: sort_expr.nulls_first,
+                                },
+                            })
+                        } else {
+                            internal_err!(
+                                "physical_plan::from_proto() {self:?}"
+                            )
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                Ok(Arc::new(SlidingHashJoinExec::try_new(
+                    left,
+                    right,
+                    on,
+                    filter,
+                    &join_type.into(),
+                    sliding_hash_join.null_equals_null,
+                    left_sort_exprs,
+                    right_sort_exprs,
+                    partition_mode,
+                )?))
+            }
+            PhysicalPlanType::SlidingNestedLoopJoin(sliding_nested_loop_join) => {
+                let left: Arc<dyn ExecutionPlan> = into_physical_plan(
+                    &sliding_nested_loop_join.left,
+                    registry,
+                    runtime,
+                    extension_codec,
+                )?;
+                let right: Arc<dyn ExecutionPlan> = into_physical_plan(
+                    &sliding_nested_loop_join.right,
+                    registry,
+                    runtime,
+                    extension_codec,
+                )?;
+                let join_type =
+                    protobuf::JoinType::try_from(sliding_nested_loop_join.join_type)
+                        .map_err(|_| {
+                            proto_error(format!(
+                            "Received a HashJoinNode message with unknown JoinType {}",
+                            sliding_nested_loop_join.join_type
+                        ))
+                        })?;
+                let ok_filter: Result<_> = sliding_nested_loop_join
+                    .filter
+                    .as_ref()
+                    .map(|f| {
+                        let schema = f
+                            .schema
+                            .as_ref()
+                            .ok_or_else(|| proto_error("Missing JoinFilter schema"))?
+                            .try_into()?;
+
+                        let expression = parse_physical_expr(
+                            f.expression.as_ref().ok_or_else(|| {
+                                proto_error("Unexpected empty filter expression")
+                            })?,
+                            registry, &schema
+                        )?;
+                        let column_indices = f.column_indices
+                            .iter()
+                            .map(|i| {
+                                let side = protobuf::JoinSide::try_from(i.side)
+                                    .map_err(|_| proto_error(format!(
+                                        "Received a HashJoinNode message with JoinSide in Filter {}",
+                                        i.side))
+                                    )?;
+
+                                Ok(ColumnIndex{
+                                    index: i.index as usize,
+                                    side: side.into(),
+                                })
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+
+                        Ok(JoinFilter::new(expression, column_indices, schema))
+                    }).transpose();
+
+                let filter = ok_filter?.unwrap();
+
+                let left_sort_exprs = sliding_nested_loop_join
+                    .left_sort_exprs
+                    .iter()
+                    .map(|expr| {
+                        let expr = expr.expr_type.as_ref().ok_or_else(|| {
+                            proto_error(format!(
+                                "physical_plan::from_proto() Unexpected expr {self:?}"
+                            ))
+                        })?;
+                        if let protobuf::physical_expr_node::ExprType::Sort(sort_expr) = expr {
+                            let expr = sort_expr
+                                .expr
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    proto_error(format!(
+                                        "physical_plan::from_proto() Unexpected sort expr {self:?}"
+                                    ))
+                                })?
+                                .as_ref();
+                            Ok(PhysicalSortExpr {
+                                expr: parse_physical_expr(expr,registry, left.schema().as_ref())?,
+                                options: SortOptions {
+                                    descending: !sort_expr.asc,
+                                    nulls_first: sort_expr.nulls_first,
+                                },
+                            })
+                        } else {
+                            internal_err!(
+                                "physical_plan::from_proto() {self:?}"
+                            )
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                let right_sort_exprs = sliding_nested_loop_join
+                    .right_sort_exprs
+                    .iter()
+                    .map(|expr| {
+                        let expr = expr.expr_type.as_ref().ok_or_else(|| {
+                            proto_error(format!(
+                                "physical_plan::from_proto() Unexpected expr {self:?}"
+                            ))
+                        })?;
+                        if let protobuf::physical_expr_node::ExprType::Sort(sort_expr) = expr {
+                            let expr = sort_expr
+                                .expr
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    proto_error(format!(
+                                        "physical_plan::from_proto() Unexpected sort expr {self:?}"
+                                    ))
+                                })?
+                                .as_ref();
+                            Ok(PhysicalSortExpr {
+                                expr: parse_physical_expr(expr,registry, right.schema().as_ref())?,
+                                options: SortOptions {
+                                    descending: !sort_expr.asc,
+                                    nulls_first: sort_expr.nulls_first,
+                                },
+                            })
+                        } else {
+                            internal_err!(
+                                "physical_plan::from_proto() {self:?}"
+                            )
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                Ok(Arc::new(SlidingNestedLoopJoinExec::try_new(
+                    left,
+                    right,
+                    filter,
+                    &join_type.into(),
+                    left_sort_exprs,
+                    right_sort_exprs,
+                )?))
             }
             PhysicalPlanType::Union(union) => {
                 let mut inputs: Vec<Arc<dyn ExecutionPlan>> = vec![];

@@ -459,12 +459,12 @@ macro_rules! assert_optimized_orthogonal {
             .iter().map(|s| *s).collect();
         //
         // Run JoinSelection - EnforceSorting
-        let optimized_physical_plan = GlobalOrderRequire::new_add_mode().optimize(physical_plan.clone(), state.config_options())?;
+        let optimized_physical_plan = OutputRequirements::new_add_mode().optimize(physical_plan.clone(), state.config_options())?;
         let optimized_physical_plan = JoinSelection::new().optimize(optimized_physical_plan.clone(), state.config_options())?;
         let optimized_physical_plan =
             EnforceSorting::new().optimize(optimized_physical_plan, state.config_options())?;
         let optimized_physical_plan =
-            GlobalOrderRequire::new_remove_mode().optimize(optimized_physical_plan, state.config_options())?;
+            OutputRequirements::new_remove_mode().optimize(optimized_physical_plan, state.config_options())?;
 
         assert_eq!(physical_plan.schema(), optimized_physical_plan.schema());
 
@@ -475,12 +475,12 @@ macro_rules! assert_optimized_orthogonal {
             "\n**JoinSelection - EnforceSorting Optimized Plan Mismatch\n\nexpected:\n\n{expected_optimized_lines:#?}\nactual:\n\n{actual:#?}\n\n"
         );
         // Run EnforceSorting - JoinSelection
-        let optimized_physical_plan_2 = GlobalOrderRequire::new_add_mode().optimize(physical_plan.clone(), state.config_options())?;
+        let optimized_physical_plan_2 = OutputRequirements::new_add_mode().optimize(physical_plan.clone(), state.config_options())?;
         let optimized_physical_plan_2 =
             EnforceSorting::new().optimize(optimized_physical_plan_2.clone(), state.config_options())?;
         let optimized_physical_plan_2 = JoinSelection::new().optimize(optimized_physical_plan_2.clone(), state.config_options())?;
         let optimized_physical_plan_2 =
-            GlobalOrderRequire::new_remove_mode().optimize(optimized_physical_plan_2, state.config_options())?;
+            OutputRequirements::new_remove_mode().optimize(optimized_physical_plan_2, state.config_options())?;
 
         assert_eq!(physical_plan.schema(), optimized_physical_plan_2.schema());
 
@@ -521,10 +521,10 @@ macro_rules! assert_join_selection_enforce_sorting {
         let physical_plan = $PLAN;
 
         let expected_optimized_lines: Vec<&str> = $EXPECTED_OPTIMIZED_PLAN_LINES.iter().map(|s| *s).collect();
-        let optimized_physical_plan = GlobalOrderRequire::new_add_mode().optimize(physical_plan.clone(), state.config_options())?;
+        let optimized_physical_plan = OutputRequirements::new_add_mode().optimize(physical_plan.clone(), state.config_options())?;
         let optimized_physical_plan = JoinSelection::new().optimize(optimized_physical_plan, state.config_options())?;
         let optimized_physical_plan = EnforceSorting::new().optimize(optimized_physical_plan, state.config_options())?;
-        let optimized_physical_plan = GlobalOrderRequire::new_remove_mode().optimize(optimized_physical_plan, state.config_options())?;
+        let optimized_physical_plan = OutputRequirements::new_remove_mode().optimize(optimized_physical_plan, state.config_options())?;
 
         assert_eq!(physical_plan.schema(), optimized_physical_plan.schema());
 
@@ -546,10 +546,10 @@ macro_rules! assert_enforce_sorting_join_selection {
         let physical_plan = $PLAN;
 
         let expected_optimized_lines: Vec<&str> = $EXPECTED_OPTIMIZED_PLAN_LINES.iter().map(|s| *s).collect();
-        let optimized_physical_plan = GlobalOrderRequire::new_add_mode().optimize(physical_plan.clone(), state.config_options())?;
+        let optimized_physical_plan = OutputRequirements::new_add_mode().optimize(physical_plan.clone(), state.config_options())?;
         let optimized_physical_plan = EnforceSorting::new().optimize(optimized_physical_plan, state.config_options())?;
         let optimized_physical_plan = JoinSelection::new().optimize(optimized_physical_plan, state.config_options())?;
-        let optimized_physical_plan = GlobalOrderRequire::new_remove_mode().optimize(optimized_physical_plan, state.config_options())?;
+        let optimized_physical_plan = OutputRequirements::new_remove_mode().optimize(optimized_physical_plan, state.config_options())?;
 
         assert_eq!(physical_plan.schema(), optimized_physical_plan.schema());
 

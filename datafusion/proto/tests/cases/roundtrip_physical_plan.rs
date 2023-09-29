@@ -45,8 +45,10 @@ use datafusion::physical_plan::expressions::{
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::functions::make_scalar_function;
 use datafusion::physical_plan::insert::FileSinkExec;
+use datafusion::physical_plan::joins::utils::{ColumnIndex, JoinFilter, JoinSide};
 use datafusion::physical_plan::joins::{
-    HashJoinExec, NestedLoopJoinExec, PartitionMode, StreamJoinPartitionMode,
+    HashJoinExec, NestedLoopJoinExec, PartitionMode, SlidingHashJoinExec,
+    SlidingNestedLoopJoinExec, StreamJoinPartitionMode, SymmetricHashJoinExec,
 };
 use datafusion::physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion::physical_plan::placeholder_row::PlaceholderRowExec;
@@ -755,6 +757,155 @@ fn roundtrip_json_sink() -> Result<()> {
         schema.clone(),
         Some(sort_order),
     )))
+fn roundtrip_sym_hash_join() -> Result<()> {
+    let field_a = Field::new("col", DataType::Int64, false);
+    let schema_left = Schema::new(vec![field_a.clone()]);
+    let schema_right = Schema::new(vec![field_a]);
+    let on = vec![(
+        Column::new("col", schema_left.index_of("col")?),
+        Column::new("col", schema_right.index_of("col")?),
+    )];
+
+    let schema_left = Arc::new(schema_left);
+    let schema_right = Arc::new(schema_right);
+    for join_type in &[
+        JoinType::Inner,
+        JoinType::Left,
+        JoinType::Right,
+        JoinType::Full,
+        JoinType::LeftAnti,
+        JoinType::RightAnti,
+        JoinType::LeftSemi,
+        JoinType::RightSemi,
+    ] {
+        for partition_mode in &[
+            StreamJoinPartitionMode::Partitioned,
+            StreamJoinPartitionMode::SinglePartition,
+        ] {
+            roundtrip_test(Arc::new(SymmetricHashJoinExec::try_new(
+                Arc::new(EmptyExec::new(false, schema_left.clone())),
+                Arc::new(EmptyExec::new(false, schema_right.clone())),
+                on.clone(),
+                None,
+                join_type,
+                false,
+                *partition_mode,
+            )?))?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn roundtrip_sliding_hash_join() -> Result<()> {
+    let field_a = Field::new("col", DataType::Int64, false);
+    let schema_left = Schema::new(vec![field_a.clone()]);
+    let schema_right = Schema::new(vec![field_a]);
+    let on = vec![(
+        Column::new("col", schema_left.index_of("col")?),
+        Column::new("col", schema_right.index_of("col")?),
+    )];
+
+    let filter_schema = schema_left.clone();
+    let expression = binary(
+        col("col", &filter_schema)?,
+        Operator::Gt,
+        lit(42i64),
+        &filter_schema,
+    )?;
+    let col_indices = vec![ColumnIndex {
+        index: 0,
+        side: JoinSide::Left,
+    }];
+
+    let filter = JoinFilter::new(expression, col_indices, filter_schema);
+
+    let schema_left = Arc::new(schema_left);
+    let schema_right = Arc::new(schema_right);
+    for join_type in &[
+        JoinType::Inner,
+        JoinType::Left,
+        JoinType::Right,
+        JoinType::Full,
+        JoinType::LeftAnti,
+        JoinType::RightAnti,
+        JoinType::LeftSemi,
+        JoinType::RightSemi,
+    ] {
+        for partition_mode in &[
+            StreamJoinPartitionMode::Partitioned,
+            StreamJoinPartitionMode::SinglePartition,
+        ] {
+            roundtrip_test(Arc::new(SlidingHashJoinExec::try_new(
+                Arc::new(EmptyExec::new(false, schema_left.clone())),
+                Arc::new(EmptyExec::new(false, schema_right.clone())),
+                on.clone(),
+                filter.clone(),
+                join_type,
+                false,
+                vec![PhysicalSortExpr {
+                    expr: col("col", &schema_left)?,
+                    options: Default::default(),
+                }],
+                vec![PhysicalSortExpr {
+                    expr: col("col", &schema_left)?,
+                    options: Default::default(),
+                }],
+                *partition_mode,
+            )?))?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn roundtrip_sliding_nested_loop_join() -> Result<()> {
+    let field_a = Field::new("col", DataType::Int64, false);
+    let schema_left = Schema::new(vec![field_a.clone()]);
+    let schema_right = Schema::new(vec![field_a]);
+
+    let filter_schema = schema_left.clone();
+    let expression = binary(
+        col("col", &filter_schema)?,
+        Operator::Gt,
+        lit(42i64),
+        &filter_schema,
+    )?;
+    let col_indices = vec![ColumnIndex {
+        index: 0,
+        side: JoinSide::Left,
+    }];
+
+    let filter = JoinFilter::new(expression, col_indices, filter_schema);
+
+    let schema_left = Arc::new(schema_left);
+    let schema_right = Arc::new(schema_right);
+    for join_type in &[
+        JoinType::Inner,
+        JoinType::Left,
+        JoinType::Right,
+        JoinType::Full,
+        JoinType::LeftAnti,
+        JoinType::RightAnti,
+        JoinType::LeftSemi,
+        JoinType::RightSemi,
+    ] {
+        roundtrip_test(Arc::new(SlidingNestedLoopJoinExec::try_new(
+            Arc::new(EmptyExec::new(false, schema_left.clone())),
+            Arc::new(EmptyExec::new(false, schema_right.clone())),
+            filter.clone(),
+            join_type,
+            vec![PhysicalSortExpr {
+                expr: col("col", &schema_left)?,
+                options: Default::default(),
+            }],
+            vec![PhysicalSortExpr {
+                expr: col("col", &schema_left)?,
+                options: Default::default(),
+            }],
+        )?))?;
+    }
+    Ok(())
 }
 
 #[test]
