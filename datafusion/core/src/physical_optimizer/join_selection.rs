@@ -39,6 +39,7 @@ use crate::physical_plan::ExecutionPlan;
 use datafusion_common::internal_err;
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{DataFusionError, JoinType};
+use datafusion_physical_plan::joins::prunability::separate_columns_of_filter_expression;
 use datafusion_physical_plan::joins::utils::{
     swap_join_filter, swap_join_type, swap_reverting_projection,
 };
@@ -388,7 +389,9 @@ fn hash_join_convert_symmetric_subrule(
                 hash_join.left().clone(),
                 hash_join.right().clone(),
                 hash_join.on().to_vec(),
-                hash_join.filter().cloned(),
+                hash_join
+                    .filter()
+                    .map(|filter| separate_columns_of_filter_expression(filter.clone())),
                 hash_join.join_type(),
                 hash_join.null_equals_null(),
                 mode,
