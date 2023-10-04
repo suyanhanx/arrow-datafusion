@@ -4,14 +4,12 @@
 use std::sync::Arc;
 
 use crate::physical_optimizer::utils::{is_hash_join, is_nested_loop_join, is_sort};
-use crate::physical_plan::joins::utils::is_filter_expr_prunable;
 use crate::physical_plan::joins::{
     HashJoinExec, NestedLoopJoinExec, SlidingHashJoinExec, SlidingNestedLoopJoinExec,
     SortMergeJoinExec, StreamJoinPartitionMode,
 };
 use crate::physical_plan::sorts::sort::SortExec;
 use crate::physical_plan::{with_new_children_if_necessary, ExecutionPlan};
-use datafusion_physical_plan::joins::utils::swap_join_type;
 
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::{Transformed, TreeNode, VisitRecursion};
@@ -21,10 +19,14 @@ use datafusion_physical_expr::utils::{
     ordering_satisfy_requirement_concrete,
 };
 use datafusion_physical_expr::PhysicalSortRequirement;
-
+use datafusion_physical_plan::joins::prunability::{
+    is_filter_expr_prunable, separate_columns_of_filter_expression,
+};
+use datafusion_physical_plan::joins::utils::swap_join_type;
 use datafusion_physical_plan::joins::{
     swap_sliding_hash_join, swap_sliding_nested_loop_join, swap_sort_merge_join,
 };
+
 use itertools::{iproduct, izip, Itertools};
 
 /// This object is used within the JoinSelection rule to track the closest
@@ -328,7 +330,11 @@ fn check_hash_join_convertable(
     hash_join: &HashJoinExec,
     config_options: &ConfigOptions,
 ) -> Result<Option<Vec<Arc<dyn ExecutionPlan>>>> {
-    let filter = hash_join.filter();
+    // To perform the prunability analysis correctly, the columns from the left table
+    // and the columns from the right table must be on the different sides of the join.
+    let filter = hash_join
+        .filter()
+        .map(|filter| separate_columns_of_filter_expression(filter.clone()));
     let (on_left, on_right): (Vec<_>, Vec<_>) = hash_join.on.iter().cloned().unzip();
     let left_order = hash_join.left().output_ordering();
     let right_order = hash_join.right().output_ordering();
@@ -343,7 +349,7 @@ fn check_hash_join_convertable(
     ) {
         (true, true, Some(filter), Some(left_order), Some(right_order)) => {
             let (left_prunable, right_prunable) = is_filter_expr_prunable(
-                filter,
+                &filter,
                 Some(left_order[0].clone()),
                 Some(right_order[0].clone()),
                 || hash_join.left().equivalence_properties(),
@@ -441,7 +447,11 @@ fn check_nested_loop_join_convertable(
     nested_loop_join: &NestedLoopJoinExec,
     _config_options: &ConfigOptions,
 ) -> Result<Option<Vec<Arc<dyn ExecutionPlan>>>> {
-    let filter = nested_loop_join.filter();
+    // To perform the prunability analysis correctly, the columns from the left table
+    // and the columns from the right table must be on the different sides of the join.
+    let filter = nested_loop_join
+        .filter()
+        .map(|filter| separate_columns_of_filter_expression(filter.clone()));
     let left_order = nested_loop_join.left().output_ordering();
     let right_order = nested_loop_join.right().output_ordering();
     let is_left_streaming = is_plan_streaming(nested_loop_join.left());
@@ -455,7 +465,7 @@ fn check_nested_loop_join_convertable(
     ) {
         (true, true, Some(filter), Some(left_order), Some(right_order)) => {
             let (left_prunable, right_prunable) = is_filter_expr_prunable(
-                filter,
+                &filter,
                 Some(left_order[0].clone()),
                 Some(right_order[0].clone()),
                 || nested_loop_join.left().equivalence_properties(),

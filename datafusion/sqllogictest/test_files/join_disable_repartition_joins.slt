@@ -525,6 +525,43 @@ LIMIT 10
 1 2
 1 2
 
+# Rewrite of filter predicate enables the pruning.
+query TT
+EXPLAIN SELECT
+    subquery.c_custkey,
+    subquery.c_nationkey,
+    subquery.price_rank,
+    nation.n_name
+FROM
+    (
+        SELECT
+            customer.c_custkey,
+            customer.c_nationkey,
+            customer.c_address,
+            CAST(ROW_NUMBER() OVER(ORDER BY customer.c_custkey) as BIGINT) as price_rank
+        FROM
+            customer
+    ) as subquery
+INNER JOIN nation ON nation.n_name = subquery.c_address
+AND nation.n_nationkey - subquery.c_custkey > 0
+AND nation.n_nationkey - subquery.price_rank < 0
+----
+logical_plan
+Projection: subquery.c_custkey, subquery.c_nationkey, subquery.price_rank, nation.n_name
+--Inner Join: subquery.c_address = nation.n_name Filter: nation.n_nationkey - subquery.c_custkey > Int64(0) AND nation.n_nationkey - subquery.price_rank < Int64(0)
+----SubqueryAlias: subquery
+------Projection: customer.c_custkey, customer.c_nationkey, customer.c_address, CAST(ROW_NUMBER() ORDER BY [customer.c_custkey ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW AS Int64) AS price_rank
+--------WindowAggr: windowExpr=[[ROW_NUMBER() ORDER BY [customer.c_custkey ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]
+----------TableScan: customer projection=[c_custkey, c_address, c_nationkey]
+----TableScan: nation projection=[n_nationkey, n_name]
+physical_plan
+ProjectionExec: expr=[c_custkey@0 as c_custkey, c_nationkey@1 as c_nationkey, price_rank@3 as price_rank, n_name@5 as n_name]
+--SymmetricHashJoinExec: mode=SinglePartition, join_type=Inner, on=[(c_address@2, n_name@1)], filter=n_nationkey@2 > c_custkey@0 AND n_nationkey@2 < price_rank@1
+----ProjectionExec: expr=[c_custkey@0 as c_custkey, c_nationkey@2 as c_nationkey, c_address@1 as c_address, CAST(ROW_NUMBER() ORDER BY [customer.c_custkey ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW@3 AS Int64) as price_rank]
+------BoundedWindowAggExec: wdw=[ROW_NUMBER() ORDER BY [customer.c_custkey ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW: Ok(Field { name: "ROW_NUMBER() ORDER BY [customer.c_custkey ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW", data_type: UInt64, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(Int64(NULL)), end_bound: CurrentRow }], mode=[Sorted]
+--------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/customer.csv]]}, projection=[c_custkey, c_address, c_nationkey], infinite_source=true, output_ordering=[c_custkey@0 ASC NULLS LAST], has_header=false
+----CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/nation.csv]]}, projection=[n_nationkey, n_name], infinite_source=true, output_ordering=[n_nationkey@0 ASC NULLS LAST], has_header=false
+
 # turn on repartition_joins
 statement ok
 set datafusion.optimizer.repartition_joins = true;

@@ -152,3 +152,4 @@ datafusion/sqllogictest/test_files/stream.slt
 datafusion/core/tests/data/exchange_rates.csv
 datafusion/core/tests/data/sales_global.csv
 datafusion/core/tests/data/sales_us.csv
+datafusion/physical-plan/src/joins/prunability.rs
