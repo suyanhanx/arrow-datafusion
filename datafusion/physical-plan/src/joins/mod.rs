@@ -20,6 +20,7 @@
 pub use cross_join::CrossJoinExec;
 pub use hash_join::HashJoinExec;
 pub use nested_loop_join::NestedLoopJoinExec;
+pub use partitioned_hash_join::PartitionedHashJoinExec;
 pub use sliding_hash_join::{swap_sliding_hash_join, SlidingHashJoinExec};
 pub use sliding_nested_loop_join::{
     swap_sliding_nested_loop_join, SlidingNestedLoopJoinExec,
@@ -33,6 +34,7 @@ pub mod utils;
 mod cross_join;
 mod hash_join;
 mod nested_loop_join;
+mod partitioned_hash_join;
 mod sliding_hash_join;
 mod sliding_nested_loop_join;
 mod sliding_window_join_utils;

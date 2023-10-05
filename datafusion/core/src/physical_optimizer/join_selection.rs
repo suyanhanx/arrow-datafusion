@@ -25,24 +25,23 @@
 
 use std::sync::Arc;
 
+use super::join_pipeline_selection::select_joins_to_preserve_pipeline;
+
 use crate::config::ConfigOptions;
+use crate::datasource::physical_plan::is_plan_streaming;
 use crate::error::Result;
-use crate::physical_optimizer::pipeline_checker::PipelineStatePropagator;
+use crate::physical_optimizer::join_pipeline_selection::{cost_of_the_plan, PlanState};
 use crate::physical_optimizer::PhysicalOptimizerRule;
-use crate::physical_plan::joins::{
-    CrossJoinExec, HashJoinExec, PartitionMode, StreamJoinPartitionMode,
-    SymmetricHashJoinExec,
-};
+use crate::physical_plan::joins::utils::swap_filter;
+use crate::physical_plan::joins::{CrossJoinExec, HashJoinExec, PartitionMode};
 use crate::physical_plan::projection::ProjectionExec;
 use crate::physical_plan::ExecutionPlan;
 
-use datafusion_common::internal_err;
-use datafusion_common::tree_node::{Transformed, TreeNode};
-use datafusion_common::{DataFusionError, JoinType};
-use datafusion_physical_plan::joins::prunability::separate_columns_of_filter_expression;
-use datafusion_physical_plan::joins::utils::{
-    swap_join_filter, swap_join_type, swap_reverting_projection,
-};
+use arrow_schema::Schema;
+use datafusion_common::tree_node::TreeNode;
+use datafusion_common::{internal_err, DataFusionError, JoinType};
+use datafusion_physical_expr::expressions::Column;
+use datafusion_physical_expr::PhysicalExpr;
 
 /// The [`JoinSelection`] rule tries to modify a given plan so that it can
 /// accommodate infinite sources and optimize joins in the plan according to
@@ -120,6 +119,21 @@ fn supports_swap(join_type: JoinType) -> bool {
     )
 }
 
+/// This function returns the new join type we get after swapping the given
+/// join's inputs.
+pub(crate) fn swap_join_type(join_type: JoinType) -> JoinType {
+    match join_type {
+        JoinType::Inner => JoinType::Inner,
+        JoinType::Full => JoinType::Full,
+        JoinType::Left => JoinType::Right,
+        JoinType::Right => JoinType::Left,
+        JoinType::LeftSemi => JoinType::RightSemi,
+        JoinType::RightSemi => JoinType::LeftSemi,
+        JoinType::LeftAnti => JoinType::RightAnti,
+        JoinType::RightAnti => JoinType::LeftAnti,
+    }
+}
+
 /// This function swaps the inputs of the given join operator.
 fn swap_hash_join(
     hash_join: &HashJoinExec,
@@ -128,14 +142,14 @@ fn swap_hash_join(
     let left = hash_join.left();
     let right = hash_join.right();
     let new_join = HashJoinExec::try_new(
-        Arc::clone(right),
-        Arc::clone(left),
+        right.clone(),
+        left.clone(),
         hash_join
             .on()
             .iter()
             .map(|(l, r)| (r.clone(), l.clone()))
             .collect(),
-        swap_join_filter(hash_join.filter()),
+        hash_join.filter().map(swap_filter),
         &swap_join_type(*hash_join.join_type()),
         partition_mode,
         hash_join.null_equals_null(),
@@ -158,44 +172,50 @@ fn swap_hash_join(
     }
 }
 
+/// When the order of the join is changed by the optimizer, the columns in
+/// the output should not be impacted. This function creates the expressions
+/// that will allow to swap back the values from the original left as the first
+/// columns and those on the right next.
+pub(crate) fn swap_reverting_projection(
+    left_schema: &Schema,
+    right_schema: &Schema,
+) -> Vec<(Arc<dyn PhysicalExpr>, String)> {
+    let right_cols = right_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (Arc::new(Column::new(f.name(), i)) as _, f.name().to_owned()));
+    let right_len = right_cols.len();
+    let left_cols = left_schema.fields().iter().enumerate().map(|(i, f)| {
+        (
+            Arc::new(Column::new(f.name(), right_len + i)) as _,
+            f.name().to_owned(),
+        )
+    });
+
+    left_cols.chain(right_cols).collect()
+}
+
 impl PhysicalOptimizerRule for JoinSelection {
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
         config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // First, we inspect all joins in the plan and make necessary modifications
-        // to preserve output orderings when necessary:
-        let plan_with_hash_joins = crate::physical_optimizer::join_pipeline_selection::PlanWithCorrespondingHashJoin::new(plan);
-        let state = plan_with_hash_joins
-            .transform_up(&|p| crate::physical_optimizer::join_pipeline_selection::select_joins_to_preserve_order_subrule(p, config))?;
-        let pipeline = PipelineStatePropagator::new(state.plan);
-        // Next, we make pipeline-fixing modifications to joins so as to accommodate
-        // unbounded inputs. Each pipeline-fixing subrule, which is a function
-        // of type `PipelineFixerSubrule`, takes a single [`PipelineStatePropagator`]
-        // argument storing state variables that indicate the unboundedness status
-        // of the current [`ExecutionPlan`] as we traverse the plan tree.
-        let subrules: Vec<Box<PipelineFixerSubrule>> = vec![
-            Box::new(hash_join_convert_symmetric_subrule),
-            Box::new(hash_join_swap_subrule),
-        ];
-        let state = pipeline.transform_up(&|p| apply_subrules(p, &subrules, config))?;
-        // Next, we apply another subrule that tries to optimize joins using any
-        // statistics their inputs might have.
-        // - For a hash join with partition mode [`PartitionMode::Auto`], we will
-        //   make a cost-based decision to select which `PartitionMode` mode
-        //   (`Partitioned`/`CollectLeft`) is optimal. If the statistics information
-        //   is not available, we will fall back to [`PartitionMode::Partitioned`].
-        // - We optimize/swap join sides so that the left (build) side of the join
-        //   is the small side. If the statistics information is not available, we
-        //   do not modify join sides.
-        // - We will also swap left and right sides for cross joins so that the left
-        //   side is the small side.
-        let config = &config.optimizer;
-        let collect_left_threshold = config.hash_join_single_partition_threshold;
-        state.plan.transform_up(&|plan| {
-            statistical_join_selection_subrule(plan, collect_left_threshold)
-        })
+        let plan_global = PlanState::new(plan.clone());
+        let new_state = plan_global
+            .transform_up(&|p| select_joins_to_preserve_pipeline(p, config))?;
+        let lowest_plan = if let Some(optimized_plan) = new_state
+            .plans
+            .into_iter()
+            .filter(|plan| is_plan_streaming(plan).is_ok())
+            .min_by(|a, b| cost_of_the_plan(a).cmp(&cost_of_the_plan(b)))
+        {
+            optimized_plan
+        } else {
+            plan
+        };
+        Ok(lowest_plan)
     }
 
     fn name(&self) -> &str {
@@ -305,179 +325,61 @@ fn partitioned_hash_join(hash_join: &HashJoinExec) -> Result<Arc<dyn ExecutionPl
 
 /// This subrule tries to modify a given plan so that it can
 /// optimize hash and cross joins in the plan according to available statistical information.
-fn statistical_join_selection_subrule(
-    plan: Arc<dyn ExecutionPlan>,
+/// - For a hash join with partition mode [`PartitionMode::Auto`], we will
+///   make a cost-based decision to select which `PartitionMode` mode
+///   (`Partitioned`/`CollectLeft`) is optimal. If the statistics information
+///   is not available, we will fall back to [`PartitionMode::Partitioned`].
+/// - We optimize/swap join sides so that the left (build) side of the join
+///   is the small side. If the statistics information is not available, we
+///   do not modify join sides.
+/// - We will also swap left and right sides for cross joins so that the left
+///   side is the small side.
+pub(crate) fn statistical_join_selection_hash_join(
+    hash_join: &HashJoinExec,
     collect_left_threshold: usize,
-) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
-    let transformed = if let Some(hash_join) =
-        plan.as_any().downcast_ref::<HashJoinExec>()
-    {
-        match hash_join.partition_mode() {
-            PartitionMode::Auto => {
-                try_collect_left(hash_join, Some(collect_left_threshold))?.map_or_else(
-                    || partitioned_hash_join(hash_join).map(Some),
-                    |v| Ok(Some(v)),
-                )?
-            }
-            PartitionMode::CollectLeft => try_collect_left(hash_join, None)?
-                .map_or_else(
-                    || partitioned_hash_join(hash_join).map(Some),
-                    |v| Ok(Some(v)),
-                )?,
-            PartitionMode::Partitioned => {
-                let left = hash_join.left();
-                let right = hash_join.right();
-                if should_swap_join_order(&**left, &**right)?
-                    && supports_swap(*hash_join.join_type())
-                {
-                    swap_hash_join(hash_join, PartitionMode::Partitioned).map(Some)?
-                } else {
-                    None
-                }
+) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    let new_plan = match hash_join.partition_mode() {
+        PartitionMode::Auto => try_collect_left(hash_join, Some(collect_left_threshold))?
+            .map_or_else(
+                || partitioned_hash_join(hash_join).map(Some),
+                |v| Ok(Some(v)),
+            )?,
+        PartitionMode::CollectLeft => try_collect_left(hash_join, None)?.map_or_else(
+            || partitioned_hash_join(hash_join).map(Some),
+            |v| Ok(Some(v)),
+        )?,
+        PartitionMode::Partitioned => {
+            let left = hash_join.left();
+            let right = hash_join.right();
+            if should_swap_join_order(&**left, &**right)
+                && supports_swap(*hash_join.join_type())
+            {
+                swap_hash_join(hash_join, PartitionMode::Partitioned).map(Some)?
+            } else {
+                None
             }
         }
-    } else if let Some(cross_join) = plan.as_any().downcast_ref::<CrossJoinExec>() {
-        let left = cross_join.left();
-        let right = cross_join.right();
-        if should_swap_join_order(&**left, &**right)? {
-            let new_join = CrossJoinExec::new(Arc::clone(right), Arc::clone(left));
-            // TODO avoid adding ProjectionExec again and again, only adding Final Projection
-            let proj: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
-                swap_reverting_projection(&left.schema(), &right.schema()),
-                Arc::new(new_join),
-            )?);
-            Some(proj)
-        } else {
-            None
-        }
+    };
+    Ok(new_plan)
+}
+
+pub(crate) fn statistical_join_selection_cross_join(
+    cross_join: &CrossJoinExec,
+) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    let left = cross_join.left();
+    let right = cross_join.right();
+    let new_plan = if should_swap_join_order(&**left, &**right) {
+        let new_join = CrossJoinExec::new(Arc::clone(right), Arc::clone(left));
+        // TODO avoid adding ProjectionExec again and again, only adding Final Projection
+        let proj: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
+            swap_reverting_projection(&left.schema(), &right.schema()),
+            Arc::new(new_join),
+        )?);
+        Some(proj)
     } else {
         None
     };
-
-    Ok(if let Some(transformed) = transformed {
-        Transformed::Yes(transformed)
-    } else {
-        Transformed::No(plan)
-    })
-}
-
-/// Pipeline-fixing join selection subrule.
-pub type PipelineFixerSubrule = dyn Fn(
-    PipelineStatePropagator,
-    &ConfigOptions,
-) -> Option<Result<PipelineStatePropagator>>;
-
-/// This subrule checks if we can replace a hash join with a symmetric hash
-/// join when we are dealing with infinite inputs on both sides. This change
-/// avoids pipeline breaking and preserves query runnability. If possible,
-/// this subrule makes this replacement; otherwise, it has no effect.
-fn hash_join_convert_symmetric_subrule(
-    mut input: PipelineStatePropagator,
-    config_options: &ConfigOptions,
-) -> Option<Result<PipelineStatePropagator>> {
-    if let Some(hash_join) = input.plan.as_any().downcast_ref::<HashJoinExec>() {
-        let ub_flags = input.children_unbounded();
-        let (left_unbounded, right_unbounded) = (ub_flags[0], ub_flags[1]);
-        input.unbounded = left_unbounded || right_unbounded;
-        let result = if left_unbounded && right_unbounded {
-            let mode = if config_options.optimizer.repartition_joins {
-                StreamJoinPartitionMode::Partitioned
-            } else {
-                StreamJoinPartitionMode::SinglePartition
-            };
-            SymmetricHashJoinExec::try_new(
-                hash_join.left().clone(),
-                hash_join.right().clone(),
-                hash_join.on().to_vec(),
-                hash_join
-                    .filter()
-                    .map(|filter| separate_columns_of_filter_expression(filter.clone())),
-                hash_join.join_type(),
-                hash_join.null_equals_null(),
-                mode,
-            )
-            .map(|exec| {
-                input.plan = Arc::new(exec) as _;
-                input
-            })
-        } else {
-            Ok(input)
-        };
-        Some(result)
-    } else {
-        None
-    }
-}
-
-/// This subrule will swap build/probe sides of a hash join depending on whether
-/// one of its inputs may produce an infinite stream of records. The rule ensures
-/// that the left (build) side of the hash join always operates on an input stream
-/// that will produce a finite set of records. If the left side can not be chosen
-/// to be "finite", the join sides stay the same as the original query.
-/// ```text
-/// For example, this rule makes the following transformation:
-///
-///
-///
-///           +--------------+              +--------------+
-///           |              |  unbounded   |              |
-///    Left   | Infinite     |    true      | Hash         |\true
-///           | Data source  |--------------| Repartition  | \   +--------------+       +--------------+
-///           |              |              |              |  \  |              |       |              |
-///           +--------------+              +--------------+   - |  Hash Join   |-------| Projection   |
-///                                                            - |              |       |              |
-///           +--------------+              +--------------+  /  +--------------+       +--------------+
-///           |              |  unbounded   |              | /
-///    Right  | Finite       |    false     | Hash         |/false
-///           | Data Source  |--------------| Repartition  |
-///           |              |              |              |
-///           +--------------+              +--------------+
-///
-///
-///
-///           +--------------+              +--------------+
-///           |              |  unbounded   |              |
-///    Left   | Finite       |    false     | Hash         |\false
-///           | Data source  |--------------| Repartition  | \   +--------------+       +--------------+
-///           |              |              |              |  \  |              | true  |              | true
-///           +--------------+              +--------------+   - |  Hash Join   |-------| Projection   |-----
-///                                                            - |              |       |              |
-///           +--------------+              +--------------+  /  +--------------+       +--------------+
-///           |              |  unbounded   |              | /
-///    Right  | Infinite     |    true      | Hash         |/true
-///           | Data Source  |--------------| Repartition  |
-///           |              |              |              |
-///           +--------------+              +--------------+
-///
-/// ```
-fn hash_join_swap_subrule(
-    mut input: PipelineStatePropagator,
-    _config_options: &ConfigOptions,
-) -> Option<Result<PipelineStatePropagator>> {
-    if let Some(hash_join) = input.plan.as_any().downcast_ref::<HashJoinExec>() {
-        let ub_flags = input.children_unbounded();
-        let (left_unbounded, right_unbounded) = (ub_flags[0], ub_flags[1]);
-        input.unbounded = left_unbounded || right_unbounded;
-        let result = if left_unbounded
-            && !right_unbounded
-            && matches!(
-                *hash_join.join_type(),
-                JoinType::Inner
-                    | JoinType::Left
-                    | JoinType::LeftSemi
-                    | JoinType::LeftAnti
-            ) {
-            swap_join_according_to_unboundedness(hash_join).map(|plan| {
-                input.plan = plan;
-                input
-            })
-        } else {
-            Ok(input)
-        };
-        Some(result)
-    } else {
-        None
-    }
+    Ok(new_plan)
 }
 
 /// This function swaps sides of a hash join to make it runnable even if one of
@@ -485,7 +387,7 @@ fn hash_join_swap_subrule(
 /// [`JoinType::Full`], [`JoinType::Right`], [`JoinType::RightAnti`] and
 /// [`JoinType::RightSemi`] can not run with an unbounded left side, even if
 /// we swap join sides. Therefore, we do not consider them here.
-fn swap_join_according_to_unboundedness(
+pub(crate) fn swap_join_according_to_unboundedness(
     hash_join: &HashJoinExec,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let partition_mode = hash_join.partition_mode();
@@ -505,32 +407,6 @@ fn swap_join_according_to_unboundedness(
             internal_err!("Auto is not acceptable for unbounded input here.")
         }
     }
-}
-
-/// Apply given `PipelineFixerSubrule`s to a given plan. This plan, along with
-/// auxiliary boundedness information, is in the `PipelineStatePropagator` object.
-fn apply_subrules(
-    mut input: PipelineStatePropagator,
-    subrules: &Vec<Box<PipelineFixerSubrule>>,
-    config_options: &ConfigOptions,
-) -> Result<Transformed<PipelineStatePropagator>> {
-    for subrule in subrules {
-        if let Some(value) = subrule(input.clone(), config_options).transpose()? {
-            input = value;
-        }
-    }
-    let is_unbounded = input
-        .plan
-        .unbounded_output(&input.children_unbounded())
-        // Treat the case where an operator can not run on unbounded data as
-        // if it can and it outputs unbounded data. Do not raise an error yet.
-        // Such operators may be fixed, adjusted or replaced later on during
-        // optimization passes -- sorts may be removed, windows may be adjusted
-        // etc. If this doesn't happen, the final `PipelineChecker` rule will
-        // catch this and raise an error anyway.
-        .unwrap_or(true);
-    input.unbounded = is_unbounded;
-    Ok(Transformed::Yes(input))
 }
 
 #[cfg(test)]
@@ -1187,6 +1063,7 @@ mod util_tests {
 #[cfg(test)]
 mod hash_join_tests {
     use super::*;
+    use crate::physical_optimizer::join_selection::swap_join_type;
     use crate::physical_optimizer::test_utils::SourceType;
     use crate::physical_plan::expressions::Column;
     use crate::physical_plan::joins::PartitionMode;
@@ -1564,28 +1441,9 @@ mod hash_join_tests {
             false,
         )?;
 
-        let children = vec![
-            PipelineStatePropagator {
-                plan: Arc::new(EmptyExec::new(Arc::new(Schema::empty()))),
-                unbounded: left_unbounded,
-                children: vec![],
-            },
-            PipelineStatePropagator {
-                plan: Arc::new(EmptyExec::new(Arc::new(Schema::empty()))),
-                unbounded: right_unbounded,
-                children: vec![],
-            },
-        ];
-        let initial_hash_join_state = PipelineStatePropagator {
-            plan: Arc::new(join),
-            unbounded: false,
-            children,
-        };
-
-        let optimized_hash_join =
-            hash_join_swap_subrule(initial_hash_join_state, &ConfigOptions::new())
-                .unwrap()?;
-        let optimized_join_plan = optimized_hash_join.plan;
+        let optimized_join_plan = JoinSelection::new()
+            .optimize(Arc::new(join), &ConfigOptions::new())
+            .unwrap();
 
         // If swap did happen
         let projection_added = optimized_join_plan.as_any().is::<ProjectionExec>();

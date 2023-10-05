@@ -397,6 +397,25 @@ pub fn prunable_filter(left_index: ColumnIndex, right_index: ColumnIndex) -> Joi
     );
     JoinFilter::new(filter_expr, column_indices, intermediate_schema)
 }
+pub fn partial_prunable_filter(
+    left_index: ColumnIndex,
+    right_index: ColumnIndex,
+) -> JoinFilter {
+    // Filter columns, ensure first batches will have matching rows.
+    let intermediate_schema = Schema::new(vec![
+        Field::new("0", DataType::Int32, true),
+        Field::new("1", DataType::Int32, true),
+    ]);
+    let column_indices = vec![left_index, right_index];
+    let filter_expr = Arc::new(BinaryExpr::new(
+        col("0", &intermediate_schema).unwrap(),
+        Operator::Gt,
+        col("1", &intermediate_schema).unwrap(),
+    ));
+
+    JoinFilter::new(filter_expr, column_indices, intermediate_schema)
+}
+
 pub fn not_prunable_filter(
     left_index: ColumnIndex,
     right_index: ColumnIndex,

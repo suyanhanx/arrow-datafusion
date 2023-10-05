@@ -21,8 +21,10 @@ use std::fmt;
 use std::fmt::Formatter;
 use std::sync::Arc;
 
+use crate::error::Result;
+use crate::physical_plan::aggregates::AggregateExec;
 use crate::physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use crate::physical_plan::joins::{HashJoinExec, NestedLoopJoinExec};
+use crate::physical_plan::joins::{CrossJoinExec, HashJoinExec, NestedLoopJoinExec};
 use crate::physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use crate::physical_plan::repartition::RepartitionExec;
 use crate::physical_plan::sorts::sort::SortExec;
@@ -163,4 +165,14 @@ pub fn is_hash_join(plan: &Arc<dyn ExecutionPlan>) -> bool {
 /// Checks whether the given operator is a [`NestedLoopJoinExec`].
 pub fn is_nested_loop_join(plan: &Arc<dyn ExecutionPlan>) -> bool {
     plan.as_any().is::<NestedLoopJoinExec>()
+}
+
+/// Checks whether the given operator is a [`CrossJoinExec`].
+pub fn is_cross_join(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    plan.as_any().is::<CrossJoinExec>()
+}
+
+/// Checks whether the given operator is an [`AggregateExec`].
+pub fn is_aggregate(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    plan.as_any().is::<AggregateExec>()
 }

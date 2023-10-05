@@ -31,6 +31,7 @@ use crate::joins::utils::{
     JoinSide,
 };
 use crate::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
+use crate::projection::ProjectionExec;
 use crate::stream::RecordBatchBroadcastStreamsBuilder;
 use crate::{
     metrics, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning,
@@ -41,8 +42,7 @@ use arrow::array::{UInt32Array, UInt32Builder, UInt64Array, UInt64Builder};
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{internal_err, DataFusionError, Result, Statistics};
-use datafusion_execution::memory_pool::MemoryConsumer;
-use datafusion_execution::memory_pool::MemoryReservation;
+use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::TaskContext;
 use datafusion_expr::JoinType;
 use datafusion_physical_expr::intervals::ExprIntervalGraph;
@@ -51,7 +51,6 @@ use datafusion_physical_expr::{
     PhysicalSortRequirement,
 };
 
-use crate::projection::ProjectionExec;
 use futures::{ready, Stream, StreamExt};
 use hashbrown::HashSet;
 use parking_lot::Mutex;
@@ -230,6 +229,20 @@ impl SlidingNestedLoopJoinExec {
         })
     }
 
+    /// Calculate order preservation flags for this join.
+    fn maintains_input_order(join_type: JoinType) -> Vec<bool> {
+        vec![
+            false,
+            matches!(
+                join_type,
+                JoinType::Inner
+                    | JoinType::Right
+                    | JoinType::RightAnti
+                    | JoinType::RightSemi
+            ),
+        ]
+    }
+
     /// left (build) side which gets hashed
     pub fn left(&self) -> &Arc<dyn ExecutionPlan> {
         &self.left
@@ -258,20 +271,6 @@ impl SlidingNestedLoopJoinExec {
     /// Get right_sort_exprs
     pub fn right_sort_exprs(&self) -> &Vec<PhysicalSortExpr> {
         &self.right_sort_exprs
-    }
-
-    /// Calculate order preservation flags for this join.
-    fn maintains_input_order(join_type: JoinType) -> Vec<bool> {
-        vec![
-            false,
-            matches!(
-                join_type,
-                JoinType::Inner
-                    | JoinType::Right
-                    | JoinType::RightAnti
-                    | JoinType::RightSemi
-            ),
-        ]
     }
 
     /// In this section, we are employing the strategy of broadcasting
