@@ -635,7 +635,7 @@ impl ProbeBuffer {
     ///
     /// # Returns
     ///
-    /// A new `BuildSideBuffer`.    
+    /// A new `BuildSideBuffer`.
     pub fn new(schema: SchemaRef, on: Vec<Column>) -> Self {
         Self {
             current_batch: RecordBatch::new_empty(schema),
@@ -648,7 +648,7 @@ impl ProbeBuffer {
     ///
     /// # Returns
     ///
-    /// The size of this `ProbeBuffer` in bytes.    
+    /// The size of this `ProbeBuffer` in bytes.
     pub fn size(&self) -> usize {
         let mut size = 0;
         size += self.current_batch.get_array_memory_size();

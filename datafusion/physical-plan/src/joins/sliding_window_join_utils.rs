@@ -7,7 +7,9 @@ use crate::joins::{
     },
     utils::{
         append_right_indices, get_anti_indices, get_build_side_pruned_exprs,
-        get_filter_representation_of_build_side, get_semi_indices, JoinFilter, JoinSide,
+        get_filter_representation_of_build_side,
+        get_filter_representation_schema_of_build_side, get_semi_indices, JoinFilter,
+        JoinSide,
     },
 };
 
@@ -25,8 +27,22 @@ use datafusion_physical_expr::{
 
 use hashbrown::HashSet;
 
-/// This function checks if the batch offers a reference value that enables us
-/// to tell whether is falls in the viable sliding window via interval analysis.
+/// Determines if the given batch is suitable for interval calculations based on the join
+/// filter and sorted filter expressions.
+///
+/// The function evaluates the latest row of the batch for each sorted filter expression.
+/// It is considered suitable if the evaluated value for all sorted filter expressions are non-null.
+/// Empty batches are deemed unsuitable by default.
+///
+/// # Arguments
+/// * `filter`: The `JoinFilter` used to determine the suitability of the batch.
+/// * `probe_sorted_filter_exprs`: A slice of sorted filter expressions used to evaluate the suitability of the batch.
+/// * `batch`: The `RecordBatch` to evaluate.
+/// * `build_side`: The side of the join operation (either `JoinSide::Left` or `JoinSide::Right`).
+///
+/// # Returns
+/// * A `Result` containing a boolean value. Returns `true` if the batch is suitable for interval calculation, `false` otherwise.
+///
 pub fn is_batch_suitable_interval_calculation(
     filter: &JoinFilter,
     probe_sorted_filter_exprs: &[SortedFilterExpr],
@@ -62,9 +78,26 @@ pub fn is_batch_suitable_interval_calculation(
     Ok(result.into_iter().all(|b| b))
 }
 
-/// This function takes a batch of data from the probe side, calculates the
-/// interval for the build side filter expression, and updates the probe
-/// buffer and the stream state accordingly.
+/// Calculates the necessary build-side range for join pruning.
+///
+/// Given a join filter, build inner buffer, and the current state of the expression graph,
+/// this function computes the interval range for the build side filter expression and then
+/// updates the expression graph with the calculated interval range. This aids in optimizing
+/// the join operation by pruning unnecessary rows from the build side and fetching just enough
+/// batch.
+///
+/// # Arguments
+/// * `filter`: The join filter which dictates the join condition.
+/// * `build_inner_buffer`: The record batch representing the build side of the join.
+/// * `graph`: The current state of the expression interval graph to be updated.
+/// * `build_sorted_filter_exprs`: Sorted filter expressions related to the build side.
+/// * `probe_sorted_filter_exprs`: Sorted filter expressions related to the probe side.
+/// * `probe_batch`: The probe record batch.
+///
+/// # Returns
+/// * A vector of tuples containing the physical sort expression and its associated interval
+///   for the build side. These tuples represent the range in which join pruning can occur
+///   for each expression.
 pub fn calculate_the_necessary_build_side_range(
     filter: &JoinFilter,
     build_inner_buffer: &RecordBatch,
@@ -78,7 +111,6 @@ pub fn calculate_the_necessary_build_side_range(
         filter,
         build_inner_buffer,
         build_sorted_filter_exprs,
-        JoinSide::Left,
         probe_batch,
         probe_sorted_filter_exprs,
         JoinSide::Right,
@@ -98,14 +130,11 @@ pub fn calculate_the_necessary_build_side_range(
     // Update the physical expression graph using the join filter intervals:
     graph.update_ranges(&mut filter_intervals)?;
 
-    let intermediate_batch = get_filter_representation_of_build_side(
+    let intermediate_schema = get_filter_representation_schema_of_build_side(
         filter.schema(),
-        build_inner_buffer,
         filter.column_indices(),
         JoinSide::Left,
     )?;
-
-    let intermediate_schema = intermediate_batch.schema();
 
     // Filter expressions that can shrink.
     let shrunk_exprs = graph.get_deepest_pruning_exprs()?;
@@ -113,9 +142,22 @@ pub fn calculate_the_necessary_build_side_range(
     get_build_side_pruned_exprs(shrunk_exprs, intermediate_schema, filter, JoinSide::Left)
 }
 
-/// Checks whether the given reference value (i.e. `latest_value`) falls within
-/// the viable sliding window specified by `interval` according to the sort
-/// options of the join in question (i.e. `sort_options`).
+/// Checks if the sliding window condition is met for the join operation.
+///
+/// This function evaluates the incoming build batch against a set of intervals
+/// to determine whether the sliding window condition has been satisfied. It assesses
+/// that the current window has captured all the relevant rows for the join.
+///
+/// # Arguments
+/// * `filter`: The join filter defining the join condition.
+/// * `incoming_build_batch`: The incoming record batch from the build side.
+/// * `intervals`: A set of intervals representing the build side's boundaries
+///   against which the incoming batch is evaluated.
+///
+/// # Returns
+/// * A boolean value indicating if the sliding window condition is met:
+///   * `true` if all rows necessary from the build side for this window have been processed.
+///   * `false` otherwise.
 pub fn check_if_sliding_window_condition_is_met(
     filter: &JoinFilter,
     incoming_build_batch: &RecordBatch,
@@ -137,6 +179,9 @@ pub fn check_if_sliding_window_condition_is_met(
                 .evaluate(&latest_build_intermediate_batch)?
                 .into_array(1);
             let latest_value = ScalarValue::try_from_array(&array, 0)?;
+            if latest_value.is_null() {
+                return Ok(false);
+            }
             Ok(if sorted_shrunk_expr.options.descending {
                 // Data is sorted in descending order, so check if latest value is less
                 // than the lower bound of the interval. If it is, we must have processed
@@ -153,10 +198,18 @@ pub fn check_if_sliding_window_condition_is_met(
     Ok(results.iter().all(|e| *e))
 }
 
-/// This function combines the given batches into a probe batch.
-pub fn get_probe_batch(
-    mut batches: Vec<RecordBatch>,
-) -> datafusion_common::Result<RecordBatch> {
+/// Constructs a single `RecordBatch` from a vector of `RecordBatch`es.
+///
+/// If there's only one batch in the vector, it's directly returned. Otherwise,
+/// all the batches are concatenated to produce a single `RecordBatch`.
+///
+/// # Arguments
+/// * `batches`: A vector of `RecordBatch`es to be combined into a single batch.
+///
+/// # Returns
+/// * A `Result` containing a single `RecordBatch` or an error if the concatenation fails.
+///
+pub fn get_probe_batch(mut batches: Vec<RecordBatch>) -> Result<RecordBatch> {
     let probe_batch = if batches.len() == 1 {
         batches.remove(0)
     } else {
@@ -432,22 +485,14 @@ pub(crate) fn update_filter_expr_bounds(
     filter: &JoinFilter,
     build_inner_buffer: &RecordBatch,
     build_sorted_filter_exprs: &mut [SortedFilterExpr],
-    build_side: JoinSide,
     probe_batch: &RecordBatch,
     probe_sorted_filter_exprs: &mut [SortedFilterExpr],
     probe_side: JoinSide,
 ) -> Result<()> {
-    let build_intermediate_batch = get_filter_representation_of_build_side(
-        filter.schema(),
-        &build_inner_buffer.slice(0, 0),
-        filter.column_indices(),
-        build_side,
-    )?;
     // Evaluate the build side order expression to get datatype:
     let build_order_datatype = build_sorted_filter_exprs[0]
         .intermediate_batch_filter_expr()
-        .evaluate(&build_intermediate_batch)?
-        .data_type();
+        .data_type(&build_inner_buffer.schema())?;
 
     // Create a null scalar value with the obtained datatype:
     let null_scalar = ScalarValue::try_from(build_order_datatype)?;

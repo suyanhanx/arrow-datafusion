@@ -1526,7 +1526,7 @@ pub fn swap_join_on(on: &JoinOn) -> JoinOn {
 }
 
 /// Swaps join sides for filter column indices and produces new JoinFilter
-pub(crate) fn swap_filter(filter: &JoinFilter) -> JoinFilter {
+pub fn swap_filter(filter: &JoinFilter) -> JoinFilter {
     let column_indices = filter
         .column_indices()
         .iter()
@@ -1540,11 +1540,6 @@ pub(crate) fn swap_filter(filter: &JoinFilter) -> JoinFilter {
         column_indices,
         filter.schema().clone(),
     )
-}
-
-/// Swaps join sides for filter column indices and produces new `JoinFilter` (if exists).
-pub fn swap_join_filter(filter: Option<&JoinFilter>) -> Option<JoinFilter> {
-    filter.map(swap_filter)
 }
 
 /// This function returns the new join type we get after swapping the given

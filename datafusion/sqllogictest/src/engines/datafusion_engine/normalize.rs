@@ -15,21 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::util::display::ArrayFormatter;
-use arrow::{array, array::ArrayRef, datatypes::DataType, record_batch::RecordBatch};
-use datafusion_common::format::DEFAULT_FORMAT_OPTIONS;
-use datafusion_common::DFField;
-use datafusion_common::DataFusionError;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use crate::engines::output::DFColumnType;
-
 use super::super::conversion::*;
 use super::error::{DFSqlLogicTestError, Result};
+use crate::engines::output::DFColumnType;
+
+use arrow::util::display::ArrayFormatter;
+use arrow::{array, array::ArrayRef, datatypes::DataType, record_batch::RecordBatch};
+use datafusion_common::format::DEFAULT_FORMAT_OPTIONS;
+use datafusion_common::{DFField, DataFusionError};
 
 /// Converts `batches` to a result as expected by sqllogicteset.
-pub(crate) fn convert_batches(batches: Vec<RecordBatch>) -> Result<Vec<Vec<String>>> {
+pub fn convert_batches(batches: Vec<RecordBatch>) -> Result<Vec<Vec<String>>> {
     if batches.is_empty() {
         Ok(vec![])
     } else {

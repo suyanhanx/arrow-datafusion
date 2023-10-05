@@ -191,6 +191,22 @@ impl ExecutionPlan for NestedLoopJoinExec {
         distribution_from_join_type(&self.join_type)
     }
 
+    fn unbounded_output(&self, children: &[bool]) -> Result<bool> {
+        let (left, right) = (children[0], children[1]);
+        if left || right {
+            plan_err!(
+                "Join Error: The join with cannot be executed with unbounded inputs. {}",
+                if left && right {
+                    "Currently, we do not support unbounded inputs on both sides."
+                } else {
+                    "Please consider a different type of join."
+                }
+            )
+        } else {
+            Ok(false)
+        }
+    }
+
     fn equivalence_properties(&self) -> EquivalenceProperties {
         join_equivalence_properties(
             self.left.equivalence_properties(),
@@ -744,21 +760,15 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::{
-        common, expressions::Column, memory::MemoryExec, repartition::RepartitionExec,
-        test::build_table_i32,
-    };
+    use crate::joins::test_utils::partitioned_nested_join_with_filter;
+    use crate::joins::utils::JoinSide;
+    use crate::{expressions::Column, memory::MemoryExec, repartition::RepartitionExec, test::build_table_i32};
 
     use arrow::datatypes::{DataType, Field};
     use datafusion_common::{assert_batches_sorted_eq, assert_contains, ScalarValue};
     use datafusion_execution::runtime_env::{RuntimeConfig, RuntimeEnv};
     use datafusion_expr::Operator;
     use datafusion_physical_expr::expressions::{BinaryExpr, Literal};
-
-    use crate::physical_plan::joins::test_utils::partitioned_nested_join_with_filter;
-    use crate::joins::utils::JoinSide;
-    use datafusion_common::{assert_batches_sorted_eq, assert_contains, ScalarValue};
-    use datafusion_physical_expr::expressions::Literal;
     use datafusion_physical_expr::PhysicalExpr;
 
     fn build_table(
@@ -831,62 +841,13 @@ mod tests {
         JoinFilter::new(filter_expression, column_indices, intermediate_schema)
     }
 
-    async fn multi_partitioned_join_collect(
-        left: Arc<dyn ExecutionPlan>,
-        right: Arc<dyn ExecutionPlan>,
-        join_type: &JoinType,
-        join_filter: Option<JoinFilter>,
-        context: Arc<TaskContext>,
-    ) -> Result<(Vec<String>, Vec<RecordBatch>)> {
-        let partition_count = 4;
-        let mut output_partition = 1;
-        let distribution = distribution_from_join_type(join_type);
-        // left
-        let left = if matches!(distribution[0], Distribution::SinglePartition) {
-            left
-        } else {
-            output_partition = partition_count;
-            Arc::new(RepartitionExec::try_new(
-                left,
-                Partitioning::RoundRobinBatch(partition_count),
-            )?)
-        } as Arc<dyn ExecutionPlan>;
-
-        let right = if matches!(distribution[1], Distribution::SinglePartition) {
-            right
-        } else {
-            output_partition = partition_count;
-            Arc::new(RepartitionExec::try_new(
-                right,
-                Partitioning::RoundRobinBatch(partition_count),
-            )?)
-        } as Arc<dyn ExecutionPlan>;
-
-        // Use the required distribution for nested loop join to test partition data
-        let nested_loop_join =
-            NestedLoopJoinExec::try_new(left, right, join_filter, join_type)?;
-        let columns = columns(&nested_loop_join.schema());
-        let mut batches = vec![];
-        for i in 0..output_partition {
-            let stream = nested_loop_join.execute(i, context.clone())?;
-            let more_batches = common::collect(stream).await?;
-            batches.extend(
-                more_batches
-                    .into_iter()
-                    .filter(|b| b.num_rows() > 0)
-                    .collect::<Vec<_>>(),
-            );
-        }
-        Ok((columns, batches))
-    }
-
     #[tokio::test]
     async fn join_inner_with_filter() -> Result<()> {
         let task_ctx = Arc::new(TaskContext::default());
         let left = build_left_table();
         let right = build_right_table();
         let filter = prepare_join_filter();
-        let (columns, batches) = multi_partitioned_join_collect(
+        let (columns, batches) = partitioned_nested_join_with_filter(
             left,
             right,
             &JoinType::Inner,
@@ -915,7 +876,7 @@ mod tests {
         let right = build_right_table();
 
         let filter = prepare_join_filter();
-        let (columns, batches) = multi_partitioned_join_collect(
+        let (columns, batches) = partitioned_nested_join_with_filter(
             left,
             right,
             &JoinType::Left,
@@ -946,7 +907,7 @@ mod tests {
         let right = build_right_table();
 
         let filter = prepare_join_filter();
-        let (columns, batches) = multi_partitioned_join_collect(
+        let (columns, batches) = partitioned_nested_join_with_filter(
             left,
             right,
             &JoinType::Right,
@@ -977,7 +938,7 @@ mod tests {
         let right = build_right_table();
 
         let filter = prepare_join_filter();
-        let (columns, batches) = multi_partitioned_join_collect(
+        let (columns, batches) = partitioned_nested_join_with_filter(
             left,
             right,
             &JoinType::Full,
@@ -1010,7 +971,7 @@ mod tests {
         let right = build_right_table();
 
         let filter = prepare_join_filter();
-        let (columns, batches) = multi_partitioned_join_collect(
+        let (columns, batches) = partitioned_nested_join_with_filter(
             left,
             right,
             &JoinType::LeftSemi,
@@ -1039,7 +1000,7 @@ mod tests {
         let right = build_right_table();
 
         let filter = prepare_join_filter();
-        let (columns, batches) = multi_partitioned_join_collect(
+        let (columns, batches) = partitioned_nested_join_with_filter(
             left,
             right,
             &JoinType::LeftAnti,
@@ -1069,7 +1030,7 @@ mod tests {
         let right = build_right_table();
 
         let filter = prepare_join_filter();
-        let (columns, batches) = multi_partitioned_join_collect(
+        let (columns, batches) = partitioned_nested_join_with_filter(
             left,
             right,
             &JoinType::RightSemi,
@@ -1098,7 +1059,7 @@ mod tests {
         let right = build_right_table();
 
         let filter = prepare_join_filter();
-        let (columns, batches) = multi_partitioned_join_collect(
+        let (columns, batches) = partitioned_nested_join_with_filter(
             left,
             right,
             &JoinType::RightAnti,
@@ -1152,7 +1113,7 @@ mod tests {
             let task_ctx = TaskContext::default().with_runtime(runtime);
             let task_ctx = Arc::new(task_ctx);
 
-            let err = multi_partitioned_join_collect(
+            let err = partitioned_nested_join_with_filter(
                 left.clone(),
                 right.clone(),
                 &join_type,
@@ -1170,10 +1131,5 @@ mod tests {
         }
 
         Ok(())
-    }
-
-    /// Returns the column names on the schema
-    fn columns(schema: &Schema) -> Vec<String> {
-        schema.fields().iter().map(|f| f.name().clone()).collect()
     }
 }
