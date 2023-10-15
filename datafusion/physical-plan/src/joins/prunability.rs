@@ -211,7 +211,7 @@ impl ExprPrunability {
         self.expr
             .children()
             .into_iter()
-            .map(|e| ExprPrunability::new(e))
+            .map(ExprPrunability::new)
             .collect()
     }
 

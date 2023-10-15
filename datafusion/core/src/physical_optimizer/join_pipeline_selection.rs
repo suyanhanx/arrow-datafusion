@@ -121,7 +121,7 @@ impl PlanState {
         self.plans[0]
             .children()
             .into_iter()
-            .map(|child| PlanState::new(child))
+            .map(PlanState::new)
             .collect()
     }
 }
@@ -1786,7 +1786,6 @@ mod order_preserving_join_swap_tests {
                 )
                 .unwrap()],
                 input.clone(),
-                input.schema(),
                 vec![],
                 crate::physical_plan::windows::PartitionSearchMode::Sorted,
             )
@@ -4060,7 +4059,7 @@ mod sql_fuzzy_tests {
         let config = SessionConfig::new()
             .with_target_partitions(1)
             .with_repartition_joins(false);
-        let ctx = SessionContext::with_config(config);
+        let ctx = SessionContext::new_with_config(config);
         let tables = ["orders", "lineitem", "customer", "nation", "region"];
         let can_be_infinite = [true, true, true, true, false];
         let ordered_columns = [
