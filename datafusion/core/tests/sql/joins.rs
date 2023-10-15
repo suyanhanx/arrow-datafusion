@@ -124,11 +124,11 @@ async fn join_change_in_planner() -> Result<()> {
         [
             "SlidingHashJoinExec: join_type=Full, on=[(a2@1, a2@1)], filter=CAST(a1@0 AS Int64) > CAST(a1@1 AS Int64) + 3 AND CAST(a1@0 AS Int64) < CAST(a1@1 AS Int64) + 10",
             "  CoalesceBatchesExec: target_batch_size=8192",
-            "    SortPreservingRepartitionExec: partitioning=Hash([a2@1], 8), input_partitions=8",
+            "    SortPreservingRepartitionExec: partitioning=Hash([a2@1], 8), input_partitions=8, sort_exprs=a1@0 ASC NULLS LAST",
             "      RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1",
             // "     CsvExec: file_groups={1 group: [[tempdir/left.csv]]}, projection=[a1, a2], has_header=false",
             "  CoalesceBatchesExec: target_batch_size=8192",
-            "    SortPreservingRepartitionExec: partitioning=Hash([a2@1], 8), input_partitions=8",
+            "    SortPreservingRepartitionExec: partitioning=Hash([a2@1], 8), input_partitions=8, sort_exprs=a1@0 ASC NULLS LAST",
             "      RepartitionExec: partitioning=RoundRobinBatch(8), input_partitions=1",
             // "     CsvExec: file_groups={1 group: [[tempdir/right.csv]]}, projection=[a1, a2], has_header=false"
         ]
