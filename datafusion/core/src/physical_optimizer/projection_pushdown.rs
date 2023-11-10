@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Copyright (C) Synnada, Inc. - All Rights Reserved.
+// This file does not contain any Apache Software Foundation copyrighted code.
+
 //! This file implements the `ProjectionPushdown` physical optimization rule.
 //! The function [`remove_unnecessary_projections`] tries to push down all
 //! projections one by one if the operator below is amenable to this. If a
@@ -29,10 +32,10 @@ use crate::datasource::physical_plan::CsvExec;
 use crate::error::Result;
 use crate::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use crate::physical_plan::filter::FilterExec;
-use crate::physical_plan::joins::utils::{ColumnIndex, JoinFilter};
+use crate::physical_plan::joins::utils::{ColumnIndex, JoinFilter, JoinSide};
 use crate::physical_plan::joins::{
-    CrossJoinExec, HashJoinExec, NestedLoopJoinExec, SortMergeJoinExec,
-    SymmetricHashJoinExec,
+    CrossJoinExec, HashJoinExec, NestedLoopJoinExec, SlidingHashJoinExec,
+    SortMergeJoinExec, SymmetricHashJoinExec,
 };
 use crate::physical_plan::memory::MemoryExec;
 use crate::physical_plan::projection::ProjectionExec;
@@ -133,6 +136,8 @@ pub fn remove_unnecessary_projections(
             try_swapping_with_cross_join(projection, cross_join)?
         } else if let Some(nl_join) = input.downcast_ref::<NestedLoopJoinExec>() {
             try_swapping_with_nested_loop_join(projection, nl_join)?
+        } else if let Some(sh_join) = input.downcast_ref::<SlidingHashJoinExec>() {
+            try_swapping_with_sliding_hash_join(projection, sh_join)?
         } else if let Some(sm_join) = input.downcast_ref::<SortMergeJoinExec>() {
             try_swapping_with_sort_merge_join(projection, sm_join)?
         } else if let Some(sym_join) = input.downcast_ref::<SymmetricHashJoinExec>() {
@@ -679,6 +684,85 @@ fn try_swapping_with_nested_loop_join(
     )?)))
 }
 
+/// Tries to swap the projection with its input [`SlidingHashJoinExec`]. If it can be done,
+/// it returns the new swapped version having the [`SlidingHashJoinExec`] as the top plan.
+/// Otherwise, it returns None.
+fn try_swapping_with_sliding_hash_join(
+    projection: &ProjectionExec,
+    sh_join: &SlidingHashJoinExec,
+) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    // Convert projected PhysicalExpr's to columns. If not possible, we cannot proceed.
+    let Some(projection_as_columns) = physical_to_column_exprs(projection.expr()) else {
+        return Ok(None);
+    };
+
+    let (far_right_left_col_ind, far_left_right_col_ind) = join_table_borders(
+        sh_join.left().schema().fields().len(),
+        &projection_as_columns,
+    );
+
+    if !join_allows_pushdown(
+        &projection_as_columns,
+        sh_join.schema(),
+        far_right_left_col_ind,
+        far_left_right_col_ind,
+    ) {
+        return Ok(None);
+    }
+
+    let Some(new_on) = update_join_on(
+        &projection_as_columns[0..=far_right_left_col_ind as _],
+        &projection_as_columns[far_left_right_col_ind as _..],
+        sh_join.on(),
+    ) else {
+        return Ok(None);
+    };
+
+    let Some(new_filter) = update_join_filter(
+        &projection_as_columns[0..=far_right_left_col_ind as _],
+        &projection_as_columns[far_left_right_col_ind as _..],
+        sh_join.filter(),
+        sh_join.left(),
+        sh_join.right(),
+    ) else {
+        return Ok(None);
+    };
+
+    let (new_left_sort, new_right_sort) = match (
+        update_sort_expr(
+            sh_join.left_sort_exprs(),
+            &projection.expr()[0..=far_right_left_col_ind as _],
+        )?,
+        update_sort_expr(
+            sh_join.right_sort_exprs(),
+            &projection.expr()[far_left_right_col_ind as _..],
+        )?,
+    ) {
+        (Some(left), Some(right)) => (left, right),
+        _ => return Ok(None),
+    };
+
+    let (new_left, new_right) = new_join_children(
+        projection_as_columns,
+        far_right_left_col_ind,
+        far_left_right_col_ind,
+        sh_join.left(),
+        sh_join.right(),
+    )?;
+
+    Ok(Some(Arc::new(SlidingHashJoinExec::try_new(
+        Arc::new(new_left),
+        Arc::new(new_right),
+        new_on,
+        new_filter,
+        sh_join.join_type(),
+        sh_join.null_equals_null(),
+        new_left_sort,
+        new_right_sort,
+        *sh_join.partition_mode(),
+    )?)))
+}
+
 /// Tries to swap the projection with its input [`SortMergeJoinExec`]. If it can be done,
 /// it returns the new swapped version having the [`SortMergeJoinExec`] as the top plan.
 /// Otherwise, it returns None.
@@ -876,7 +960,6 @@ fn update_expr(
         /// references could not be.
         RewrittenInvalid,
     }
-
     let mut state = RewriteState::Unchanged;
 
     let new_expr = expr
@@ -1156,6 +1239,25 @@ fn new_join_children(
     Ok((new_left, new_right))
 }
 
+/// [`PhysicalSortExpr`] handler version of update_expr() function.
+fn update_sort_expr(
+    sort_exprs: &[PhysicalSortExpr],
+    projected_exprs: &[(Arc<dyn PhysicalExpr>, String)],
+) -> Result<Option<Vec<PhysicalSortExpr>>> {
+    let mut new_sort_exprs = vec![];
+    for sort_expr in sort_exprs {
+        let Some(updated_expr) = update_expr(&sort_expr.expr, projected_exprs, false)?
+        else {
+            return Ok(None);
+        };
+        new_sort_exprs.push(PhysicalSortExpr {
+            expr: updated_expr,
+            options: sort_expr.options,
+        })
+    }
+    Ok(Some(new_sort_exprs))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1170,7 +1272,7 @@ mod tests {
     use crate::physical_optimizer::PhysicalOptimizerRule;
     use crate::physical_plan::coalesce_partitions::CoalescePartitionsExec;
     use crate::physical_plan::filter::FilterExec;
-    use crate::physical_plan::joins::utils::{ColumnIndex, JoinFilter};
+    use crate::physical_plan::joins::utils::{ColumnIndex, JoinFilter, JoinSide};
     use crate::physical_plan::joins::StreamJoinPartitionMode;
     use crate::physical_plan::memory::MemoryExec;
     use crate::physical_plan::projection::ProjectionExec;
@@ -1192,7 +1294,7 @@ mod tests {
         Distribution, Partitioning, PhysicalExpr, PhysicalSortExpr,
         PhysicalSortRequirement, ScalarFunctionExpr,
     };
-    use datafusion_physical_plan::joins::SymmetricHashJoinExec;
+    use datafusion_physical_plan::joins::{SymmetricHashJoinExec, SlidingHashJoinExec};
     use datafusion_physical_plan::streaming::{PartitionStream, StreamingTableExec};
     use datafusion_physical_plan::union::UnionExec;
 

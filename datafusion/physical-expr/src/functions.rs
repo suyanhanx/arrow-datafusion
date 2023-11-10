@@ -30,26 +30,28 @@
 //! an argument i32 is passed to a function that supports f64, the
 //! argument is automatically is coerced to f64.
 
+use std::ops::Neg;
+use std::sync::Arc;
+
 use crate::execution_props::ExecutionProps;
+use crate::expressions::{cast_column, nullif_func};
 use crate::sort_properties::SortProperties;
 use crate::{
     array_expressions, conditional_expressions, datetime_expressions,
     expressions::nullif_func, math_expressions, string_expressions, struct_expressions,
     PhysicalExpr, ScalarFunctionExpr,
 };
+
 use arrow::{
     array::ArrayRef,
     compute::kernels::length::{bit_length, length},
-    datatypes::{DataType, Int32Type, Int64Type, Schema},
+    datatypes::{DataType, Int32Type, Int64Type, Schema, TimeUnit},
 };
 use datafusion_common::{internal_err, DataFusionError, Result, ScalarValue};
-pub use datafusion_expr::FuncMonotonicity;
 use datafusion_expr::{
     type_coercion::functions::data_types, BuiltinScalarFunction, ColumnarValue,
     ScalarFunctionImplementation,
 };
-use std::ops::Neg;
-use std::sync::Arc;
 
 /// Create a physical (function) expression.
 /// This function errors when `args`' can't be coerced to a valid argument type of the function.
@@ -979,8 +981,8 @@ fn func_order_in_one_dimension(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::expressions::try_cast;
-    use crate::expressions::{col, lit};
+    use crate::expressions::{col, lit, try_cast};
+
     use arrow::{
         array::{
             Array, ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array,
@@ -990,8 +992,7 @@ mod tests {
         record_batch::RecordBatch,
     };
     use datafusion_common::cast::as_uint64_array;
-    use datafusion_common::{exec_err, plan_err};
-    use datafusion_common::{Result, ScalarValue};
+    use datafusion_common::{exec_err, plan_err, Result, ScalarValue};
     use datafusion_expr::type_coercion::functions::data_types;
     use datafusion_expr::Signature;
 
