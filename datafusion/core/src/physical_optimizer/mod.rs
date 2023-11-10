@@ -34,12 +34,13 @@ pub mod pipeline_checker;
 mod projection_pushdown;
 pub mod pruning;
 pub mod replace_with_order_preserving_variants;
-mod sort_pushdown;
-pub mod topk_aggregation;
-mod utils;
-
-mod join_pipeline_selection;
 #[cfg(test)]
 pub mod test_utils;
+pub mod topk_aggregation;
+
+mod join_pipeline_selection;
+mod projection_pushdown;
+mod sort_pushdown;
+mod utils;
 
 pub use optimizer::PhysicalOptimizerRule;

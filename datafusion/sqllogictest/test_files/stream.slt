@@ -200,10 +200,8 @@ ProjectionExec: expr=[ROW_NUMBER() ORDER BY [u.ts ASC NULLS LAST] RANGE BETWEEN 
 --BoundedWindowAggExec: wdw=[ROW_NUMBER() ORDER BY [u.ts ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW: Ok(Field { name: "ROW_NUMBER() ORDER BY [u.ts ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW", data_type: UInt64, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(IntervalMonthDayNano("NULL")), end_bound: CurrentRow }], mode=[Sorted]
 ----SortPreservingMergeExec: [ts@0 ASC NULLS LAST]
 ------UnionExec
---------ProjectionExec: expr=[ts@0 as ts, currency@2 as currency, amount@1 as amount]
-----------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/sales_us.csv]]}, projection=[ts, amount, currency], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST], has_header=true
---------ProjectionExec: expr=[ts@0 as ts, currency@2 as currency, amount@1 as amount]
-----------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/sales_global.csv]]}, projection=[ts, amount, currency], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST], has_header=true
+--------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/sales_us.csv]]}, projection=[ts, currency, amount], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST], has_header=true
+--------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/sales_global.csv]]}, projection=[ts, currency, amount], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST], has_header=true
 
 query PIT
 SELECT * EXCLUDE(sn) FROM sales_us LIMIT 5
@@ -297,21 +295,19 @@ ProjectionExec: expr=[amount_usd@0 as amount_usd]
 --------CoalesceBatchesExec: target_batch_size=8192
 ----------SortPreservingRepartitionExec: partitioning=Hash([sn@0], 4), input_partitions=4, sort_exprs=sn@0 ASC NULLS LAST
 ------------AggregateExec: mode=Partial, gby=[sn@0 as sn], aggr=[LAST_VALUE(e.rate)], ordering_mode=FullyOrdered
---------------ProjectionExec: expr=[sn@1 as sn, sn2@4 as sn2, rate@6 as rate]
-----------------ProjectionExec: expr=[ts@4 as ts, sn@5 as sn, currency@6 as currency, ts@0 as ts, sn2@1 as sn2, currency_from@2 as currency_from, rate@3 as rate]
-------------------PartitionedHashJoinExec: join_type=Inner, on=[(currency_from@2, currency@2)], filter=ts@0 >= ts@1
---------------------CoalesceBatchesExec: target_batch_size=8192
-----------------------SortPreservingRepartitionExec: partitioning=Hash([currency_from@2], 4), input_partitions=4, sort_exprs=sn2@1 ASC NULLS LAST
-------------------------ProjectionExec: expr=[ts@0 as ts, sn2@1 as sn2, currency_from@2 as currency_from, rate@4 as rate]
---------------------------CoalesceBatchesExec: target_batch_size=8192
-----------------------------FilterExec: currency_to@3 = USD
-------------------------------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
---------------------------------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/exchange_rates.csv]]}, projection=[ts, sn2, currency_from, currency_to, rate], infinite_source=true, output_ordering=[sn2@1 ASC NULLS LAST], has_header=true
---------------------CoalesceBatchesExec: target_batch_size=8192
-----------------------SortPreservingRepartitionExec: partitioning=Hash([currency@2], 4), input_partitions=4, sort_exprs=sn@1 ASC NULLS LAST
-------------------------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
---------------------------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/sales_global.csv]]}, projection=[ts, sn, currency], infinite_source=true, output_ordering=[sn@1 ASC NULLS LAST], has_header=true
-
+--------------ProjectionExec: expr=[sn@5 as sn, sn2@1 as sn2, rate@3 as rate]
+----------------PartitionedHashJoinExec: join_type=Inner, on=[(currency_from@2, currency@2)], filter=ts@0 >= ts@1
+------------------CoalesceBatchesExec: target_batch_size=8192
+--------------------SortPreservingRepartitionExec: partitioning=Hash([currency_from@2], 4), input_partitions=4, sort_exprs=sn2@1 ASC NULLS LAST
+----------------------ProjectionExec: expr=[ts@0 as ts, sn2@1 as sn2, currency_from@2 as currency_from, rate@4 as rate]
+------------------------CoalesceBatchesExec: target_batch_size=8192
+--------------------------FilterExec: currency_to@3 = USD
+----------------------------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+------------------------------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/exchange_rates.csv]]}, projection=[ts, sn2, currency_from, currency_to, rate], infinite_source=true, output_ordering=[sn2@1 ASC NULLS LAST], has_header=true
+------------------CoalesceBatchesExec: target_batch_size=8192
+--------------------SortPreservingRepartitionExec: partitioning=Hash([currency@2], 4), input_partitions=4, sort_exprs=sn@1 ASC NULLS LAST
+----------------------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+------------------------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/sales_global.csv]]}, projection=[ts, sn, currency], infinite_source=true, output_ordering=[sn@1 ASC NULLS LAST], has_header=true
 
 # Scalar Subquery not supported
 # SELECT s.*,
@@ -390,21 +386,19 @@ ProjectionExec: expr=[amount_usd@0 as amount_usd]
 --------CoalesceBatchesExec: target_batch_size=8192
 ----------SortPreservingRepartitionExec: partitioning=Hash([sn@0], 4), input_partitions=4, sort_exprs=sn@0 ASC NULLS LAST
 ------------AggregateExec: mode=Partial, gby=[sn@0 as sn], aggr=[AVG(e.rate)], ordering_mode=FullyOrdered
---------------ProjectionExec: expr=[sn@1 as sn, rate@5 as rate]
-----------------ProjectionExec: expr=[ts@3 as ts, sn@4 as sn, currency@5 as currency, ts@0 as ts, currency_from@1 as currency_from, rate@2 as rate]
-------------------SlidingHashJoinExec: join_type=Right, on=[(currency_from@1, currency@2)], filter=ts@0 >= ts@1 AND ts@1 >= ts@0 - 600000000000
---------------------CoalesceBatchesExec: target_batch_size=8192
-----------------------SortPreservingRepartitionExec: partitioning=Hash([currency_from@1], 4), input_partitions=4, sort_exprs=ts@0 ASC NULLS LAST
-------------------------ProjectionExec: expr=[ts@0 as ts, currency_from@1 as currency_from, rate@3 as rate]
---------------------------CoalesceBatchesExec: target_batch_size=8192
-----------------------------FilterExec: currency_to@2 = USD
-------------------------------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
---------------------------------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/exchange_rates.csv]]}, projection=[ts, currency_from, currency_to, rate], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST], has_header=true
---------------------CoalesceBatchesExec: target_batch_size=8192
-----------------------SortPreservingRepartitionExec: partitioning=Hash([currency@2], 4), input_partitions=4, sort_exprs=ts@0 ASC NULLS LAST
-------------------------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
---------------------------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/sales_global.csv]]}, projection=[ts, sn, currency], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST], has_header=true
-
+--------------ProjectionExec: expr=[sn@4 as sn, rate@2 as rate]
+----------------SlidingHashJoinExec: join_type=Right, on=[(currency_from@1, currency@2)], filter=ts@0 >= ts@1 AND ts@1 >= ts@0 - 600000000000
+------------------CoalesceBatchesExec: target_batch_size=8192
+--------------------SortPreservingRepartitionExec: partitioning=Hash([currency_from@1], 4), input_partitions=4, sort_exprs=ts@0 ASC NULLS LAST
+----------------------ProjectionExec: expr=[ts@0 as ts, currency_from@1 as currency_from, rate@3 as rate]
+------------------------CoalesceBatchesExec: target_batch_size=8192
+--------------------------FilterExec: currency_to@2 = USD
+----------------------------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+------------------------------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/exchange_rates.csv]]}, projection=[ts, currency_from, currency_to, rate], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST], has_header=true
+------------------CoalesceBatchesExec: target_batch_size=8192
+--------------------SortPreservingRepartitionExec: partitioning=Hash([currency@2], 4), input_partitions=4, sort_exprs=ts@0 ASC NULLS LAST
+----------------------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+------------------------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/sales_global.csv]]}, projection=[ts, sn, currency], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST], has_header=true
 
 # Explicit Windows in Joins
 
@@ -434,7 +428,6 @@ SortPreservingMergeExec: [ts@0 ASC NULLS LAST]
 --------SortPreservingRepartitionExec: partitioning=Hash([currency_from@2, currency_to@3], 4), input_partitions=4, sort_exprs=ts@0 ASC NULLS LAST
 ----------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
 ------------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/exchange_rates.csv]]}, projection=[ts, sn, currency_from, currency_to, rate], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST], has_header=true
-
 
 
 # Machine Learning via User-Defined Functions (UDFs)
