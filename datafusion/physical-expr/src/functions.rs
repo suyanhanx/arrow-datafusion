@@ -34,7 +34,6 @@ use std::ops::Neg;
 use std::sync::Arc;
 
 use crate::execution_props::ExecutionProps;
-use crate::expressions::{cast_column, nullif_func};
 use crate::sort_properties::SortProperties;
 use crate::{
     array_expressions, conditional_expressions, datetime_expressions,
@@ -45,12 +44,12 @@ use crate::{
 use arrow::{
     array::ArrayRef,
     compute::kernels::length::{bit_length, length},
-    datatypes::{DataType, Int32Type, Int64Type, Schema, TimeUnit},
+    datatypes::{DataType, Int32Type, Int64Type, Schema},
 };
 use datafusion_common::{internal_err, DataFusionError, Result, ScalarValue};
 use datafusion_expr::{
     type_coercion::functions::data_types, BuiltinScalarFunction, ColumnarValue,
-    ScalarFunctionImplementation,
+    FuncMonotonicity, ScalarFunctionImplementation,
 };
 
 /// Create a physical (function) expression.

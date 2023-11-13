@@ -12,23 +12,22 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use crate::common::AbortOnDropMany;
-use crate::joins::hash_join_utils::{
-    calculate_filter_expr_intervals, combine_two_batches, record_visited_indices,
-    SortedFilterExpr,
-};
 use crate::joins::nested_loop_join::distribution_from_join_type;
 use crate::joins::sliding_window_join_utils::{
     adjust_probe_side_indices_by_join_type, calculate_build_outer_indices_by_join_type,
     calculate_the_necessary_build_side_range, check_if_sliding_window_condition_is_met,
     get_probe_batch, is_batch_suitable_interval_calculation, JoinStreamState,
 };
+use crate::joins::stream_join_utils::{
+    calculate_filter_expr_intervals, combine_two_batches, record_visited_indices,
+    SortedFilterExpr,
+};
+use crate::joins::utils::calculate_prune_length_with_probe_batch_helper;
 use crate::joins::utils::{
     apply_join_filter_to_indices, build_batch_from_indices, build_join_schema,
-    calculate_join_output_ordering, calculate_prune_length_with_probe_batch_helper,
-    combine_join_equivalence_properties, combine_join_ordering_equivalence_properties,
-    estimate_join_statistics, partitioned_join_output_partitioning, prepare_sorted_exprs,
-    swap_filter, swap_join_type, swap_reverting_projection, ColumnIndex, JoinFilter,
-    JoinSide,
+    calculate_join_output_ordering, estimate_join_statistics,
+    partitioned_join_output_partitioning, prepare_sorted_exprs, swap_filter,
+    swap_join_type, swap_reverting_projection, ColumnIndex, JoinFilter,
 };
 use crate::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
 use crate::projection::ProjectionExec;
@@ -41,14 +40,15 @@ use crate::{
 use arrow::array::{UInt32Array, UInt32Builder, UInt64Array, UInt64Builder};
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use datafusion_common::{internal_err, DataFusionError, Result, Statistics};
-use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
-use datafusion_execution::TaskContext;
+use datafusion_common::{internal_err, DataFusionError, JoinSide, Result, Statistics};
+use datafusion_execution::{
+    memory_pool::{MemoryConsumer, MemoryReservation},
+    TaskContext,
+};
 use datafusion_expr::JoinType;
-use datafusion_physical_expr::intervals::ExprIntervalGraph;
 use datafusion_physical_expr::{
-    EquivalenceProperties, OrderingEquivalenceProperties, PhysicalSortExpr,
-    PhysicalSortRequirement,
+    equivalence::join_equivalence_properties, intervals::ExprIntervalGraph,
+    EquivalenceProperties, PhysicalSortExpr, PhysicalSortRequirement,
 };
 
 use futures::{ready, Stream, StreamExt};
@@ -209,7 +209,7 @@ impl SlidingNestedLoopJoinExec {
             left_schema.fields.len(),
             &Self::maintains_input_order(*join_type),
             Some(JoinSide::Right),
-        )?;
+        );
 
         Ok(SlidingNestedLoopJoinExec {
             left,
@@ -391,28 +391,15 @@ impl ExecutionPlan for SlidingNestedLoopJoinExec {
         Self::maintains_input_order(self.join_type)
     }
 
-    fn ordering_equivalence_properties(&self) -> OrderingEquivalenceProperties {
-        combine_join_ordering_equivalence_properties(
-            &self.join_type,
-            &self.left,
-            &self.right,
+    fn equivalence_properties(&self) -> EquivalenceProperties {
+        join_equivalence_properties(
+            self.left.equivalence_properties(),
+            self.right.equivalence_properties(),
+            self.join_type(),
             self.schema(),
             &self.maintains_input_order(),
             Some(JoinSide::Right),
-            self.equivalence_properties(),
-        )
-        .unwrap()
-    }
-
-    fn equivalence_properties(&self) -> EquivalenceProperties {
-        let left_columns_len = self.left.schema().fields.len();
-        combine_join_equivalence_properties(
-            self.join_type,
-            self.left.equivalence_properties(),
-            self.right.equivalence_properties(),
-            left_columns_len,
-            &[], // empty join keys
-            self.schema(),
+            &[],
         )
     }
 
@@ -492,12 +479,13 @@ impl ExecutionPlan for SlidingNestedLoopJoinExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn statistics(&self) -> Statistics {
+    fn statistics(&self) -> Result<Statistics> {
         estimate_join_statistics(
             self.left.clone(),
             self.right.clone(),
             vec![],
             &self.join_type,
+            &self.schema,
         )
     }
 }
@@ -1234,15 +1222,13 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::joins::hash_join_utils::tests::{
-        complicated_4_column_exprs, complicated_filter,
-    };
+    use crate::joins::test_utils::complicated_4_column_exprs;
     use crate::joins::test_utils::{
-        build_sides_record_batches, compare_batches, create_memory_table,
-        join_expr_tests_fixture_i32, partitioned_nested_join_with_filter,
-        partitioned_sliding_nested_join_with_filter, split_record_batches,
+        build_sides_record_batches, compare_batches, complicated_filter,
+        create_memory_table, join_expr_tests_fixture_i32,
+        partitioned_nested_join_with_filter, partitioned_sliding_nested_join_with_filter,
+        split_record_batches,
     };
-    use crate::joins::utils::JoinSide;
 
     use arrow::datatypes::{DataType, Field};
     use arrow_schema::SortOptions;

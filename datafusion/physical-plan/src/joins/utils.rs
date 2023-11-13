@@ -41,33 +41,25 @@ use arrow::array::{
 use arrow::compute;
 use arrow::datatypes::{Field, Schema, SchemaBuilder};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
+use arrow_schema::SchemaRef;
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::stats::Precision;
-use datafusion_common::tree_node::{Transformed, TreeNode, VisitRecursion};
+use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::utils::bisect;
 use datafusion_common::{
-    plan_datafusion_err, plan_err, DataFusionError, JoinSide, JoinType, Result,
-    SharedResult,
+    plan_err, DataFusionError, JoinSide, JoinType, Result, SharedResult,
 };
 use datafusion_expr::interval_arithmetic::Interval;
 use datafusion_physical_expr::equivalence::add_offset_to_expr;
 use datafusion_physical_expr::intervals::cp_solver::ExprIntervalGraph;
 use datafusion_physical_expr::utils::merge_vectors;
 use datafusion_physical_expr::expressions::{BinaryExpr, Column};
-use datafusion_physical_expr::intervals::{ExprIntervalGraph, Interval};
+use datafusion_physical_expr::intervals::{ExprIntervalGraph, Interval, IntervalBound};
 use datafusion_physical_expr::utils::{collect_columns, merge_vectors};
 use datafusion_physical_expr::{
-    add_offset_to_lex_ordering, EquivalentClass, LexOrdering, LexOrderingRef,
-    OrderingEquivalenceProperties, OrderingEquivalentClass, PhysicalExpr,
-    PhysicalSortExpr,
+    LexOrdering, LexOrderingRef, PhysicalExpr, PhysicalSortExpr,
 };
 
-use crate::joins::hash_join_utils::{build_filter_input_order, SortedFilterExpr};
-use datafusion_expr::Operator;
-use datafusion_physical_expr::intervals::{ExprIntervalGraph, Interval, IntervalBound};
-use datafusion_physical_expr::utils::{
-    collect_columns, get_indices_of_matching_sort_exprs_with_order_eq, merge_vectors,
-};
 use futures::future::{BoxFuture, Shared};
 use futures::{ready, FutureExt};
 use hashbrown::raw::RawTable;
@@ -303,40 +295,6 @@ fn replace_on_columns_of_right_ordering(
                 }
             }
         }
-    }
-}
-
-/// Calculate the output ordering for sliding joins.
-pub fn calculate_sliding_join_output_order(
-    join_type: &JoinType,
-    maybe_left_order: Option<&[PhysicalSortExpr]>,
-    maybe_right_order: Option<&[PhysicalSortExpr]>,
-    left_len: usize,
-) -> Result<Option<Vec<PhysicalSortExpr>>> {
-    match maybe_right_order {
-        Some(right_order) => {
-            let result = match join_type {
-                JoinType::Inner => {
-                    // We modify the indices of the right order columns because their
-                    // columns are appended to the right side of the left schema.
-                    let mut adjusted_right_order =
-                        add_offset_to_lex_ordering(right_order, left_len)?;
-                    if let Some(left_order) = maybe_left_order {
-                        adjusted_right_order.extend_from_slice(left_order);
-                    }
-                    Some(adjusted_right_order)
-                }
-                JoinType::Right => {
-                    let adjusted_right_order =
-                        add_offset_to_lex_ordering(right_order, left_len)?;
-                    Some(adjusted_right_order)
-                }
-                JoinType::RightAnti | JoinType::RightSemi => Some(right_order.to_vec()),
-                _ => None,
-            };
-            Ok(result)
-        }
-        None => Ok(None),
     }
 }
 
@@ -1399,7 +1357,6 @@ pub fn prepare_sorted_exprs(
         &left.schema(),
         &left_sort_exprs[0],
         &left.equivalence_properties(),
-        &left.ordering_equivalence_properties(),
     )?;
 
     // Build the filter order for the right side:
@@ -1409,7 +1366,6 @@ pub fn prepare_sorted_exprs(
         &right.schema(),
         &right_sort_exprs[0],
         &right.equivalence_properties(),
-        &right.ordering_equivalence_properties(),
     )?;
 
     if !left_temp_sorted_filter_expr.is_empty()
@@ -1541,14 +1497,6 @@ mod tests {
     use arrow::datatypes::{DataType, Fields};
     use arrow::error::{ArrowError, Result as ArrowResult};
     use arrow_schema::SortOptions;
-    use datafusion_common::ScalarValue;
-
-    use super::*;
-
-    use arrow::datatypes::{DataType, Fields};
-    use arrow::error::{ArrowError, Result as ArrowResult};
-    use arrow_schema::SortOptions;
-
     use datafusion_common::ScalarValue;
 
     fn check(left: &[Column], right: &[Column], on: &[(Column, Column)]) -> Result<()> {
@@ -2367,7 +2315,7 @@ fn determine_prune_length(
             let batch_arr = sort_expr
                 .expr
                 .evaluate(buffer)?
-                .into_array(buffer.num_rows());
+                .into_array(buffer.num_rows())?;
 
             // Perform binary search on the array to determine the length of
             // the record batch to prune:

@@ -64,7 +64,7 @@ Sort: s.sn ASC NULLS LAST
 ------TableScan: sales_us projection=[ts, sn, amount, currency]
 physical_plan
 BoundedWindowAggExec: wdw=[SUM(s.amount) ORDER BY [s.sn ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW: Ok(Field { name: "SUM(s.amount) ORDER BY [s.sn ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(Int32(NULL)), end_bound: CurrentRow }], mode=[Sorted]
---CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/sales_us.csv]]}, projection=[ts, sn, amount, currency], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST], has_header=true
+--StreamingTableExec: partition_sizes=1, projection=[ts, sn, amount, currency], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST]
 
 query PIITI
 SELECT * from annotated_sales_us
@@ -100,7 +100,7 @@ Sort: s.sn ASC NULLS LAST
 ------TableScan: sales_us projection=[ts, sn, amount, currency]
 physical_plan
 BoundedWindowAggExec: wdw=[SUM(s.amount) ORDER BY [s.sn ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW: Ok(Field { name: "SUM(s.amount) ORDER BY [s.sn ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(Int32(NULL)), end_bound: CurrentRow }], mode=[Sorted]
---CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/sales_us.csv]]}, projection=[ts, sn, amount, currency], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST], has_header=true
+--StreamingTableExec: partition_sizes=1, projection=[ts, sn, amount, currency], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST]
 
 query PIITI
 SELECT * from annotated_sales_us
@@ -136,7 +136,7 @@ Sort: s.sn ASC NULLS LAST
 ------TableScan: sales_us projection=[ts, sn, amount, currency]
 physical_plan
 BoundedWindowAggExec: wdw=[AVG(s.amount) ORDER BY [s.sn ASC NULLS LAST] ROWS BETWEEN 100 PRECEDING AND CURRENT ROW: Ok(Field { name: "AVG(s.amount) ORDER BY [s.sn ASC NULLS LAST] ROWS BETWEEN 100 PRECEDING AND CURRENT ROW", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Rows, start_bound: Preceding(UInt64(100)), end_bound: CurrentRow }], mode=[Sorted]
---CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/sales_us.csv]]}, projection=[ts, sn, amount, currency], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST], has_header=true
+--StreamingTableExec: partition_sizes=1, projection=[ts, sn, amount, currency], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST]
 
 query PIITR
 SELECT * from annotated_sales_us
@@ -200,8 +200,10 @@ ProjectionExec: expr=[ROW_NUMBER() ORDER BY [u.ts ASC NULLS LAST] RANGE BETWEEN 
 --BoundedWindowAggExec: wdw=[ROW_NUMBER() ORDER BY [u.ts ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW: Ok(Field { name: "ROW_NUMBER() ORDER BY [u.ts ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW", data_type: UInt64, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(IntervalMonthDayNano("NULL")), end_bound: CurrentRow }], mode=[Sorted]
 ----SortPreservingMergeExec: [ts@0 ASC NULLS LAST]
 ------UnionExec
---------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/sales_us.csv]]}, projection=[ts, currency, amount], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST], has_header=true
---------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/sales_global.csv]]}, projection=[ts, currency, amount], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST], has_header=true
+--------ProjectionExec: expr=[ts@0 as ts, currency@2 as currency, amount@1 as amount]
+----------StreamingTableExec: partition_sizes=1, projection=[ts, amount, currency], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST]
+--------ProjectionExec: expr=[ts@0 as ts, currency@2 as currency, amount@1 as amount]
+----------StreamingTableExec: partition_sizes=1, projection=[ts, amount, currency], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST]
 
 query PIT
 SELECT * EXCLUDE(sn) FROM sales_us LIMIT 5
@@ -216,7 +218,7 @@ query TT
 EXPLAIN SELECT * EXCLUDE(sn) FROM sales_us
 ----
 logical_plan TableScan: sales_us projection=[ts, amount, currency]
-physical_plan CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/sales_us.csv]]}, projection=[ts, amount, currency], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST], has_header=true
+physical_plan StreamingTableExec: partition_sizes=1, projection=[ts, amount, currency], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST]
 
 
 # Joining Streams
@@ -286,28 +288,28 @@ Projection: amount_usd
 ------------SubqueryAlias: e
 --------------Projection: exchange_rates_temp.ts, exchange_rates_temp.sn2, exchange_rates_temp.currency_from, exchange_rates_temp.rate
 ----------------Filter: exchange_rates_temp.currency_to = Utf8("USD")
-------------------TableScan: exchange_rates_temp projection=[ts, sn2, currency_from, currency_to, rate], partial_filters=[exchange_rates_temp.currency_to = Utf8("USD")]
+------------------TableScan: exchange_rates_temp projection=[ts, sn2, currency_from, currency_to, rate]
 physical_plan
 ProjectionExec: expr=[amount_usd@0 as amount_usd]
 --SortPreservingMergeExec: [sn@1 ASC NULLS LAST]
 ----ProjectionExec: expr=[LAST_VALUE(e.rate) ORDER BY [e.sn2 ASC NULLS LAST]@1 as amount_usd, sn@0 as sn]
-------AggregateExec: mode=FinalPartitioned, gby=[sn@0 as sn], aggr=[LAST_VALUE(e.rate)], ordering_mode=FullyOrdered
+------AggregateExec: mode=FinalPartitioned, gby=[sn@0 as sn], aggr=[LAST_VALUE(e.rate)], ordering_mode=Sorted
 --------CoalesceBatchesExec: target_batch_size=8192
 ----------SortPreservingRepartitionExec: partitioning=Hash([sn@0], 4), input_partitions=4, sort_exprs=sn@0 ASC NULLS LAST
-------------AggregateExec: mode=Partial, gby=[sn@0 as sn], aggr=[LAST_VALUE(e.rate)], ordering_mode=FullyOrdered
+------------AggregateExec: mode=Partial, gby=[sn@0 as sn], aggr=[LAST_VALUE(e.rate)], ordering_mode=Sorted
 --------------ProjectionExec: expr=[sn@5 as sn, sn2@1 as sn2, rate@3 as rate]
 ----------------PartitionedHashJoinExec: join_type=Inner, on=[(currency_from@2, currency@2)], filter=ts@0 >= ts@1
 ------------------CoalesceBatchesExec: target_batch_size=8192
---------------------SortPreservingRepartitionExec: partitioning=Hash([currency_from@2], 4), input_partitions=4, sort_exprs=sn2@1 ASC NULLS LAST
+--------------------SortPreservingRepartitionExec: partitioning=Hash([currency_from@2], 4), input_partitions=4, sort_exprs=sn2@1 ASC NULLS LAST,ts@0 ASC NULLS LAST
 ----------------------ProjectionExec: expr=[ts@0 as ts, sn2@1 as sn2, currency_from@2 as currency_from, rate@4 as rate]
 ------------------------CoalesceBatchesExec: target_batch_size=8192
 --------------------------FilterExec: currency_to@3 = USD
 ----------------------------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
-------------------------------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/exchange_rates.csv]]}, projection=[ts, sn2, currency_from, currency_to, rate], infinite_source=true, output_ordering=[sn2@1 ASC NULLS LAST], has_header=true
+------------------------------StreamingTableExec: partition_sizes=1, projection=[ts, sn2, currency_from, currency_to, rate], infinite_source=true, output_ordering=[sn2@1 ASC NULLS LAST]
 ------------------CoalesceBatchesExec: target_batch_size=8192
 --------------------SortPreservingRepartitionExec: partitioning=Hash([currency@2], 4), input_partitions=4, sort_exprs=sn@1 ASC NULLS LAST
 ----------------------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
-------------------------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/sales_global.csv]]}, projection=[ts, sn, currency], infinite_source=true, output_ordering=[sn@1 ASC NULLS LAST], has_header=true
+------------------------StreamingTableExec: partition_sizes=1, projection=[ts, sn, currency], infinite_source=true, output_ordering=[sn@1 ASC NULLS LAST]
 
 # Scalar Subquery not supported
 # SELECT s.*,
@@ -351,9 +353,13 @@ ProjectionExec: expr=[amount_usd@0 as amount_usd]
 # GROUP BY s.sn
 # ORDER BY s.sn
 
+# Make partition number 1
+statement ok
+set datafusion.execution.target_partitions = 1;
 
 # Outer Joins
 
+# query below should be able to run in single partition
 query TT
 EXPLAIN SELECT AVG(e.rate) AS amount_usd
 FROM sales_global AS s
@@ -377,15 +383,102 @@ Projection: amount_usd
 ------------SubqueryAlias: e
 --------------Projection: exchange_rates.ts, exchange_rates.currency_from, exchange_rates.rate
 ----------------Filter: exchange_rates.currency_to = Utf8("USD")
-------------------TableScan: exchange_rates projection=[ts, currency_from, currency_to, rate], partial_filters=[exchange_rates.currency_to = Utf8("USD")]
+------------------TableScan: exchange_rates projection=[ts, currency_from, currency_to, rate]
+physical_plan
+ProjectionExec: expr=[AVG(e.rate)@1 as amount_usd]
+--AggregateExec: mode=Single, gby=[sn@0 as sn], aggr=[AVG(e.rate)], ordering_mode=Sorted
+----ProjectionExec: expr=[sn@4 as sn, rate@2 as rate]
+------SlidingHashJoinExec: join_type=Right, on=[(currency_from@1, currency@2)], filter=ts@0 >= ts@1 AND ts@1 >= ts@0 - 600000000000
+--------ProjectionExec: expr=[ts@0 as ts, currency_from@1 as currency_from, rate@3 as rate]
+----------CoalesceBatchesExec: target_batch_size=8192
+------------FilterExec: currency_to@2 = USD
+--------------StreamingTableExec: partition_sizes=1, projection=[ts, currency_from, currency_to, rate], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST]
+--------StreamingTableExec: partition_sizes=1, projection=[ts, sn, currency], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST]
+
+# Make partition number 2
+statement ok
+set datafusion.execution.target_partitions = 4;
+
+# query below should be able to run in multi partitions
+query TT
+EXPLAIN SELECT AVG(e.rate) AS amount_usd
+FROM sales_global AS s
+LEFT JOIN exchange_rates AS e
+ON s.currency = e.currency_from AND
+   e.currency_to = 'USD' AND
+   s.ts >= e.ts AND
+   e.ts >= s.ts - INTERVAL '10' MINUTE
+GROUP BY s.ts
+ORDER BY s.ts
+----
+logical_plan
+Projection: amount_usd
+--Sort: s.ts ASC NULLS LAST
+----Projection: AVG(e.rate) AS amount_usd, s.ts
+------Aggregate: groupBy=[[s.ts]], aggr=[[AVG(CAST(e.rate AS Float64))]]
+--------Projection: s.ts, e.rate
+----------Left Join: s.currency = e.currency_from Filter: s.ts >= e.ts AND e.ts >= s.ts - IntervalMonthDayNano("600000000000")
+------------SubqueryAlias: s
+--------------TableScan: sales_global projection=[ts, currency]
+------------SubqueryAlias: e
+--------------Projection: exchange_rates.ts, exchange_rates.currency_from, exchange_rates.rate
+----------------Filter: exchange_rates.currency_to = Utf8("USD")
+------------------TableScan: exchange_rates projection=[ts, currency_from, currency_to, rate]
+physical_plan
+ProjectionExec: expr=[amount_usd@0 as amount_usd]
+--SortPreservingMergeExec: [ts@1 ASC NULLS LAST]
+----ProjectionExec: expr=[AVG(e.rate)@1 as amount_usd, ts@0 as ts]
+------AggregateExec: mode=FinalPartitioned, gby=[ts@0 as ts], aggr=[AVG(e.rate)], ordering_mode=Sorted
+--------CoalesceBatchesExec: target_batch_size=8192
+----------SortPreservingRepartitionExec: partitioning=Hash([ts@0], 4), input_partitions=4, sort_exprs=ts@0 ASC NULLS LAST
+------------AggregateExec: mode=Partial, gby=[ts@0 as ts], aggr=[AVG(e.rate)], ordering_mode=Sorted
+--------------ProjectionExec: expr=[ts@3 as ts, rate@2 as rate]
+----------------SlidingHashJoinExec: join_type=Right, on=[(currency_from@1, currency@1)], filter=ts@0 >= ts@1 AND ts@1 >= ts@0 - 600000000000
+------------------CoalesceBatchesExec: target_batch_size=8192
+--------------------SortPreservingRepartitionExec: partitioning=Hash([currency_from@1], 4), input_partitions=4, sort_exprs=ts@0 ASC NULLS LAST
+----------------------ProjectionExec: expr=[ts@0 as ts, currency_from@1 as currency_from, rate@3 as rate]
+------------------------CoalesceBatchesExec: target_batch_size=8192
+--------------------------FilterExec: currency_to@2 = USD
+----------------------------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+------------------------------StreamingTableExec: partition_sizes=1, projection=[ts, currency_from, currency_to, rate], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST]
+------------------CoalesceBatchesExec: target_batch_size=8192
+--------------------SortPreservingRepartitionExec: partitioning=Hash([currency@1], 4), input_partitions=4, sort_exprs=ts@0 ASC NULLS LAST
+----------------------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+------------------------StreamingTableExec: partition_sizes=1, projection=[ts, currency], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST]
+
+# query below (where we have alternative valid orderings) should run in multi partitions also.
+query TT
+EXPLAIN SELECT AVG(e.rate) AS amount_usd
+FROM sales_global AS s
+LEFT JOIN exchange_rates AS e
+ON s.currency = e.currency_from AND
+   e.currency_to = 'USD' AND
+   s.ts >= e.ts AND
+   e.ts >= s.ts - INTERVAL '10' MINUTE
+GROUP BY s.sn
+ORDER BY s.sn
+----
+logical_plan
+Projection: amount_usd
+--Sort: s.sn ASC NULLS LAST
+----Projection: AVG(e.rate) AS amount_usd, s.sn
+------Aggregate: groupBy=[[s.sn]], aggr=[[AVG(CAST(e.rate AS Float64))]]
+--------Projection: s.sn, e.rate
+----------Left Join: s.currency = e.currency_from Filter: s.ts >= e.ts AND e.ts >= s.ts - IntervalMonthDayNano("600000000000")
+------------SubqueryAlias: s
+--------------TableScan: sales_global projection=[ts, sn, currency]
+------------SubqueryAlias: e
+--------------Projection: exchange_rates.ts, exchange_rates.currency_from, exchange_rates.rate
+----------------Filter: exchange_rates.currency_to = Utf8("USD")
+------------------TableScan: exchange_rates projection=[ts, currency_from, currency_to, rate]
 physical_plan
 ProjectionExec: expr=[amount_usd@0 as amount_usd]
 --SortPreservingMergeExec: [sn@1 ASC NULLS LAST]
 ----ProjectionExec: expr=[AVG(e.rate)@1 as amount_usd, sn@0 as sn]
-------AggregateExec: mode=FinalPartitioned, gby=[sn@0 as sn], aggr=[AVG(e.rate)], ordering_mode=FullyOrdered
+------AggregateExec: mode=FinalPartitioned, gby=[sn@0 as sn], aggr=[AVG(e.rate)], ordering_mode=Sorted
 --------CoalesceBatchesExec: target_batch_size=8192
 ----------SortPreservingRepartitionExec: partitioning=Hash([sn@0], 4), input_partitions=4, sort_exprs=sn@0 ASC NULLS LAST
-------------AggregateExec: mode=Partial, gby=[sn@0 as sn], aggr=[AVG(e.rate)], ordering_mode=FullyOrdered
+------------AggregateExec: mode=Partial, gby=[sn@0 as sn], aggr=[AVG(e.rate)], ordering_mode=Sorted
 --------------ProjectionExec: expr=[sn@4 as sn, rate@2 as rate]
 ----------------SlidingHashJoinExec: join_type=Right, on=[(currency_from@1, currency@2)], filter=ts@0 >= ts@1 AND ts@1 >= ts@0 - 600000000000
 ------------------CoalesceBatchesExec: target_batch_size=8192
@@ -394,16 +487,43 @@ ProjectionExec: expr=[amount_usd@0 as amount_usd]
 ------------------------CoalesceBatchesExec: target_batch_size=8192
 --------------------------FilterExec: currency_to@2 = USD
 ----------------------------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
-------------------------------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/exchange_rates.csv]]}, projection=[ts, currency_from, currency_to, rate], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST], has_header=true
+------------------------------StreamingTableExec: partition_sizes=1, projection=[ts, currency_from, currency_to, rate], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST]
 ------------------CoalesceBatchesExec: target_batch_size=8192
 --------------------SortPreservingRepartitionExec: partitioning=Hash([currency@2], 4), input_partitions=4, sort_exprs=ts@0 ASC NULLS LAST
 ----------------------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
-------------------------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/sales_global.csv]]}, projection=[ts, sn, currency], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST], has_header=true
+------------------------StreamingTableExec: partition_sizes=1, projection=[ts, sn, currency], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST]
+
 
 # Explicit Windows in Joins
 
 # Sort is not removed!
 
+query TT
+EXPLAIN SELECT e.*,
+       AVG(rate) OVER sliding_window AS avg_rate
+FROM exchange_rates AS e
+WINDOW sliding_window AS (
+	PARTITION BY currency_from, currency_to
+	ORDER BY ts RANGE INTERVAL '10' MINUTE PRECEDING
+)
+ORDER BY ts
+----
+logical_plan
+Sort: e.ts ASC NULLS LAST
+--Projection: e.ts, e.sn, e.currency_from, e.currency_to, e.rate, AVG(e.rate) PARTITION BY [e.currency_from, e.currency_to] ORDER BY [e.ts ASC NULLS LAST] RANGE BETWEEN 10 MINUTE PRECEDING AND CURRENT ROW AS avg_rate
+----WindowAggr: windowExpr=[[AVG(CAST(e.rate AS Float64)) PARTITION BY [e.currency_from, e.currency_to] ORDER BY [e.ts ASC NULLS LAST] RANGE BETWEEN 600000000000 PRECEDING AND CURRENT ROW AS AVG(e.rate) PARTITION BY [e.currency_from, e.currency_to] ORDER BY [e.ts ASC NULLS LAST] RANGE BETWEEN 10 MINUTE PRECEDING AND CURRENT ROW]]
+------SubqueryAlias: e
+--------TableScan: exchange_rates projection=[ts, sn, currency_from, currency_to, rate]
+physical_plan
+SortPreservingMergeExec: [ts@0 ASC NULLS LAST,sn@1 ASC NULLS LAST]
+--ProjectionExec: expr=[ts@0 as ts, sn@1 as sn, currency_from@2 as currency_from, currency_to@3 as currency_to, rate@4 as rate, AVG(e.rate) PARTITION BY [e.currency_from, e.currency_to] ORDER BY [e.ts ASC NULLS LAST] RANGE BETWEEN 10 MINUTE PRECEDING AND CURRENT ROW@5 as avg_rate]
+----BoundedWindowAggExec: wdw=[AVG(e.rate) PARTITION BY [e.currency_from, e.currency_to] ORDER BY [e.ts ASC NULLS LAST] RANGE BETWEEN 10 MINUTE PRECEDING AND CURRENT ROW: Ok(Field { name: "AVG(e.rate) PARTITION BY [e.currency_from, e.currency_to] ORDER BY [e.ts ASC NULLS LAST] RANGE BETWEEN 10 MINUTE PRECEDING AND CURRENT ROW", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(IntervalMonthDayNano("600000000000")), end_bound: CurrentRow }], mode=[Linear]
+------CoalesceBatchesExec: target_batch_size=8192
+--------SortPreservingRepartitionExec: partitioning=Hash([currency_from@2, currency_to@3], 4), input_partitions=4, sort_exprs=ts@0 ASC NULLS LAST
+----------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+------------StreamingTableExec: partition_sizes=1, projection=[ts, sn, currency_from, currency_to, rate], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST]
+
+# query below (where we have alternative valid orderings) should run in multi partitions also.
 query TT
 EXPLAIN SELECT e.*,
        AVG(rate) OVER sliding_window AS avg_rate
@@ -421,14 +541,13 @@ Sort: e.sn ASC NULLS LAST
 ------SubqueryAlias: e
 --------TableScan: exchange_rates projection=[ts, sn, currency_from, currency_to, rate]
 physical_plan
-SortPreservingMergeExec: [ts@0 ASC NULLS LAST]
+SortPreservingMergeExec: [ts@0 ASC NULLS LAST,sn@1 ASC NULLS LAST]
 --ProjectionExec: expr=[ts@0 as ts, sn@1 as sn, currency_from@2 as currency_from, currency_to@3 as currency_to, rate@4 as rate, AVG(e.rate) PARTITION BY [e.currency_from, e.currency_to] ORDER BY [e.ts ASC NULLS LAST] RANGE BETWEEN 10 MINUTE PRECEDING AND CURRENT ROW@5 as avg_rate]
 ----BoundedWindowAggExec: wdw=[AVG(e.rate) PARTITION BY [e.currency_from, e.currency_to] ORDER BY [e.ts ASC NULLS LAST] RANGE BETWEEN 10 MINUTE PRECEDING AND CURRENT ROW: Ok(Field { name: "AVG(e.rate) PARTITION BY [e.currency_from, e.currency_to] ORDER BY [e.ts ASC NULLS LAST] RANGE BETWEEN 10 MINUTE PRECEDING AND CURRENT ROW", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(IntervalMonthDayNano("600000000000")), end_bound: CurrentRow }], mode=[Linear]
 ------CoalesceBatchesExec: target_batch_size=8192
 --------SortPreservingRepartitionExec: partitioning=Hash([currency_from@2, currency_to@3], 4), input_partitions=4, sort_exprs=ts@0 ASC NULLS LAST
 ----------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
-------------CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/data/exchange_rates.csv]]}, projection=[ts, sn, currency_from, currency_to, rate], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST], has_header=true
-
+------------StreamingTableExec: partition_sizes=1, projection=[ts, sn, currency_from, currency_to, rate], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST]
 
 # Machine Learning via User-Defined Functions (UDFs)
 

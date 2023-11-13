@@ -351,7 +351,7 @@ pub(crate) fn statistical_join_selection_hash_join(
         PartitionMode::Partitioned => {
             let left = hash_join.left();
             let right = hash_join.right();
-            if should_swap_join_order(&**left, &**right)
+            if should_swap_join_order(&**left, &**right)?
                 && supports_swap(*hash_join.join_type())
             {
                 swap_hash_join(hash_join, PartitionMode::Partitioned).map(Some)?
@@ -368,7 +368,7 @@ pub(crate) fn statistical_join_selection_cross_join(
 ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
     let left = cross_join.left();
     let right = cross_join.right();
-    let new_plan = if should_swap_join_order(&**left, &**right) {
+    let new_plan = if should_swap_join_order(&**left, &**right)? {
         let new_join = CrossJoinExec::new(Arc::clone(right), Arc::clone(left));
         // TODO avoid adding ProjectionExec again and again, only adding Final Projection
         let proj: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(

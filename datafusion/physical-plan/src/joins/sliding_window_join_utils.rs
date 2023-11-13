@@ -2,14 +2,13 @@
 // This file does not contain any Apache Software Foundation copyrighted code.
 
 use crate::joins::{
-    hash_join_utils::{
+    stream_join_utils::{
         get_pruning_anti_indices, get_pruning_semi_indices, SortedFilterExpr,
     },
     utils::{
         append_right_indices, get_anti_indices, get_build_side_pruned_exprs,
         get_filter_representation_of_build_side,
         get_filter_representation_schema_of_build_side, get_semi_indices, JoinFilter,
-        JoinSide,
     },
 };
 
@@ -19,7 +18,7 @@ use arrow_array::{
     ArrowPrimitiveType, NativeAdapter, PrimitiveArray, RecordBatch, UInt32Array,
     UInt64Array,
 };
-use datafusion_common::{DataFusionError, JoinType, Result, ScalarValue};
+use datafusion_common::{DataFusionError, JoinSide, JoinType, Result, ScalarValue};
 use datafusion_physical_expr::{
     intervals::{ExprIntervalGraph, Interval, IntervalBound},
     PhysicalSortExpr,
@@ -67,7 +66,7 @@ pub fn is_batch_suitable_interval_calculation(
             let expr = sorted_filter_expr.intermediate_batch_filter_expr();
             let array_ref = expr
                 .evaluate(&intermediate_batch)?
-                .into_array(intermediate_batch.num_rows());
+                .into_array(intermediate_batch.num_rows())?;
             // Calculate the latest value of the sorted filter expression:
             let latest_value = ScalarValue::try_from_array(&array_ref, 0);
             // Return true if the latest value is not null:
@@ -177,7 +176,7 @@ pub fn check_if_sliding_window_condition_is_met(
                 .expr
                 .clone()
                 .evaluate(&latest_build_intermediate_batch)?
-                .into_array(1);
+                .into_array(1)?;
             let latest_value = ScalarValue::try_from_array(&array, 0)?;
             if latest_value.is_null() {
                 return Ok(false);
@@ -530,13 +529,13 @@ pub(crate) fn update_filter_expr_bounds(
             // and convert the result to an array:
             let first_array = expr
                 .evaluate(&first_probe_intermediate_batch)?
-                .into_array(first_probe_intermediate_batch.num_rows());
+                .into_array(first_probe_intermediate_batch.num_rows())?;
 
             // Evaluate the probe side filter expression with the last batch
             // and convert the result to an array:
             let last_array = expr
                 .evaluate(&last_probe_intermediate_batch)?
-                .into_array(last_probe_intermediate_batch.num_rows());
+                .into_array(last_probe_intermediate_batch.num_rows())?;
             // Extract the left and right values from the array:
             let left_value = ScalarValue::try_from_array(&first_array, 0)?;
             let right_value = ScalarValue::try_from_array(&last_array, 0)?;

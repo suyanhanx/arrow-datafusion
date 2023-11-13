@@ -233,14 +233,14 @@ impl EquivalenceGroup {
     }
 
     /// Creates an equivalence group from the given equivalence classes.
-    fn new(classes: Vec<EquivalenceClass>) -> Self {
-        let mut result = Self { classes };
+    pub fn new(classes: Vec<EquivalenceClass>) -> Self {
+        let mut result = EquivalenceGroup { classes };
         result.remove_redundant_entries();
         result
     }
 
     /// Returns how many equivalence classes there are in this group.
-    fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.classes.len()
     }
 

@@ -659,7 +659,7 @@ impl AsExecutionPlan for PhysicalPlanNode {
                         StreamJoinPartitionMode::Partitioned
                     }
                 };
-                SymmetricHashJoinExec::try_new(
+                Ok(Arc::new(SymmetricHashJoinExec::try_new(
                     left,
                     right,
                     on,
@@ -1404,76 +1404,9 @@ impl AsExecutionPlan for PhysicalPlanNode {
                         filter,
                     },
                 ))),
-            })
-        } else if let Some(exec) = plan.downcast_ref::<HashJoinExec>() {
-            let left = protobuf::PhysicalPlanNode::try_from_physical_plan(
-                exec.left().to_owned(),
-                extension_codec,
-            )?;
-            let right = protobuf::PhysicalPlanNode::try_from_physical_plan(
-                exec.right().to_owned(),
-                extension_codec,
-            )?;
-            let on: Vec<protobuf::JoinOn> = exec
-                .on()
-                .iter()
-                .map(|tuple| protobuf::JoinOn {
-                    left: Some(protobuf::PhysicalColumn {
-                        name: tuple.0.name().to_string(),
-                        index: tuple.0.index() as u32,
-                    }),
-                    right: Some(protobuf::PhysicalColumn {
-                        name: tuple.1.name().to_string(),
-                        index: tuple.1.index() as u32,
-                    }),
-                })
-                .collect();
-            let join_type: protobuf::JoinType = exec.join_type().to_owned().into();
-            let filter = exec
-                .filter()
-                .as_ref()
-                .map(|f| {
-                    let expression = f.expression().to_owned().try_into()?;
-                    let column_indices = f
-                        .column_indices()
-                        .iter()
-                        .map(|i| {
-                            let side: protobuf::JoinSide = i.side.to_owned().into();
-                            protobuf::ColumnIndex {
-                                index: i.index as u32,
-                                side: side.into(),
-                            }
-                        })
-                        .collect();
-                    let schema = f.schema().try_into()?;
-                    Ok(protobuf::JoinFilter {
-                        expression: Some(expression),
-                        column_indices,
-                        schema: Some(schema),
-                    })
-                })
-                .map_or(Ok(None), |v: Result<protobuf::JoinFilter>| v.map(Some))?;
-
-            let partition_mode = match exec.partition_mode() {
-                PartitionMode::CollectLeft => protobuf::PartitionMode::CollectLeft,
-                PartitionMode::Partitioned => protobuf::PartitionMode::Partitioned,
-                PartitionMode::Auto => protobuf::PartitionMode::Auto,
-            };
-
-            Ok(protobuf::PhysicalPlanNode {
-                physical_plan_type: Some(PhysicalPlanType::HashJoin(Box::new(
-                    protobuf::HashJoinExecNode {
-                        left: Some(Box::new(left)),
-                        right: Some(Box::new(right)),
-                        on,
-                        join_type: join_type.into(),
-                        partition_mode: partition_mode.into(),
-                        null_equals_null: exec.null_equals_null(),
-                        filter,
-                    },
-                ))),
-            })
-        } else if let Some(exec) = plan.downcast_ref::<SymmetricHashJoinExec>() {
+            });
+        }
+        if let Some(exec) = plan.downcast_ref::<SymmetricHashJoinExec>() {
             let left = protobuf::PhysicalPlanNode::try_from_physical_plan(
                 exec.left().to_owned(),
                 extension_codec,
@@ -1531,7 +1464,7 @@ impl AsExecutionPlan for PhysicalPlanNode {
                 }
             };
 
-            Ok(protobuf::PhysicalPlanNode {
+            return Ok(protobuf::PhysicalPlanNode {
                 physical_plan_type: Some(PhysicalPlanType::SymmetricHashJoin(Box::new(
                     protobuf::SymmetricHashJoinExecNode {
                         left: Some(Box::new(left)),
@@ -1543,8 +1476,9 @@ impl AsExecutionPlan for PhysicalPlanNode {
                         filter,
                     },
                 ))),
-            })
-        } else if let Some(exec) = plan.downcast_ref::<SlidingHashJoinExec>() {
+            });
+        }
+        if let Some(exec) = plan.downcast_ref::<SlidingHashJoinExec>() {
             let left = protobuf::PhysicalPlanNode::try_from_physical_plan(
                 exec.left().to_owned(),
                 extension_codec,
@@ -1630,7 +1564,7 @@ impl AsExecutionPlan for PhysicalPlanNode {
                 })
                 .collect::<Result<Vec<_>>>()?;
 
-            Ok(protobuf::PhysicalPlanNode {
+            return Ok(protobuf::PhysicalPlanNode {
                 physical_plan_type: Some(PhysicalPlanType::SlidingHashJoin(Box::new(
                     protobuf::SlidingHashJoinExecNode {
                         left: Some(Box::new(left)),
@@ -1644,8 +1578,9 @@ impl AsExecutionPlan for PhysicalPlanNode {
                         right_sort_exprs,
                     },
                 ))),
-            })
-        } else if let Some(exec) = plan.downcast_ref::<SlidingNestedLoopJoinExec>() {
+            });
+        }
+        if let Some(exec) = plan.downcast_ref::<SlidingNestedLoopJoinExec>() {
             let left = protobuf::PhysicalPlanNode::try_from_physical_plan(
                 exec.left().to_owned(),
                 extension_codec,
@@ -1709,7 +1644,7 @@ impl AsExecutionPlan for PhysicalPlanNode {
                 })
                 .collect::<Result<Vec<_>>>()?;
 
-            Ok(protobuf::PhysicalPlanNode {
+            return Ok(protobuf::PhysicalPlanNode {
                 physical_plan_type: Some(PhysicalPlanType::SlidingNestedLoopJoin(
                     Box::new(protobuf::SlidingNestedLoopJoinExecNode {
                         left: Some(Box::new(left)),
@@ -1720,8 +1655,9 @@ impl AsExecutionPlan for PhysicalPlanNode {
                         right_sort_exprs,
                     }),
                 )),
-            })
-        } else if let Some(exec) = plan.downcast_ref::<CrossJoinExec>() {
+            });
+        }
+        if let Some(exec) = plan.downcast_ref::<CrossJoinExec>() {
             let left = protobuf::PhysicalPlanNode::try_from_physical_plan(
                 exec.left().to_owned(),
                 extension_codec,

@@ -11,9 +11,7 @@ use crate::physical_optimizer::join_selection::{
 use crate::physical_optimizer::utils::{
     is_aggregate, is_cross_join, is_hash_join, is_nested_loop_join, is_sort, is_window,
 };
-use crate::physical_plan::aggregates::{
-    get_working_mode, AggregateExec, AggregateMode, PhysicalGroupBy,
-};
+use crate::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
 use crate::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use crate::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use crate::physical_plan::joins::utils::{swap_filter, JoinFilter, JoinOn};
@@ -35,7 +33,6 @@ use datafusion_common::{internal_err, DataFusionError, JoinType, Result};
 use datafusion_physical_expr::expressions::{Column, LastValue};
 use datafusion_physical_expr::utils::{
     collect_columns, get_indices_of_matching_sort_exprs_with_order_eq,
-    ordering_satisfy_requirement_concrete,
 };
 use datafusion_physical_expr::{
     AggregateExpr, PhysicalSortExpr, PhysicalSortRequirement,
@@ -48,7 +45,7 @@ use datafusion_physical_plan::joins::{
     swap_sliding_hash_join, swap_sliding_nested_loop_join,
 };
 use datafusion_physical_plan::windows::{
-    get_best_fitting_window, BoundedWindowAggExec, WindowAggExec,
+    get_best_fitting_window, get_window_mode, BoundedWindowAggExec, WindowAggExec,
 };
 
 use itertools::{iproduct, izip, Itertools};
@@ -300,21 +297,9 @@ fn handle_sort_requirements(
         // If plan is streaming, check if all children satisfy their requirements
         Ok(true) => izip!(children, requirements).all(|(child, maybe_requirement)| {
             // If there's no requirement, it's automatically satisfied
-            if let Some(requirement) = maybe_requirement {
-                if let Some(child_output_ordering) = child.output_ordering() {
-                    ordering_satisfy_requirement_concrete(
-                        child_output_ordering,
-                        &requirement,
-                        || child.equivalence_properties(),
-                        || child.ordering_equivalence_properties(),
-                    )
-                } else {
-                    // If child doesn't provide output ordering, requirement isn't satisfied
-                    false
-                }
-            } else {
-                true
-            }
+            let child_eq_properties = child.equivalence_properties();
+            child_eq_properties
+                .ordering_satisfy_requirement(&maybe_requirement.unwrap_or_default())
         }),
         // If plan is not streaming but valid with its sources, it's considered valid
         Ok(false) => true,
@@ -514,7 +499,7 @@ fn select_best_aggregate_streaming_plan(
             };
 
             // Plan should support streamable aggregates and be streamable itself
-            if get_working_mode(&plan, group_by).is_some()
+            if get_window_mode(&group_by.input_exprs(), &[], &plan).is_some()
                 && is_plan_streaming(&plan).is_ok()
                 && agg_valid_results {
                 Some(Ok(plan))
@@ -681,15 +666,8 @@ fn handle_sort_exec(
             PhysicalSortRequirement::from_sort_exprs(sort_exec.expr());
         return if sort_exec.fetch().is_none()
             && sort_child
-                .output_ordering()
-                .map_or(false, |provided_ordering| {
-                    ordering_satisfy_requirement_concrete(
-                        provided_ordering,
-                        &child_requirement,
-                        || sort_child.equivalence_properties(),
-                        || sort_child.ordering_equivalence_properties(),
-                    )
-                })
+                .equivalence_properties()
+                .ordering_satisfy_requirement(&child_requirement)
         {
             Ok(vec![sort_child.clone()])
             // If the plan is OK with bounded data, we can continue without deleting the possible plan.
@@ -798,15 +776,12 @@ fn replace_with_partial_hash_join(
     ) {
         // Both streams are unbounded, and filter with orders are present
         (true, true, Some(filter), Some(left_order), Some(right_order)) => {
-            // Check if filter expressions can be pruned based on the data orders
             let (build_prunable, probe_prunable) = is_filter_expr_prunable(
                 filter,
                 Some(left_order[0].clone()),
                 Some(right_order[0].clone()),
-                || left_child.equivalence_properties(),
-                || left_child.ordering_equivalence_properties(),
-                || right_child.equivalence_properties(),
-                || right_child.ordering_equivalence_properties(),
+                &left_child.equivalence_properties(),
+                &right_child.equivalence_properties(),
             )?;
 
             let group_by = parent_plan.group_by();
@@ -933,15 +908,8 @@ fn check_hash_join_convertable(
                     mode,
                 )
             }
-            (true, true, None, Some(left_order), Some(right_order)) => {
-                handle_sort_merge_join_creation(
-                    hash_join,
-                    mode,
-                    &on_left,
-                    &on_right,
-                    left_order,
-                    right_order,
-                )
+            (true, true, None, Some(_left_order), Some(_right_order)) => {
+                handle_sort_merge_join_creation(hash_join, mode, &on_left, &on_right)
             }
             (true, true, maybe_filter, _, _) => {
                 Ok(Some(vec![create_symmetric_hash_join(
@@ -1009,10 +977,8 @@ fn handle_sliding_hash_conversion(
         filter,
         Some(left_order[0].clone()),
         Some(right_order[0].clone()),
-        || hash_join.left().equivalence_properties(),
-        || hash_join.left().ordering_equivalence_properties(),
-        || hash_join.right().equivalence_properties(),
-        || hash_join.right().ordering_equivalence_properties(),
+        &hash_join.left().equivalence_properties(),
+        &hash_join.right().equivalence_properties(),
     )?;
 
     if left_prunable && right_prunable {
@@ -1058,22 +1024,16 @@ fn handle_sort_merge_join_creation(
     mode: StreamJoinPartitionMode,
     on_left: &[Column],
     on_right: &[Column],
-    left_order: &[PhysicalSortExpr],
-    right_order: &[PhysicalSortExpr],
 ) -> Result<Option<Vec<Arc<dyn ExecutionPlan>>>> {
     // Get left key(s)' sort options:
     let left_satisfied = get_indices_of_matching_sort_exprs_with_order_eq(
-        left_order,
         on_left,
-        &hash_join.left().equivalence_properties(),
-        &hash_join.left().ordering_equivalence_properties(),
+        hash_join.left().equivalence_properties(),
     );
     // Get right key(s)' sort options:
     let right_satisfied = get_indices_of_matching_sort_exprs_with_order_eq(
-        right_order,
         on_right,
-        &hash_join.right().equivalence_properties(),
-        &hash_join.right().ordering_equivalence_properties(),
+        hash_join.right().equivalence_properties(),
     );
     let mut plans: Vec<Arc<dyn ExecutionPlan>> = vec![];
     if let (
@@ -1208,10 +1168,8 @@ fn check_nested_loop_join_convertable(
                 &filter,
                 Some(left_order[0].clone()),
                 Some(right_order[0].clone()),
-                || nested_loop_join.left().equivalence_properties(),
-                || nested_loop_join.left().ordering_equivalence_properties(),
-                || nested_loop_join.right().equivalence_properties(),
-                || nested_loop_join.right().ordering_equivalence_properties(),
+                &nested_loop_join.left().equivalence_properties(),
+                &nested_loop_join.right().equivalence_properties(),
             )?;
             if left_prunable && right_prunable {
                 let sliding_nested_loop_join =
@@ -1429,7 +1387,7 @@ mod order_preserving_join_swap_tests {
     use crate::physical_plan::aggregates::{
         AggregateExec, AggregateMode, PhysicalGroupBy,
     };
-    use crate::physical_plan::joins::utils::{ColumnIndex, JoinSide};
+    use crate::physical_plan::joins::utils::ColumnIndex;
     use crate::physical_plan::windows::create_window_expr;
     use crate::physical_plan::{displayable, ExecutionPlan};
     use crate::prelude::SessionContext;
@@ -1443,7 +1401,7 @@ mod order_preserving_join_swap_tests {
     };
 
     use arrow_schema::{DataType, Field, Schema, SchemaRef, SortOptions};
-    use datafusion_common::Result;
+    use datafusion_common::{JoinSide, Result};
     use datafusion_expr::{BuiltInWindowFunction, JoinType, WindowFrame, WindowFunction};
     use datafusion_physical_expr::expressions::{
         col, Column, FirstValue, LastValue, NotExpr,
@@ -3396,13 +3354,13 @@ mod order_preserving_join_swap_tests {
         let physical_plan = partial_aggregate_exec(join, partial_group_by, aggr_expr);
 
         let expected_input = [
-            "AggregateExec: mode=Partial, gby=[d@3 as d], aggr=[LastValue(b)], ordering_mode=FullyOrdered",
+            "AggregateExec: mode=Partial, gby=[d@3 as d], aggr=[LastValue(b)], ordering_mode=Sorted",
             "  HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, d@0)], filter=0@0 > 1@1",
             "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
             "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
         ];
         let expected_optimized = [
-            "AggregateExec: mode=Partial, gby=[d@3 as d], aggr=[LastValue(b)], ordering_mode=FullyOrdered",
+            "AggregateExec: mode=Partial, gby=[d@3 as d], aggr=[LastValue(b)], ordering_mode=Sorted",
             "  PartitionedHashJoinExec: join_type=Inner, on=[(a@0, d@0)], filter=0@0 > 1@1",
             "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
             "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
@@ -3462,13 +3420,13 @@ mod order_preserving_join_swap_tests {
         let physical_plan = partial_aggregate_exec(join, partial_group_by, aggr_expr);
 
         let expected_input = [
-            "AggregateExec: mode=Partial, gby=[a@0 as a], aggr=[LastValue(e)], ordering_mode=FullyOrdered",
+            "AggregateExec: mode=Partial, gby=[a@0 as a], aggr=[LastValue(e)], ordering_mode=Sorted",
             "  HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, d@0)], filter=0@0 > 1@1",
             "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
             "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
         ];
         let expected_optimized = [
-            "AggregateExec: mode=Partial, gby=[a@0 as a], aggr=[LastValue(e)], ordering_mode=FullyOrdered",
+            "AggregateExec: mode=Partial, gby=[a@0 as a], aggr=[LastValue(e)], ordering_mode=Sorted",
             "  ProjectionExec: expr=[a@3 as a, b@4 as b, c@5 as c, d@0 as d, e@1 as e, c@2 as c]",
             "    PartitionedHashJoinExec: join_type=Inner, on=[(d@0, a@0)], filter=0@0 > 1@1",
             "      StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
@@ -3530,13 +3488,13 @@ mod order_preserving_join_swap_tests {
         let physical_plan = partial_aggregate_exec(join, partial_group_by, aggr_expr);
 
         let expected_input = [
-            "AggregateExec: mode=Partial, gby=[a@0 as a], aggr=[LastValue(e)], ordering_mode=FullyOrdered",
+            "AggregateExec: mode=Partial, gby=[a@0 as a], aggr=[LastValue(e)], ordering_mode=Sorted",
             "  HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, d@0)], filter=0@0 > 1@1",
             "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
             "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
         ];
         let expected_optimized = [
-            "AggregateExec: mode=Partial, gby=[a@0 as a], aggr=[LastValue(e)], ordering_mode=FullyOrdered",
+            "AggregateExec: mode=Partial, gby=[a@0 as a], aggr=[LastValue(e)], ordering_mode=Sorted",
             "  HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, d@0)], filter=0@0 > 1@1",
             "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
             "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
@@ -3597,13 +3555,13 @@ mod order_preserving_join_swap_tests {
         let physical_plan = partial_aggregate_exec(join, partial_group_by, aggr_expr);
 
         let expected_input = [
-            "AggregateExec: mode=Partial, gby=[d@3 as d], aggr=[FirstValue(b)], ordering_mode=FullyOrdered",
+            "AggregateExec: mode=Partial, gby=[d@3 as d], aggr=[FirstValue(b)], ordering_mode=Sorted",
             "  HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, d@0)], filter=0@0 > 1@1",
             "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
             "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
         ];
         let expected_optimized = [
-            "AggregateExec: mode=Partial, gby=[d@3 as d], aggr=[FirstValue(b)], ordering_mode=FullyOrdered",
+            "AggregateExec: mode=Partial, gby=[d@3 as d], aggr=[FirstValue(b)], ordering_mode=Sorted",
             "  HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, d@0)], filter=0@0 > 1@1",
             "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
             "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
@@ -3695,7 +3653,7 @@ mod order_preserving_join_swap_tests {
             partial_aggregate_exec(second_join, partial_group_by, aggr_expr);
 
         let expected_input = [
-            "AggregateExec: mode=Partial, gby=[d@6 as d], aggr=[LastValue(y)], ordering_mode=FullyOrdered",
+            "AggregateExec: mode=Partial, gby=[d@6 as d], aggr=[LastValue(y)], ordering_mode=Sorted",
             "  HashJoinExec: mode=Partitioned, join_type=Inner, on=[(z@2, c@2)], filter=0@0 > 1@1",
             "    StreamingTableExec: partition_sizes=0, projection=[x, y, z], infinite_source=true, output_ordering=[x@0 ASC]",
             "    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, d@0)], filter=0@0 > 1@1",
@@ -3703,7 +3661,7 @@ mod order_preserving_join_swap_tests {
             "      StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
         ];
         let expected_optimized = [
-            "AggregateExec: mode=Partial, gby=[d@6 as d], aggr=[LastValue(y)], ordering_mode=FullyOrdered",
+            "AggregateExec: mode=Partial, gby=[d@6 as d], aggr=[LastValue(y)], ordering_mode=Sorted",
             "  HashJoinExec: mode=Partitioned, join_type=Inner, on=[(z@2, c@2)], filter=0@0 > 1@1",
             "    StreamingTableExec: partition_sizes=0, projection=[x, y, z], infinite_source=true, output_ordering=[x@0 ASC]",
             "    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, d@0)], filter=0@0 > 1@1",
@@ -3797,7 +3755,7 @@ mod order_preserving_join_swap_tests {
             partial_aggregate_exec(second_join, partial_group_by, aggr_expr);
 
         let expected_input = [
-            "AggregateExec: mode=Partial, gby=[d@6 as d], aggr=[LastValue(b)], ordering_mode=FullyOrdered",
+            "AggregateExec: mode=Partial, gby=[d@6 as d], aggr=[LastValue(b)], ordering_mode=Sorted",
             "  HashJoinExec: mode=Partitioned, join_type=Inner, on=[(z@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
             "    StreamingTableExec: partition_sizes=0, projection=[x, y, z], infinite_source=true, output_ordering=[x@0 ASC]",
             "    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, d@0)], filter=0@0 > 1@1",
@@ -3805,7 +3763,7 @@ mod order_preserving_join_swap_tests {
             "      MemoryExec: partitions=0, partition_sizes=[], output_ordering=d@0 ASC",
         ];
         let expected_optimized = [
-            "AggregateExec: mode=Partial, gby=[d@6 as d], aggr=[LastValue(b)], ordering_mode=FullyOrdered",
+            "AggregateExec: mode=Partial, gby=[d@6 as d], aggr=[LastValue(b)], ordering_mode=Sorted",
             "  SlidingHashJoinExec: join_type=Inner, on=[(z@2, c@2)], filter=0@0 + 0 > 1@1 - 3 AND 0@0 + 0 < 1@1 + 3",
             "    StreamingTableExec: partition_sizes=0, projection=[x, y, z], infinite_source=true, output_ordering=[x@0 ASC]",
             "    ProjectionExec: expr=[a@3 as a, b@4 as b, c@5 as c, d@0 as d, e@1 as e, c@2 as c]",
@@ -3900,7 +3858,7 @@ mod order_preserving_join_swap_tests {
             partial_aggregate_exec(second_join, partial_group_by, aggr_expr);
 
         let expected_input = [
-            "AggregateExec: mode=Partial, gby=[d@6 as d], aggr=[LastValue(y)], ordering_mode=FullyOrdered",
+            "AggregateExec: mode=Partial, gby=[d@6 as d], aggr=[LastValue(y)], ordering_mode=Sorted",
             "  HashJoinExec: mode=Partitioned, join_type=Inner, on=[(z@2, c@2)], filter=0@0 > 1@1",
             "    StreamingTableExec: partition_sizes=0, projection=[x, y, z], infinite_source=true, output_ordering=[x@0 ASC]",
             "    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, d@0)], filter=0@0 > 1@1",
@@ -3908,7 +3866,7 @@ mod order_preserving_join_swap_tests {
             "      MemoryExec: partitions=0, partition_sizes=[], output_ordering=d@0 ASC",
         ];
         let expected_optimized = [
-            "AggregateExec: mode=Partial, gby=[d@6 as d], aggr=[LastValue(y)], ordering_mode=FullyOrdered",
+            "AggregateExec: mode=Partial, gby=[d@6 as d], aggr=[LastValue(y)], ordering_mode=Sorted",
             "  PartitionedHashJoinExec: join_type=Inner, on=[(z@2, c@2)], filter=0@0 > 1@1",
             "    StreamingTableExec: partition_sizes=0, projection=[x, y, z], infinite_source=true, output_ordering=[x@0 ASC]",
             "    ProjectionExec: expr=[a@3 as a, b@4 as b, c@5 as c, d@0 as d, e@1 as e, c@2 as c]",
@@ -3929,7 +3887,7 @@ mod sql_fuzzy_tests {
     use crate::physical_plan::displayable;
     use crate::physical_plan::{collect, ExecutionPlan};
     use crate::prelude::{CsvReadOptions, SessionContext};
-    use arrow::util::pretty::pretty_format_batches;
+    use arrow::util::pretty::{pretty_format_batches, print_batches};
     use arrow_array::RecordBatch;
     use arrow_schema::{DataType, Field, Schema};
     use datafusion_execution::config::SessionConfig;
@@ -4111,11 +4069,18 @@ mod sql_fuzzy_tests {
     async fn experiment(expected_unbounded_plan: &[&str], sql: &str) -> Result<()> {
         let first_batches = unbounded_execution(expected_unbounded_plan, sql).await?;
         let second_batches = bounded_execution(sql).await?;
+        print_batches(&first_batches)?;
+        print_batches(&second_batches)?;
         compare_batches(&first_batches, &second_batches);
         Ok(())
     }
 
     fn compare_batches(collected_1: &[RecordBatch], collected_2: &[RecordBatch]) {
+        let left_row_num: usize = collected_1.iter().map(|batch| batch.num_rows()).sum();
+        let right_row_num: usize = collected_2.iter().map(|batch| batch.num_rows()).sum();
+        if left_row_num == 0 && right_row_num == 0 {
+            return;
+        }
         // compare
         let first_formatted = pretty_format_batches(collected_1).unwrap().to_string();
         let second_formatted = pretty_format_batches(collected_2).unwrap().to_string();
@@ -4160,7 +4125,7 @@ mod sql_fuzzy_tests {
 
         let expected_plan = [
             "ProjectionExec: expr=[o_orderkey@0 as o_orderkey, LAST_VALUE(lineitem.l_suppkey) ORDER BY [lineitem.l_orderkey ASC NULLS LAST]@1 as amount_usd]",
-            "  AggregateExec: mode=Single, gby=[o_orderkey@0 as o_orderkey], aggr=[LAST_VALUE(lineitem.l_suppkey)], ordering_mode=FullyOrdered",
+            "  AggregateExec: mode=Single, gby=[o_orderkey@0 as o_orderkey], aggr=[LAST_VALUE(lineitem.l_suppkey)], ordering_mode=Sorted",
             "    ProjectionExec: expr=[o_orderkey@3 as o_orderkey, l_orderkey@0 as l_orderkey, l_suppkey@1 as l_suppkey]",
             "      PartitionedHashJoinExec: join_type=Inner, on=[(l_shipdate@2, o_orderdate@1)], filter=l_orderkey@1 < o_orderkey@0 - 10",
             "        ProjectionExec: expr=[l_orderkey@0 as l_orderkey, l_suppkey@1 as l_suppkey, l_shipdate@3 as l_shipdate]",
@@ -4200,7 +4165,7 @@ mod sql_fuzzy_tests {
 
         let expected_plan = [
             "ProjectionExec: expr=[n_nationkey@0 as n_nationkey, LAST_VALUE(customer.c_custkey) ORDER BY [customer.c_custkey ASC NULLS LAST]@1 as amount_usd]",
-            "  AggregateExec: mode=Single, gby=[n_nationkey@1 as n_nationkey], aggr=[LAST_VALUE(customer.c_custkey)], ordering_mode=FullyOrdered",
+            "  AggregateExec: mode=Single, gby=[n_nationkey@1 as n_nationkey], aggr=[LAST_VALUE(customer.c_custkey)], ordering_mode=Sorted",
             "    ProjectionExec: expr=[c_custkey@0 as c_custkey, n_nationkey@2 as n_nationkey]",
             "      PartitionedHashJoinExec: join_type=Inner, on=[(c_nationkey@1, n_regionkey@1)], filter=n_nationkey@1 > c_custkey@0",
             "        ProjectionExec: expr=[c_custkey@1 as c_custkey, c_nationkey@2 as c_nationkey]",
@@ -4244,9 +4209,9 @@ mod sql_fuzzy_tests {
                         GROUP BY sub.n_nationkey";
 
         let expected_plan = [
-            "AggregateExec: mode=Single, gby=[n_nationkey@0 as n_nationkey], aggr=[SUM(sub.amount_usd)], ordering_mode=FullyOrdered",
+            "AggregateExec: mode=Single, gby=[n_nationkey@0 as n_nationkey], aggr=[SUM(sub.amount_usd)], ordering_mode=Sorted",
             "  ProjectionExec: expr=[n_nationkey@0 as n_nationkey, LAST_VALUE(customer.c_custkey) ORDER BY [customer.c_custkey ASC NULLS LAST]@1 as amount_usd]",
-            "    AggregateExec: mode=Single, gby=[n_nationkey@1 as n_nationkey], aggr=[LAST_VALUE(customer.c_custkey)], ordering_mode=FullyOrdered",
+            "    AggregateExec: mode=Single, gby=[n_nationkey@1 as n_nationkey], aggr=[LAST_VALUE(customer.c_custkey)], ordering_mode=Sorted",
             "      ProjectionExec: expr=[c_custkey@0 as c_custkey, n_nationkey@2 as n_nationkey]",
             "        PartitionedHashJoinExec: join_type=Inner, on=[(c_nationkey@1, n_regionkey@1)], filter=n_nationkey@1 > c_custkey@0",
             "          ProjectionExec: expr=[c_custkey@1 as c_custkey, c_nationkey@2 as c_nationkey]",
@@ -4278,7 +4243,7 @@ mod sql_fuzzy_tests {
 
         let expected_plan = [
             "ProjectionExec: expr=[o_orderkey@0 as o_orderkey, LAST_VALUE(lineitem.l_suppkey) ORDER BY [lineitem.l_orderkey ASC NULLS LAST]@1 as amount_usd]",
-            "  AggregateExec: mode=Single, gby=[o_orderkey@0 as o_orderkey], aggr=[LAST_VALUE(lineitem.l_suppkey)], ordering_mode=FullyOrdered",
+            "  AggregateExec: mode=Single, gby=[o_orderkey@0 as o_orderkey], aggr=[LAST_VALUE(lineitem.l_suppkey)], ordering_mode=Sorted",
             "    ProjectionExec: expr=[o_orderkey@3 as o_orderkey, l_orderkey@0 as l_orderkey, l_suppkey@1 as l_suppkey]",
             "      PartitionedHashJoinExec: join_type=Inner, on=[(l_shipdate@2, o_orderdate@1)], filter=l_orderkey@1 < o_orderkey@0 - 10",
             "        ProjectionExec: expr=[l_orderkey@0 as l_orderkey, l_suppkey@1 as l_suppkey, l_shipdate@3 as l_shipdate]",
@@ -4308,7 +4273,7 @@ mod sql_fuzzy_tests {
 
         let expected_plan = [
             "ProjectionExec: expr=[o_orderkey@0 as o_orderkey, LAST_VALUE(lineitem.l_suppkey) ORDER BY [lineitem.l_orderkey ASC NULLS LAST]@1 as amount_usd]",
-            "  AggregateExec: mode=Single, gby=[o_orderkey@0 as o_orderkey], aggr=[LAST_VALUE(lineitem.l_suppkey)], ordering_mode=FullyOrdered",
+            "  AggregateExec: mode=Single, gby=[o_orderkey@0 as o_orderkey], aggr=[LAST_VALUE(lineitem.l_suppkey)], ordering_mode=Sorted",
             "    ProjectionExec: expr=[o_orderkey@3 as o_orderkey, l_orderkey@0 as l_orderkey, l_suppkey@1 as l_suppkey]",
             "      SlidingHashJoinExec: join_type=Inner, on=[(l_shipdate@2, o_orderdate@1)], filter=l_orderkey@1 < o_orderkey@0 - 10 AND l_orderkey@1 > o_orderkey@0 + 10",
             "        ProjectionExec: expr=[l_orderkey@0 as l_orderkey, l_suppkey@1 as l_suppkey, l_shipdate@3 as l_shipdate]",
@@ -4338,7 +4303,7 @@ mod sql_fuzzy_tests {
 
         let expected_plan = [
             "ProjectionExec: expr=[o_orderkey@0 as o_orderkey, AVG(lineitem.l_suppkey)@1 as amount_usd]",
-            "  AggregateExec: mode=Single, gby=[o_orderkey@0 as o_orderkey], aggr=[AVG(lineitem.l_suppkey)], ordering_mode=FullyOrdered",
+            "  AggregateExec: mode=Single, gby=[o_orderkey@0 as o_orderkey], aggr=[AVG(lineitem.l_suppkey)], ordering_mode=Sorted",
             "    ProjectionExec: expr=[o_orderkey@3 as o_orderkey, l_suppkey@1 as l_suppkey]",
             "      SlidingHashJoinExec: join_type=Right, on=[(l_shipdate@2, o_orderdate@1)], filter=l_orderkey@1 < o_orderkey@0 - 10 AND l_orderkey@1 > o_orderkey@0 + 10",
             "        ProjectionExec: expr=[l_orderkey@0 as l_orderkey, l_suppkey@1 as l_suppkey, l_shipdate@3 as l_shipdate]",
@@ -4364,7 +4329,7 @@ mod sql_fuzzy_tests {
         ORDER BY o_orderkey";
 
         let expected_plan = [
-            "AggregateExec: mode=Single, gby=[o_orderkey@0 as o_orderkey], aggr=[], ordering_mode=FullyOrdered",
+            "AggregateExec: mode=Single, gby=[o_orderkey@0 as o_orderkey], aggr=[], ordering_mode=Sorted",
             "  ProjectionExec: expr=[o_orderkey@1 as o_orderkey]",
             "    CoalesceBatchesExec: target_batch_size=8192",
             "      HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(r_comment@0, o_comment@1)]",

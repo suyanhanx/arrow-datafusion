@@ -9,17 +9,16 @@ use std::{fmt, mem};
 
 use crate::common::SharedMemoryReservation;
 use crate::joins::hash_join::equal_rows_arr;
-use crate::joins::hash_join_utils::SortedFilterExpr;
 use crate::joins::sliding_window_join_utils::{
     calculate_the_necessary_build_side_range, check_if_sliding_window_condition_is_met,
     get_probe_batch, is_batch_suitable_interval_calculation,
 };
+use crate::joins::stream_join_utils::SortedFilterExpr;
 use crate::joins::utils::{
     apply_join_filter_to_indices, build_batch_from_indices, build_join_schema,
     calculate_join_output_ordering, check_join_is_valid,
-    combine_join_equivalence_properties, combine_join_ordering_equivalence_properties,
     get_filter_representation_of_build_side, partitioned_join_output_partitioning,
-    prepare_sorted_exprs, ColumnIndex, JoinFilter, JoinOn, JoinSide,
+    prepare_sorted_exprs, ColumnIndex, JoinFilter, JoinOn,
 };
 use crate::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
 use crate::{
@@ -31,21 +30,21 @@ use arrow::compute::concat_batches;
 use arrow_array::builder::{UInt32Builder, UInt64Builder};
 use arrow_array::{ArrayRef, RecordBatch, UInt32Array, UInt64Array};
 use arrow_schema::{Field, Schema, SchemaRef};
+use datafusion_common::hash_utils::create_hashes;
 use datafusion_common::utils::{
     get_record_batch_at_indices, get_row_at_idx, linear_search,
 };
 use datafusion_common::{
-    internal_err, DataFusionError, JoinType, Result, ScalarValue, Statistics,
+    internal_err, DataFusionError, JoinSide, JoinType, Result, ScalarValue, Statistics,
 };
 use datafusion_execution::memory_pool::MemoryConsumer;
 use datafusion_execution::TaskContext;
+use datafusion_physical_expr::equivalence::join_equivalence_properties;
 use datafusion_physical_expr::expressions::Column;
-use datafusion_physical_expr::hash_utils::create_hashes;
 use datafusion_physical_expr::intervals::{ExprIntervalGraph, Interval};
 use datafusion_physical_expr::window::PartitionKey;
 use datafusion_physical_expr::{
-    EquivalenceProperties, OrderingEquivalenceProperties, PhysicalExpr, PhysicalSortExpr,
-    PhysicalSortRequirement,
+    EquivalenceProperties, PhysicalExpr, PhysicalSortExpr, PhysicalSortRequirement,
 };
 
 use ahash::RandomState;
@@ -308,7 +307,7 @@ impl PartitionedHashJoinExec {
             left_schema.fields.len(),
             &Self::maintains_input_order(*join_type),
             Some(JoinSide::Right),
-        )?;
+        );
 
         Ok(Self {
             left,
@@ -519,7 +518,7 @@ impl BuildBuffer {
         let columns = self
             .on
             .iter()
-            .map(|c| Ok(c.evaluate(build_batch)?.into_array(build_batch.num_rows())))
+            .map(|c| c.evaluate(build_batch)?.into_array(build_batch.num_rows()))
             .collect::<Result<Vec<_>>>()?;
         // Calculate indices for each partition and construct a new record
         // batch from the rows at these indices for each partition:
@@ -676,7 +675,7 @@ impl BuildBuffer {
                                 let batch_arr = sort_expr
                                     .expr
                                     .evaluate(&intermediate_batch)?
-                                    .into_array(intermediate_batch.num_rows());
+                                    .into_array(intermediate_batch.num_rows())?;
 
                                 // Perform binary search on the array to determine the length of
                                 // the record batch to prune:
@@ -781,28 +780,15 @@ impl ExecutionPlan for PartitionedHashJoinExec {
     }
 
     fn equivalence_properties(&self) -> EquivalenceProperties {
-        let left_columns_len = self.left.schema().fields.len();
-        combine_join_equivalence_properties(
-            self.join_type,
+        join_equivalence_properties(
             self.left.equivalence_properties(),
             self.right.equivalence_properties(),
-            left_columns_len,
-            &self.on,
-            self.schema(),
-        )
-    }
-
-    fn ordering_equivalence_properties(&self) -> OrderingEquivalenceProperties {
-        combine_join_ordering_equivalence_properties(
-            &self.join_type,
-            &self.left,
-            &self.right,
+            self.join_type(),
             self.schema(),
             &self.maintains_input_order(),
             Some(Self::probe_side()),
-            self.equivalence_properties(),
+            self.on(),
         )
-        .unwrap()
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
@@ -900,9 +886,9 @@ impl ExecutionPlan for PartitionedHashJoinExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn statistics(&self) -> Statistics {
+    fn statistics(&self) -> Result<Statistics> {
         // TODO stats: it is not possible in general to know the output size of joins
-        Statistics::default()
+        Ok(Statistics::new_unknown(&self.schema))
     }
 }
 
@@ -1092,7 +1078,7 @@ impl PartitionedHashJoinStream {
         let filter = &self.filter;
         let keys_values = probe_on
             .iter()
-            .map(|c| Ok(c.evaluate(probe_batch)?.into_array(probe_batch.num_rows())))
+            .map(|c| c.evaluate(probe_batch)?.into_array(probe_batch.num_rows()))
             .collect::<Result<Vec<_>>>()?;
         let mut hashes_buffer = vec![0_u64; probe_batch.num_rows()];
         let hash_values = create_hashes(&keys_values, random_state, &mut hashes_buffer)?;
@@ -1118,9 +1104,7 @@ impl PartitionedHashJoinStream {
                     .build_buffer
                     .on
                     .iter()
-                    .map(|c| {
-                        Ok(c.evaluate(build_batch)?.into_array(build_batch.num_rows()))
-                    })
+                    .map(|c| c.evaluate(build_batch)?.into_array(build_batch.num_rows()))
                     .collect::<Result<Vec<_>>>()?;
                 let (build_indices, probe_indices) =
                     build_join_indices(row, probe_batch, build_batch, filter)?;
@@ -1340,14 +1324,12 @@ mod fuzzy_tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-
     use crate::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
     use crate::common;
     use crate::joins::test_utils::{
         build_sides_record_batches, compare_batches, create_memory_table,
         split_record_batches,
     };
-    use crate::joins::utils::JoinSide;
     use crate::joins::{HashJoinExec, PartitionMode};
     use crate::repartition::RepartitionExec;
     use crate::sorts::sort_preserving_merge::SortPreservingMergeExec;
@@ -1355,9 +1337,10 @@ mod fuzzy_tests {
     use arrow::datatypes::{DataType, Field};
     use arrow_schema::{SortOptions, TimeUnit};
     use datafusion_expr::Operator;
+    use datafusion_physical_expr::equivalence::add_offset_to_expr;
     use datafusion_physical_expr::expressions::{binary, col, BinaryExpr, Literal};
     use datafusion_physical_expr::{
-        add_offset_to_lex_ordering, expressions, AggregateExpr,
+        expressions, AggregateExpr, LexOrdering, LexOrderingRef,
     };
 
     use once_cell::sync::Lazy;
@@ -1370,6 +1353,20 @@ mod fuzzy_tests {
     // Cache for storing tables
     static TABLE_CACHE: Lazy<Mutex<HashMap<TableKey, TableValue>>> =
         Lazy::new(|| Mutex::new(HashMap::new()));
+
+    /// Add offset to the column indices of the lexicographical ordering given
+    pub fn add_offset_to_lex_ordering(
+        sort_exprs: LexOrderingRef,
+        offset: usize,
+    ) -> LexOrdering {
+        sort_exprs
+            .iter()
+            .map(|sort_expr| PhysicalSortExpr {
+                expr: add_offset_to_expr(sort_expr.expr.clone(), offset),
+                options: sort_expr.options,
+            })
+            .collect()
+    }
 
     fn get_or_create_table(
         cardinality: (i32, i32),
@@ -1474,7 +1471,7 @@ mod fuzzy_tests {
             .unwrap();
 
         let adjusted_right_order =
-            add_offset_to_lex_ordering(&right_sort_expr, left.schema().fields().len())?;
+            add_offset_to_lex_ordering(&right_sort_expr, left.schema().fields().len());
 
         let join = Arc::new(HashJoinExec::try_new(
             Arc::new(RepartitionExec::try_new(
@@ -1563,7 +1560,7 @@ mod fuzzy_tests {
             .unwrap();
 
         let adjusted_right_order =
-            add_offset_to_lex_ordering(&right_sort_expr, left.schema().fields().len())?;
+            add_offset_to_lex_ordering(&right_sort_expr, left.schema().fields().len());
 
         let join = Arc::new(PartitionedHashJoinExec::try_new(
             Arc::new(RepartitionExec::try_new(

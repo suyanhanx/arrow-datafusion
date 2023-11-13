@@ -32,7 +32,7 @@ use crate::datasource::physical_plan::CsvExec;
 use crate::error::Result;
 use crate::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use crate::physical_plan::filter::FilterExec;
-use crate::physical_plan::joins::utils::{ColumnIndex, JoinFilter, JoinSide};
+use crate::physical_plan::joins::utils::{ColumnIndex, JoinFilter};
 use crate::physical_plan::joins::{
     CrossJoinExec, HashJoinExec, NestedLoopJoinExec, SlidingHashJoinExec,
     SortMergeJoinExec, SymmetricHashJoinExec,
@@ -1272,7 +1272,7 @@ mod tests {
     use crate::physical_optimizer::PhysicalOptimizerRule;
     use crate::physical_plan::coalesce_partitions::CoalescePartitionsExec;
     use crate::physical_plan::filter::FilterExec;
-    use crate::physical_plan::joins::utils::{ColumnIndex, JoinFilter, JoinSide};
+    use crate::physical_plan::joins::utils::{ColumnIndex, JoinFilter};
     use crate::physical_plan::joins::StreamJoinPartitionMode;
     use crate::physical_plan::memory::MemoryExec;
     use crate::physical_plan::projection::ProjectionExec;
