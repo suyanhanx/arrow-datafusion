@@ -26,8 +26,7 @@ use std::fmt::Formatter;
 use std::sync::Arc;
 
 use crate::config::ConfigOptions;
-use crate::error::{DataFusionError, Result};
-use crate::datasource::physical_plan::{CsvExec, ParquetExec};
+use crate::error::Result;
 use crate::physical_optimizer::utils::{
     add_sort_above, get_children_exectrees, is_coalesce_partitions, is_repartition,
     is_sort_preserving_merge, ExecTree,

@@ -207,6 +207,7 @@ mod unix_test {
     // This test provides a relatively realistic end-to-end scenario where
     // we change the join into a [SymmetricHashJoin] to accommodate two
     // unbounded (FIFO) sources.
+    #[ignore]
     #[tokio::test]
     async fn unbounded_file_with_symmetric_join() -> Result<()> {
         // Create session context

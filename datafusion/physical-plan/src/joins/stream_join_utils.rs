@@ -20,10 +20,9 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt::{Debug, Display, Formatter};
-use std::ops::IndexMut;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::usize;
+use std::{fmt, usize};
 
 use crate::joins::utils::{JoinFilter, JoinHashMapType, StatefulStreamResult};
 use crate::metrics::{ExecutionPlanMetricsSet, MetricBuilder};
@@ -35,15 +34,14 @@ use arrow_buffer::{ArrowNativeType, BooleanBufferBuilder};
 use arrow_schema::{Schema, SchemaRef};
 use async_trait::async_trait;
 use arrow_schema::SortOptions;
+use async_trait::async_trait;
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{DataFusionError, JoinSide, Result, ScalarValue};
 use datafusion_execution::SendableRecordBatchStream;
 use datafusion_expr::interval_arithmetic::Interval;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::utils::collect_columns;
-use datafusion_physical_expr::{
-    EquivalenceProperties, OrderingEquivalenceProperties, PhysicalExpr, PhysicalSortExpr,
-};
+use datafusion_physical_expr::{EquivalenceProperties, PhysicalExpr, PhysicalSortExpr};
 
 use futures::{ready, FutureExt, StreamExt};
 use hashbrown::raw::RawTable;
@@ -255,7 +253,7 @@ pub fn map_origin_col_to_filter_col(
 ///
 /// The method works as follows:
 /// 1. Collect all globally ordered (the first expression in lexical ordering) expressions with
-/// [`EquivalenceProperties`] and [`OrderingEquivalenceProperties`]
+/// [`EquivalenceProperties`]
 /// 2. Maps the original columns to the filter columns using the [`map_origin_col_to_filter_col`] function.
 /// 3. Constructs an intermediate schema from the filter columns included in the particular join side.
 /// For each [`PhysicalSortExpr`]
@@ -282,31 +280,28 @@ pub fn build_filter_input_order(
     schema: &SchemaRef,
     sort_expr: &PhysicalSortExpr,
     equivalence_properties: &EquivalenceProperties,
-    ordering_equivalence_properties: &OrderingEquivalenceProperties,
 ) -> Result<Vec<SortedFilterExpr>> {
     let mut additional_sort_exprs: HashSet<PhysicalSortExpr> = HashSet::new();
     additional_sort_exprs.insert(sort_expr.clone());
-    if let Some(class) = ordering_equivalence_properties.oeq_class() {
-        for ordering in class.iter() {
-            additional_sort_exprs.insert(ordering[0].clone());
-        }
+
+    for ordering in equivalence_properties.oeq_class().iter() {
+        additional_sort_exprs.insert(ordering[0].clone());
     }
     let mut temp_sort_exprs = vec![];
     for global_sort in &additional_sort_exprs {
-        if let Some(col) = global_sort.expr.as_any().downcast_ref::<Column>() {
-            for class in equivalence_properties.classes() {
-                if class.contains(col) {
-                    let sort_exprs = class.iter().map(|col| PhysicalSortExpr {
-                        expr: Arc::new(col.clone()),
-                        options: global_sort.options,
-                    });
-                    temp_sort_exprs.extend(sort_exprs)
-                }
+        for class in equivalence_properties.eq_group().iter() {
+            if class.contains(&global_sort.expr) {
+                let sort_exprs = class.iter().map(|expr| PhysicalSortExpr {
+                    expr: expr.clone(),
+                    options: global_sort.options,
+                });
+                temp_sort_exprs.extend(sort_exprs)
             }
         }
     }
 
     additional_sort_exprs.extend(temp_sort_exprs);
+
     let column_map = map_origin_col_to_filter_col(filter, schema, &side)?;
     let intermediate_schema = get_filter_representation_schema_of_build_side(
         filter.schema(),
@@ -489,10 +484,10 @@ impl SortedFilterExpr {
 ///
 /// # Arguments
 ///
-/// * `build_input_buffer` - The [`RecordBatch`] on the build side of the join.
-/// * `build_sorted_filter_exprs` - Build side [`SortedFilterExpr`] to update.
+/// * `build_input_buffer` - The [RecordBatch] on the build side of the join.
+/// * `build_sorted_filter_expr` - Build side [SortedFilterExpr] to update.
 /// * `probe_batch` - The `RecordBatch` on the probe side of the join.
-/// * `probe_sorted_filter_exprs` - Probe side `SortedFilterExpr` to update.
+/// * `probe_sorted_filter_expr` - Probe side `SortedFilterExpr` to update.
 ///
 /// ### Note
 /// ```text
@@ -559,6 +554,9 @@ pub fn calculate_filter_expr_intervals(
         filter.column_indices(),
         build_side,
     )?;
+    // println!("++++ Build side");
+    // print_batches(&[build_intermediate_batch.clone()])?;
+    // println!("build_sorted_filter_exprs {:?}", build_sorted_filter_exprs[0].intermediate_batch_filter_expr);
     // Calculate the interval for the build side filter expression (if present):
     update_filter_expr_interval(&build_intermediate_batch, build_sorted_filter_exprs)?;
     let probe_intermediate_batch = get_filter_representation_of_build_side(
@@ -567,6 +565,9 @@ pub fn calculate_filter_expr_intervals(
         filter.column_indices(),
         build_side.negate(),
     )?;
+    // println!("++++ Probe side");
+    // print_batches(&[probe_intermediate_batch.clone()])?;
+    // println!("probe_sorted_filter_exprs {:?}", probe_sorted_filter_exprs[0].intermediate_batch_filter_expr);
     // Calculate the interval for the probe side filter expression (if present):
     update_filter_expr_interval(&probe_intermediate_batch, probe_sorted_filter_exprs)
 }
@@ -583,7 +584,7 @@ pub fn update_filter_expr_interval(
         let array = sorted_expr
             .intermediate_batch_filter_expr()
             .evaluate(batch)?
-            .into_array(1);
+            .into_array(1)?;
         // Convert the array to a ScalarValue:
         let value = ScalarValue::try_from_array(&array, 0)?;
         // Create a ScalarValue representing positive or negative infinity for the same data type:
@@ -1124,212 +1125,20 @@ pub mod tests {
     use super::*;
     use crate::joins::stream_join_utils::{
         build_filter_input_order, check_filter_expr_contains_sort_information,
-        convert_sort_expr_with_filter_schema, PruningJoinHashMap,
+        PruningJoinHashMap,
     };
     use crate::{
         expressions::{Column, PhysicalSortExpr},
         joins::utils::{ColumnIndex, JoinFilter},
     };
 
+    use crate::joins::test_utils;
+    use crate::joins::test_utils::complicated_filter;
     use arrow::compute::SortOptions;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_common::{JoinSide, ScalarValue};
     use datafusion_expr::Operator;
-    use datafusion_physical_expr::expressions::{binary, cast, col, lit};
-
-    /// Filter expr for a + b > c + 10 AND a + b < c + 100
-    pub(crate) fn complicated_filter(
-        filter_schema: &Schema,
-    ) -> Result<Arc<dyn PhysicalExpr>> {
-        let left_expr = binary(
-            cast(
-                binary(
-                    col("0", filter_schema)?,
-                    Operator::Plus,
-                    col("1", filter_schema)?,
-                    filter_schema,
-                )?,
-                filter_schema,
-                DataType::Int64,
-            )?,
-            Operator::Gt,
-            binary(
-                cast(col("2", filter_schema)?, filter_schema, DataType::Int64)?,
-                Operator::Plus,
-                lit(ScalarValue::Int64(Some(10))),
-                filter_schema,
-            )?,
-            filter_schema,
-        )?;
-
-        let right_expr = binary(
-            cast(
-                binary(
-                    col("0", filter_schema)?,
-                    Operator::Plus,
-                    col("1", filter_schema)?,
-                    filter_schema,
-                )?,
-                filter_schema,
-                DataType::Int64,
-            )?,
-            Operator::Lt,
-            binary(
-                cast(col("2", filter_schema)?, filter_schema, DataType::Int64)?,
-                Operator::Plus,
-                lit(ScalarValue::Int64(Some(100))),
-                filter_schema,
-            )?,
-            filter_schema,
-        )?;
-        binary(left_expr, Operator::And, right_expr, filter_schema)
-    }
-
-    pub(crate) fn complicated_4_column_exprs(
-        expr_id: usize,
-        filter_schema: &Schema,
-    ) -> Result<Arc<dyn PhysicalExpr>> {
-        let columns = filter_schema
-            .fields()
-            .iter()
-            .enumerate()
-            .map(|(index, field)| Column::new(field.name(), index))
-            .map(Arc::new)
-            .collect::<Vec<_>>();
-        match expr_id {
-            // Filter expr for a + b > d + 10 AND a < c + 20
-            0 => {
-                let left_expr = binary(
-                    cast(
-                        binary(
-                            columns[0].clone(),
-                            Operator::Plus,
-                            columns[1].clone(),
-                            filter_schema,
-                        )?,
-                        filter_schema,
-                        DataType::Int64,
-                    )?,
-                    Operator::Gt,
-                    binary(
-                        cast(columns[3].clone(), filter_schema, DataType::Int64)?,
-                        Operator::Plus,
-                        lit(ScalarValue::Int64(Some(10))),
-                        filter_schema,
-                    )?,
-                    filter_schema,
-                )?;
-
-                let right_expr = binary(
-                    cast(columns[0].clone(), filter_schema, DataType::Int64)?,
-                    Operator::Lt,
-                    binary(
-                        cast(columns[2].clone(), filter_schema, DataType::Int64)?,
-                        Operator::Plus,
-                        lit(ScalarValue::Int64(Some(20))),
-                        filter_schema,
-                    )?,
-                    filter_schema,
-                )?;
-                binary(left_expr, Operator::And, right_expr, filter_schema)
-            }
-            // Filter expr for a + b > d + 10 AND a < c + 20 AND c > b
-            1 => {
-                let left_expr = binary(
-                    cast(
-                        binary(
-                            columns[0].clone(),
-                            Operator::Plus,
-                            columns[1].clone(),
-                            filter_schema,
-                        )?,
-                        filter_schema,
-                        DataType::Int64,
-                    )?,
-                    Operator::Gt,
-                    binary(
-                        cast(columns[3].clone(), filter_schema, DataType::Int64)?,
-                        Operator::Plus,
-                        lit(ScalarValue::Int64(Some(10))),
-                        filter_schema,
-                    )?,
-                    filter_schema,
-                )?;
-
-                let right_expr = binary(
-                    cast(columns[0].clone(), filter_schema, DataType::Int64)?,
-                    Operator::Lt,
-                    binary(
-                        cast(columns[2].clone(), filter_schema, DataType::Int64)?,
-                        Operator::Plus,
-                        lit(ScalarValue::Int64(Some(20))),
-                        filter_schema,
-                    )?,
-                    filter_schema,
-                )?;
-                let left_and =
-                    binary(left_expr, Operator::And, right_expr, filter_schema)?;
-                let right_and = binary(
-                    cast(columns[2].clone(), filter_schema, DataType::Int64)?,
-                    Operator::GtEq,
-                    binary(
-                        cast(columns[1].clone(), filter_schema, DataType::Int64)?,
-                        Operator::Plus,
-                        lit(ScalarValue::Int64(Some(20))),
-                        filter_schema,
-                    )?,
-                    filter_schema,
-                )?;
-                binary(left_and, Operator::And, right_and, filter_schema)
-            }
-            // a + b > c + 10 AND a + b < c + 100
-            2 => {
-                let left_expr = binary(
-                    cast(
-                        binary(
-                            columns[0].clone(),
-                            Operator::Plus,
-                            columns[1].clone(),
-                            filter_schema,
-                        )?,
-                        filter_schema,
-                        DataType::Int64,
-                    )?,
-                    Operator::Gt,
-                    binary(
-                        cast(columns[2].clone(), filter_schema, DataType::Int64)?,
-                        Operator::Plus,
-                        lit(ScalarValue::Int64(Some(10))),
-                        filter_schema,
-                    )?,
-                    filter_schema,
-                )?;
-
-                let right_expr = binary(
-                    cast(
-                        binary(
-                            columns[0].clone(),
-                            Operator::Plus,
-                            columns[1].clone(),
-                            filter_schema,
-                        )?,
-                        filter_schema,
-                        DataType::Int64,
-                    )?,
-                    Operator::Lt,
-                    binary(
-                        cast(columns[2].clone(), filter_schema, DataType::Int64)?,
-                        Operator::Plus,
-                        lit(ScalarValue::Int64(Some(100))),
-                        filter_schema,
-                    )?,
-                    filter_schema,
-                )?;
-                binary(left_expr, Operator::And, right_expr, filter_schema)
-            }
-            _ => unimplemented!(),
-        }
-    }
+    use datafusion_physical_expr::expressions::{binary, cast, col};
 
     #[test]
     fn test_column_exchange() -> Result<()> {
@@ -1402,15 +1211,12 @@ pub mod tests {
         let filter = JoinFilter::new(filter_expr, column_indices, intermediate_schema);
 
         let empty_eq = EquivalenceProperties::new(Arc::new(Schema::empty()));
-        let empty_order_eq =
-            OrderingEquivalenceProperties::new(Arc::new(Schema::empty()));
         let left_sort_filter_exprs = build_filter_input_order(
             JoinSide::Left,
             &filter,
             &Arc::new(left_child_schema),
             &left_child_sort_expr,
             &empty_eq,
-            &empty_order_eq,
         )?;
 
         assert!(left_child_filter_sort_expr.eq(left_sort_filter_exprs[0].filter_expr()));
@@ -1421,7 +1227,6 @@ pub mod tests {
             &Arc::new(right_child_schema),
             &right_child_sort_expr,
             &empty_eq,
-            &empty_order_eq,
         )?;
         assert!(right_child_filter_sort_expr.eq(right_sort_filter_exprs[0].filter_expr()));
         Ok(())
@@ -1533,8 +1338,6 @@ pub mod tests {
         let right_schema = Arc::new(right_schema);
 
         let empty_eq = EquivalenceProperties::new(Arc::new(Schema::empty()));
-        let empty_order_eq =
-            OrderingEquivalenceProperties::new(Arc::new(Schema::empty()));
 
         assert!(!build_filter_input_order(
             JoinSide::Left,
@@ -1545,7 +1348,6 @@ pub mod tests {
                 options: SortOptions::default(),
             },
             &empty_eq,
-            &empty_order_eq
         )?
         .is_empty());
 
@@ -1558,7 +1360,6 @@ pub mod tests {
                 options: SortOptions::default(),
             },
             &empty_eq,
-            &empty_order_eq
         )?
         .is_empty());
         assert!(!build_filter_input_order(
@@ -1570,7 +1371,6 @@ pub mod tests {
                 options: SortOptions::default(),
             },
             &empty_eq,
-            &empty_order_eq
         )?
         .is_empty());
         assert!(build_filter_input_order(
@@ -1582,7 +1382,6 @@ pub mod tests {
                 options: SortOptions::default(),
             },
             &empty_eq,
-            &empty_order_eq
         )?
         .is_empty());
 
@@ -1615,7 +1414,8 @@ pub mod tests {
             Field::new("2", DataType::Int32, true),
             Field::new("3", DataType::Int32, true),
         ]);
-        let filter_expr = complicated_4_column_exprs(0, &intermediate_schema)?;
+        let filter_expr =
+            test_utils::complicated_4_column_exprs(0, &intermediate_schema)?;
         let column_indices = vec![
             ColumnIndex {
                 index: left_schema.index_of("la1").unwrap(),
@@ -1639,13 +1439,10 @@ pub mod tests {
         let left_schema = Arc::new(left_schema);
 
         let mut left_eq = EquivalenceProperties::new(left_schema.clone());
-        let mut left_order_eq = OrderingEquivalenceProperties::new(left_schema.clone());
 
         // Add a column exist in filter
-        left_eq.add_equal_conditions((
-            &Column::new_with_schema("la2", &left_schema)?,
-            &Column::new_with_schema("la1", &left_schema)?,
-        ));
+        left_eq
+            .add_equal_conditions(&col("la2", &left_schema)?, &col("la1", &left_schema)?);
 
         let res = build_filter_input_order(
             JoinSide::Left,
@@ -1656,22 +1453,21 @@ pub mod tests {
                 options: SortOptions::default(),
             },
             &left_eq,
-            &left_order_eq,
         )?;
 
         assert_eq!(res.len(), 2);
 
         // Add a column exist in filter
-        left_order_eq.add_equal_conditions((
-            &vec![PhysicalSortExpr {
+        left_eq.add_new_orderings(vec![
+            vec![PhysicalSortExpr {
                 expr: Arc::new(Column::new_with_schema("la2", &left_schema)?),
                 options: SortOptions::default(),
             }],
-            &vec![PhysicalSortExpr {
+            vec![PhysicalSortExpr {
                 expr: Arc::new(Column::new_with_schema("lt1", &left_schema)?),
                 options: SortOptions::default(),
             }],
-        ));
+        ]);
 
         let res = build_filter_input_order(
             JoinSide::Left,
@@ -1682,22 +1478,21 @@ pub mod tests {
                 options: SortOptions::default(),
             },
             &left_eq,
-            &left_order_eq,
         )?;
 
         assert_eq!(res.len(), 3);
 
         // Add a column exist in filter
-        left_order_eq.add_equal_conditions((
-            &vec![PhysicalSortExpr {
+        left_eq.add_new_orderings(vec![
+            vec![PhysicalSortExpr {
                 expr: Arc::new(Column::new_with_schema("lc1", &left_schema)?),
                 options: SortOptions::default(),
             }],
-            &vec![PhysicalSortExpr {
+            vec![PhysicalSortExpr {
                 expr: Arc::new(Column::new_with_schema("lt1", &left_schema)?),
                 options: SortOptions::default(),
             }],
-        ));
+        ]);
 
         let res = build_filter_input_order(
             JoinSide::Left,
@@ -1708,7 +1503,6 @@ pub mod tests {
                 options: SortOptions::default(),
             },
             &left_eq,
-            &left_order_eq,
         )?;
 
         assert_eq!(res.len(), 3);
@@ -1758,14 +1552,12 @@ pub mod tests {
 
         let schema = Arc::new(schema);
         let eq_prop = EquivalenceProperties::new(schema.clone());
-        let order_eq_prop = OrderingEquivalenceProperties::new(schema.clone());
         let res = build_filter_input_order(
             JoinSide::Left,
             &filter,
             &schema,
             &sorted,
             &eq_prop,
-            &order_eq_prop,
         )?;
         assert!(res.is_empty());
         Ok(())

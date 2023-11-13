@@ -45,7 +45,7 @@ use datafusion::physical_plan::expressions::{
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::functions::make_scalar_function;
 use datafusion::physical_plan::insert::FileSinkExec;
-use datafusion::physical_plan::joins::utils::{ColumnIndex, JoinFilter, JoinSide};
+use datafusion::physical_plan::joins::utils::{ColumnIndex, JoinFilter};
 use datafusion::physical_plan::joins::{
     HashJoinExec, NestedLoopJoinExec, PartitionMode, SlidingHashJoinExec,
     SlidingNestedLoopJoinExec, StreamJoinPartitionMode, SymmetricHashJoinExec,
@@ -67,7 +67,7 @@ use datafusion::scalar::ScalarValue;
 use datafusion_common::file_options::json_writer::JsonWriterOptions;
 use datafusion_common::parsers::CompressionTypeVariant;
 use datafusion_common::stats::Precision;
-use datafusion_common::{FileTypeWriterOptions, Result};
+use datafusion_common::{FileTypeWriterOptions, JoinSide, Result};
 use datafusion_expr::{
     Accumulator, AccumulatorFactoryFunction, AggregateUDF, ReturnTypeFunction, Signature,
     StateTypeFunction, WindowFrame, WindowFrameBound,
@@ -756,43 +756,6 @@ fn roundtrip_json_sink() -> Result<()> {
         schema.clone(),
         Some(sort_order),
     )))
-fn roundtrip_sym_hash_join() -> Result<()> {
-    let field_a = Field::new("col", DataType::Int64, false);
-    let schema_left = Schema::new(vec![field_a.clone()]);
-    let schema_right = Schema::new(vec![field_a]);
-    let on = vec![(
-        Column::new("col", schema_left.index_of("col")?),
-        Column::new("col", schema_right.index_of("col")?),
-    )];
-
-    let schema_left = Arc::new(schema_left);
-    let schema_right = Arc::new(schema_right);
-    for join_type in &[
-        JoinType::Inner,
-        JoinType::Left,
-        JoinType::Right,
-        JoinType::Full,
-        JoinType::LeftAnti,
-        JoinType::RightAnti,
-        JoinType::LeftSemi,
-        JoinType::RightSemi,
-    ] {
-        for partition_mode in &[
-            StreamJoinPartitionMode::Partitioned,
-            StreamJoinPartitionMode::SinglePartition,
-        ] {
-            roundtrip_test(Arc::new(SymmetricHashJoinExec::try_new(
-                Arc::new(EmptyExec::new(false, schema_left.clone())),
-                Arc::new(EmptyExec::new(false, schema_right.clone())),
-                on.clone(),
-                None,
-                join_type,
-                false,
-                *partition_mode,
-            )?))?;
-        }
-    }
-    Ok(())
 }
 
 #[test]

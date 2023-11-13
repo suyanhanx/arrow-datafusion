@@ -176,10 +176,8 @@ fn is_prunable(join: &SymmetricHashJoinExec, children_unbounded: &[bool]) -> boo
             join.left().output_ordering().map(|arr| arr[0].clone()),
             // Get the right leading order
             join.right().output_ordering().map(|arr| arr[0].clone()),
-            || join.left().equivalence_properties(),
-            || join.left().ordering_equivalence_properties(),
-            || join.right().equivalence_properties(),
-            || join.right().ordering_equivalence_properties(),
+            &join.left().equivalence_properties(),
+            &join.right().equivalence_properties(),
         )
         .unwrap_or((false, false));
         (prunable_sides.1 || !children_unbounded[1])

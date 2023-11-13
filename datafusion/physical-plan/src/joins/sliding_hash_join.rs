@@ -25,10 +25,6 @@ use crate::common::SharedMemoryReservation;
 use crate::expressions::{Column, PhysicalSortExpr};
 use crate::joins::{
     hash_join::build_equal_condition_join_indices,
-    hash_join_utils::{
-        calculate_filter_expr_intervals, combine_two_batches, record_visited_indices,
-        SortedFilterExpr,
-    },
     sliding_window_join_utils::{
         adjust_probe_side_indices_by_join_type,
         calculate_build_outer_indices_by_join_type,
@@ -36,17 +32,21 @@ use crate::joins::{
         check_if_sliding_window_condition_is_met, get_probe_batch,
         is_batch_suitable_interval_calculation, JoinStreamState,
     },
+    stream_join_utils::{
+        calculate_filter_expr_intervals, combine_two_batches, record_visited_indices,
+        SortedFilterExpr,
+    },
     symmetric_hash_join::OneSideHashJoiner,
     utils::{
         build_batch_from_indices, build_join_schema, calculate_join_output_ordering,
-        check_join_is_valid, combine_join_equivalence_properties,
-        combine_join_ordering_equivalence_properties,
-        partitioned_join_output_partitioning, prepare_sorted_exprs, ColumnIndex,
-        JoinFilter, JoinOn, JoinSide,
+        check_join_is_valid, partitioned_join_output_partitioning, prepare_sorted_exprs,
+        swap_filter, swap_join_on, swap_join_type, swap_reverting_projection,
+        ColumnIndex, JoinFilter, JoinOn,
     },
     StreamJoinPartitionMode,
 };
 use crate::metrics::{self, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
+use crate::projection::ProjectionExec;
 use crate::{DataFusionError, Result};
 use crate::{
     DisplayAs, DisplayFormatType, Distribution, EquivalenceProperties, ExecutionPlan,
@@ -55,16 +55,13 @@ use crate::{
 
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use datafusion_common::{internal_err, plan_err, JoinType};
+use datafusion_common::{internal_err, plan_err, JoinSide, JoinType};
 use datafusion_execution::memory_pool::MemoryConsumer;
 use datafusion_execution::TaskContext;
+use datafusion_physical_expr::equivalence::join_equivalence_properties;
 use datafusion_physical_expr::intervals::ExprIntervalGraph;
-use datafusion_physical_expr::{OrderingEquivalenceProperties, PhysicalSortRequirement};
+use datafusion_physical_expr::PhysicalSortRequirement;
 
-use crate::joins::utils::{
-    swap_filter, swap_join_on, swap_join_type, swap_reverting_projection,
-};
-use crate::projection::ProjectionExec;
 use ahash::RandomState;
 use futures::{ready, Stream, StreamExt};
 use parking_lot::Mutex;
@@ -276,7 +273,7 @@ impl SlidingHashJoinExec {
             left_schema.fields.len(),
             &Self::maintains_input_order(*join_type),
             Some(JoinSide::Right),
-        )?;
+        );
 
         Ok(SlidingHashJoinExec {
             left,
@@ -437,32 +434,19 @@ impl ExecutionPlan for SlidingHashJoinExec {
     }
 
     fn equivalence_properties(&self) -> EquivalenceProperties {
-        let left_columns_len = self.left.schema().fields.len();
-        combine_join_equivalence_properties(
-            self.join_type,
+        join_equivalence_properties(
             self.left.equivalence_properties(),
             self.right.equivalence_properties(),
-            left_columns_len,
-            &self.on,
+            self.join_type(),
             self.schema(),
+            &self.maintains_input_order(),
+            Some(JoinSide::Right),
+            self.on(),
         )
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
         Self::maintains_input_order(self.join_type)
-    }
-
-    fn ordering_equivalence_properties(&self) -> OrderingEquivalenceProperties {
-        combine_join_ordering_equivalence_properties(
-            &self.join_type,
-            &self.left,
-            &self.right,
-            self.schema(),
-            &self.maintains_input_order(),
-            Some(JoinSide::Right),
-            self.equivalence_properties(),
-        )
-        .unwrap()
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
@@ -560,9 +544,9 @@ impl ExecutionPlan for SlidingHashJoinExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn statistics(&self) -> Statistics {
+    fn statistics(&self) -> Result<Statistics> {
         // TODO stats: it is not possible in general to know the output size of joins
-        Statistics::default()
+        Ok(Statistics::new_unknown(&self.schema))
     }
 }
 
@@ -1173,9 +1157,10 @@ impl SlidingHashJoinStream {
 mod tests {
     const TABLE_SIZE: i32 = 30;
 
-    use once_cell::sync::Lazy;
     use std::collections::HashMap;
     use std::sync::Mutex;
+
+    use once_cell::sync::Lazy;
 
     type TableKey = (i32, i32, usize); // (cardinality.0, cardinality.1, batch_size)
     type TableValue = (Vec<RecordBatch>, Vec<RecordBatch>); // (left, right)
@@ -1219,17 +1204,15 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::joins::hash_join_utils::tests::{
-        complicated_4_column_exprs, complicated_filter,
-    };
+    use crate::joins::test_utils::complicated_4_column_exprs;
     use crate::joins::test_utils::{
-        build_sides_record_batches, compare_batches, create_memory_table,
-        join_expr_tests_fixture_i32, partitioned_hash_join_with_filter,
-        split_record_batches,
+        build_sides_record_batches, compare_batches, complicated_filter,
+        create_memory_table, join_expr_tests_fixture_i32,
+        partitioned_hash_join_with_filter, split_record_batches,
     };
     use crate::joins::utils::JoinOn;
     use crate::repartition::RepartitionExec;
-    use crate::{common, expressions::Column, joins::utils::JoinSide};
+    use crate::{common, expressions::Column};
 
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow_schema::SortOptions;

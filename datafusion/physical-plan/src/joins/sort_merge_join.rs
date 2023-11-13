@@ -33,9 +33,8 @@ use std::task::{Context, Poll};
 use crate::expressions::{Column, PhysicalSortExpr};
 use crate::joins::utils::{
     build_join_schema, calculate_join_output_ordering, check_join_is_valid,
-    combine_join_equivalence_properties, combine_join_ordering_equivalence_properties,
     estimate_join_statistics, partitioned_join_output_partitioning, swap_join_type,
-    swap_reverting_projection, JoinOn, JoinSide,
+    swap_reverting_projection, JoinOn,
 };
 use crate::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
 use crate::{

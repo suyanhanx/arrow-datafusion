@@ -39,7 +39,6 @@ pub mod test_utils;
 pub mod topk_aggregation;
 
 mod join_pipeline_selection;
-mod projection_pushdown;
 mod sort_pushdown;
 mod utils;
 

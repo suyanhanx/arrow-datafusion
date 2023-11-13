@@ -21,7 +21,6 @@ use std::fmt;
 use std::fmt::Formatter;
 use std::sync::Arc;
 
-use crate::error::Result;
 use crate::physical_plan::aggregates::AggregateExec;
 use crate::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use crate::physical_plan::joins::{CrossJoinExec, HashJoinExec, NestedLoopJoinExec};

@@ -37,12 +37,10 @@ use arrow_array::{
     TimestampMillisecondArray,
 };
 use arrow_schema::{DataType, Schema};
-use datafusion_common::ScalarValue;
-use datafusion_common::{Result, DataFusionError, ScalarValue};
 use datafusion_common::{DataFusionError, Result, ScalarValue};
 use datafusion_execution::TaskContext;
 use datafusion_expr::{JoinType, Operator};
-use datafusion_physical_expr::expressions::{binary, cast, col, lit};
+use datafusion_physical_expr::expressions::{binary, cast, col, lit, Column};
 use datafusion_physical_expr::intervals::test_utils::{
     gen_conjunctive_numerical_expr, gen_conjunctive_temporal_expr,
 };
@@ -594,6 +592,8 @@ pub(crate) fn complicated_filter(
         filter_schema,
     )?;
     binary(left_expr, Operator::And, right_expr, filter_schema)
+}
+
 pub async fn partitioned_sliding_nested_join_with_filter(
     left: Arc<dyn ExecutionPlan>,
     right: Arc<dyn ExecutionPlan>,
@@ -707,4 +707,149 @@ pub async fn partitioned_nested_join_with_filter(
         );
     }
     Ok((columns, batches))
+}
+
+pub(crate) fn complicated_4_column_exprs(
+    expr_id: usize,
+    filter_schema: &Schema,
+) -> Result<Arc<dyn PhysicalExpr>> {
+    let columns = filter_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(index, field)| Column::new(field.name(), index))
+        .map(Arc::new)
+        .collect::<Vec<_>>();
+    match expr_id {
+        // Filter expr for a + b > d + 10 AND a < c + 20
+        0 => {
+            let left_expr = binary(
+                cast(
+                    binary(
+                        columns[0].clone(),
+                        Operator::Plus,
+                        columns[1].clone(),
+                        filter_schema,
+                    )?,
+                    filter_schema,
+                    DataType::Int64,
+                )?,
+                Operator::Gt,
+                binary(
+                    cast(columns[3].clone(), filter_schema, DataType::Int64)?,
+                    Operator::Plus,
+                    lit(ScalarValue::Int64(Some(10))),
+                    filter_schema,
+                )?,
+                filter_schema,
+            )?;
+
+            let right_expr = binary(
+                cast(columns[0].clone(), filter_schema, DataType::Int64)?,
+                Operator::Lt,
+                binary(
+                    cast(columns[2].clone(), filter_schema, DataType::Int64)?,
+                    Operator::Plus,
+                    lit(ScalarValue::Int64(Some(20))),
+                    filter_schema,
+                )?,
+                filter_schema,
+            )?;
+            binary(left_expr, Operator::And, right_expr, filter_schema)
+        }
+        // Filter expr for a + b > d + 10 AND a < c + 20 AND c > b
+        1 => {
+            let left_expr = binary(
+                cast(
+                    binary(
+                        columns[0].clone(),
+                        Operator::Plus,
+                        columns[1].clone(),
+                        filter_schema,
+                    )?,
+                    filter_schema,
+                    DataType::Int64,
+                )?,
+                Operator::Gt,
+                binary(
+                    cast(columns[3].clone(), filter_schema, DataType::Int64)?,
+                    Operator::Plus,
+                    lit(ScalarValue::Int64(Some(10))),
+                    filter_schema,
+                )?,
+                filter_schema,
+            )?;
+
+            let right_expr = binary(
+                cast(columns[0].clone(), filter_schema, DataType::Int64)?,
+                Operator::Lt,
+                binary(
+                    cast(columns[2].clone(), filter_schema, DataType::Int64)?,
+                    Operator::Plus,
+                    lit(ScalarValue::Int64(Some(20))),
+                    filter_schema,
+                )?,
+                filter_schema,
+            )?;
+            let left_and = binary(left_expr, Operator::And, right_expr, filter_schema)?;
+            let right_and = binary(
+                cast(columns[2].clone(), filter_schema, DataType::Int64)?,
+                Operator::GtEq,
+                binary(
+                    cast(columns[1].clone(), filter_schema, DataType::Int64)?,
+                    Operator::Plus,
+                    lit(ScalarValue::Int64(Some(20))),
+                    filter_schema,
+                )?,
+                filter_schema,
+            )?;
+            binary(left_and, Operator::And, right_and, filter_schema)
+        }
+        // a + b > c + 10 AND a + b < c + 100
+        2 => {
+            let left_expr = binary(
+                cast(
+                    binary(
+                        columns[0].clone(),
+                        Operator::Plus,
+                        columns[1].clone(),
+                        filter_schema,
+                    )?,
+                    filter_schema,
+                    DataType::Int64,
+                )?,
+                Operator::Gt,
+                binary(
+                    cast(columns[2].clone(), filter_schema, DataType::Int64)?,
+                    Operator::Plus,
+                    lit(ScalarValue::Int64(Some(10))),
+                    filter_schema,
+                )?,
+                filter_schema,
+            )?;
+
+            let right_expr = binary(
+                cast(
+                    binary(
+                        columns[0].clone(),
+                        Operator::Plus,
+                        columns[1].clone(),
+                        filter_schema,
+                    )?,
+                    filter_schema,
+                    DataType::Int64,
+                )?,
+                Operator::Lt,
+                binary(
+                    cast(columns[2].clone(), filter_schema, DataType::Int64)?,
+                    Operator::Plus,
+                    lit(ScalarValue::Int64(Some(100))),
+                    filter_schema,
+                )?,
+                filter_schema,
+            )?;
+            binary(left_expr, Operator::And, right_expr, filter_schema)
+        }
+        _ => unimplemented!(),
+    }
 }

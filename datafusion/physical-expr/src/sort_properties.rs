@@ -137,6 +137,12 @@ impl Neg for SortProperties {
     }
 }
 
+impl From<SortOptions> for SortProperties {
+    fn from(options: SortOptions) -> Self {
+        SortProperties::Ordered(options)
+    }
+}
+
 /// The `ExprOrdering` struct is designed to aid in the determination of ordering (represented
 /// by [`SortProperties`]) for a given [`PhysicalExpr`]. When analyzing the orderings
 /// of a [`PhysicalExpr`], the process begins by assigning the ordering of its leaf nodes.
