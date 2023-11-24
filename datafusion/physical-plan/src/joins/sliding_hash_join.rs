@@ -30,9 +30,14 @@ use crate::joins::{
         adjust_probe_side_indices_by_join_type,
         calculate_build_outer_indices_by_join_type,
         calculate_the_necessary_build_side_range_helper, joinable_probe_batch_helper,
-        EagerWindowJoinOperations, LazyJoinStream, LazyJoinStreamState, ProbeBuffer,
+        partitioned_join_output_partitioning, EagerWindowJoinOperations, LazyJoinStream,
+        LazyJoinStreamState, ProbeBuffer,
     },
-    symmetric_hash_join::OneSideHashJoiner,
+    stream_join_utils::{
+        combine_two_batches, prepare_sorted_exprs, record_visited_indices,
+        EagerJoinStream, EagerJoinStreamState, SortedFilterExpr, StreamJoinStateResult,
+    },
+    symmetric_hash_join::{OneSideHashJoiner, StreamJoinMetrics},
     utils::{
         build_batch_from_indices, build_join_schema, calculate_join_output_ordering,
         check_join_is_valid, swap_filter, swap_join_on, swap_join_type,
@@ -52,18 +57,13 @@ use arrow::record_batch::RecordBatch;
 use datafusion_common::{internal_err, plan_err, JoinSide, JoinType};
 use datafusion_execution::memory_pool::MemoryConsumer;
 use datafusion_execution::TaskContext;
-use datafusion_physical_expr::intervals::{ExprIntervalGraph, Interval};
+use datafusion_expr::interval_arithmetic::Interval;
+use datafusion_physical_expr::equivalence::join_equivalence_properties;
+use datafusion_physical_expr::intervals::cp_solver::ExprIntervalGraph;
 use datafusion_physical_expr::PhysicalSortRequirement;
 
-use crate::joins::sliding_window_join_utils::partitioned_join_output_partitioning;
-use crate::joins::stream_join_utils::{
-    combine_two_batches, prepare_sorted_exprs, record_visited_indices, EagerJoinStream,
-    EagerJoinStreamState, SortedFilterExpr, StreamJoinStateResult,
-};
-use crate::joins::symmetric_hash_join::StreamJoinMetrics;
 use ahash::RandomState;
 use async_trait::async_trait;
-use datafusion_physical_expr::equivalence::join_equivalence_properties;
 use futures::Stream;
 use parking_lot::Mutex;
 

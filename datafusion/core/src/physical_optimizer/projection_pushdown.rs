@@ -1295,7 +1295,7 @@ mod tests {
         Distribution, Partitioning, PhysicalExpr, PhysicalSortExpr,
         PhysicalSortRequirement, ScalarFunctionExpr,
     };
-    use datafusion_physical_plan::joins::{SymmetricHashJoinExec, SlidingHashJoinExec};
+    use datafusion_physical_plan::joins::SymmetricHashJoinExec;
     use datafusion_physical_plan::streaming::{PartitionStream, StreamingTableExec};
     use datafusion_physical_plan::union::UnionExec;
 

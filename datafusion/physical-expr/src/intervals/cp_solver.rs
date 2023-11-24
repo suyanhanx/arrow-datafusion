@@ -24,9 +24,7 @@ use std::sync::Arc;
 use super::utils::{
     convert_duration_type_to_interval, convert_interval_type_to_duration, get_inverse_op,
 };
-use super::IntervalBound;
 use crate::expressions::Literal;
-use crate::intervals::interval_aritmetic::{apply_operator, Interval};
 use crate::sort_properties::SortProperties;
 use crate::utils::{build_dag, ExprTreeNode};
 use crate::{PhysicalExpr, PhysicalSortExpr};
@@ -167,21 +165,25 @@ impl Display for ExprIntervalGraphNode {
 impl ExprIntervalGraphNode {
     /// Constructs a new DAEG node with an [-∞, ∞] range.
     pub fn new_unbounded(expr: Arc<dyn PhysicalExpr>, dt: &DataType) -> Result<Self> {
-        Interval::make_unbounded(dt)
-            .map(|interval| ExprIntervalGraphNode { expr, interval })
+        Interval::make_unbounded(dt).map(|interval| ExprIntervalGraphNode {
+            expr,
+            interval,
+            is_strict_subset: false,
+            sort_properties: SortProperties::Unordered,
+        })
     }
 
     /// Constructs a new DAEG node with the given range.
     pub fn new_with_interval(
         expr: Arc<dyn PhysicalExpr>,
         interval: Interval,
-        sort_option: SortProperties,
+        sort_properties: SortProperties,
     ) -> Self {
         ExprIntervalGraphNode {
             expr,
             interval,
             is_strict_subset: false,
-            sort_properties: sort_option,
+            sort_properties,
         }
     }
 
@@ -197,8 +199,9 @@ impl ExprIntervalGraphNode {
         let expr = node.expression().clone();
         if let Some(literal) = expr.as_any().downcast_ref::<Literal>() {
             let value = literal.value();
-            Interval::try_new(value.clone(), value.clone())
-                .map(|interval| Self::new_with_interval(expr, interval))
+            Interval::try_new(value.clone(), value.clone()).map(|interval| {
+                Self::new_with_interval(expr, interval, SortProperties::Singleton)
+            })
         } else {
             expr.data_type(schema)
                 .and_then(|dt| Self::new_unbounded(expr, &dt))
@@ -659,7 +662,10 @@ impl ExprIntervalGraph {
                 .propagate_constraints(node_interval, &children_intervals)?;
             if let Some(propagated_intervals) = propagated_intervals {
                 for (child, interval) in children.into_iter().zip(propagated_intervals) {
-                    self.graph[child].interval = interval;
+                    let child_node = &mut self.graph[child];
+                    let inside = child_node.interval.is_superset(&interval, true)?;
+                    child_node.interval = interval;
+                    child_node.is_strict_subset = inside;
                 }
             } else {
                 // The constraint is infeasible, report:
@@ -667,25 +673,6 @@ impl ExprIntervalGraph {
             }
         }
         Ok(PropagationResult::Success)
-    }
-
-    /// Updates intervals for all expressions in the DAEG by successive
-    /// bottom-up and top-down traversals.
-    pub fn update_ranges(
-        &mut self,
-        leaf_bounds: &mut [(usize, Interval)],
-    ) -> Result<PropagationResult> {
-        self.assign_intervals(leaf_bounds);
-        let bounds = self.evaluate_bounds()?;
-        if bounds == &Interval::CERTAINLY_FALSE {
-            Ok(PropagationResult::Infeasible)
-        } else if bounds == &Interval::UNCERTAIN {
-            let result = self.propagate_constraints();
-            self.update_intervals(leaf_bounds);
-            result
-        } else {
-            Ok(PropagationResult::CannotPropagate)
-        }
     }
 
     /// Returns the deepest pruning expressions from the graph.

@@ -1,16 +1,21 @@
 // Copyright (C) Synnada, Inc. - All Rights Reserved.
 // This file does not contain any Apache Software Foundation copyrighted code.
 
-use crate::joins::{
-    stream_join_utils::{
-        get_pruning_anti_indices, get_pruning_semi_indices, SortedFilterExpr,
-        StreamJoinStateResult,
-    },
-    utils,
-    utils::{append_right_indices, get_anti_indices, get_semi_indices, JoinFilter},
-};
 use std::task::Poll;
 
+use crate::joins::{
+    stream_join_utils::{
+        calculate_side_prune_length_helper, get_build_side_pruned_exprs,
+        get_filter_representation_of_join_side,
+        get_filter_representation_schema_of_build_side, get_pruning_anti_indices,
+        get_pruning_semi_indices, SortedFilterExpr, StreamJoinStateResult,
+    },
+    symmetric_hash_join::StreamJoinMetrics,
+    utils::{self, append_right_indices, get_anti_indices, get_semi_indices, JoinFilter},
+};
+use crate::{handle_async_state, handle_state};
+
+use arrow::compute::concat_batches;
 use arrow_array::{
     builder::{PrimitiveBuilder, UInt32Builder, UInt64Builder},
     types::{UInt32Type, UInt64Type},
@@ -18,23 +23,15 @@ use arrow_array::{
     UInt64Array,
 };
 use arrow_schema::SchemaRef;
-use async_trait::async_trait;
 use datafusion_common::{DataFusionError, JoinSide, JoinType, Result, ScalarValue};
 use datafusion_execution::SendableRecordBatchStream;
+use datafusion_expr::interval_arithmetic::Interval;
 use datafusion_physical_expr::expressions::{Column, PhysicalSortExpr};
-use datafusion_physical_expr::intervals::{ExprIntervalGraph, Interval, IntervalBound};
-use futures::ready;
-
-use crate::joins::stream_join_utils::{
-    calculate_side_prune_length_helper, get_build_side_pruned_exprs,
-    get_filter_representation_of_join_side,
-    get_filter_representation_schema_of_build_side,
-};
-use crate::joins::symmetric_hash_join::StreamJoinMetrics;
-use crate::{handle_async_state, handle_state};
-use arrow::compute::concat_batches;
+use datafusion_physical_expr::intervals::cp_solver::ExprIntervalGraph;
 use datafusion_physical_expr::Partitioning;
-use futures::{FutureExt, StreamExt};
+
+use async_trait::async_trait;
+use futures::{ready, FutureExt, StreamExt};
 use hashbrown::HashSet;
 use std::{mem, usize};
 
@@ -937,7 +934,7 @@ pub fn calculate_the_necessary_build_side_range_helper(
         .collect::<Vec<_>>();
 
     // Update the physical expression graph using the join filter intervals:
-    graph.update_ranges(&mut filter_intervals)?;
+    graph.update_ranges(&mut filter_intervals, Interval::CERTAINLY_TRUE)?;
 
     let intermediate_schema = get_filter_representation_schema_of_build_side(
         filter.schema(),
@@ -995,12 +992,12 @@ pub fn check_if_sliding_window_condition_is_met(
                 // Data is sorted in descending order, so check if latest value is less
                 // than the lower bound of the interval. If it is, we must have processed
                 // all rows that are needed from the build side for this window.
-                latest_value < interval.lower.value
+                &latest_value < interval.lower()
             } else {
                 // Data is sorted in ascending order, so check if latest value is greater
                 // than the upper bound of the interval. If it is, we must have processed
                 // all rows that are needed from the build side for this window.
-                latest_value > interval.upper.value
+                &latest_value > interval.upper()
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1301,18 +1298,13 @@ pub(crate) fn update_filter_expr_bounds(
         .intermediate_batch_filter_expr()
         .data_type(&build_inner_buffer.schema())?;
 
-    // Create a null scalar value with the obtained datatype:
-    let null_scalar = ScalarValue::try_from(build_order_datatype)?;
     // Create a null interval using the null scalar value:
-    let null_interval = Interval::new(
-        IntervalBound::new(null_scalar.clone(), true),
-        IntervalBound::new(null_scalar, true),
-    );
+    let unbounded_interval = Interval::make_unbounded(&build_order_datatype)?;
 
     build_sorted_filter_exprs
         .iter_mut()
         .for_each(|sorted_filter_expr| {
-            sorted_filter_expr.set_interval(null_interval.clone());
+            sorted_filter_expr.set_interval(unbounded_interval.clone());
         });
 
     let first_probe_intermediate_batch = get_filter_representation_of_join_side(
@@ -1349,15 +1341,9 @@ pub(crate) fn update_filter_expr_bounds(
             let right_value = ScalarValue::try_from_array(&last_array, 0)?;
             // Determine the interval bounds based on sort options:
             let interval = if sorted_filter_expr.order().descending {
-                Interval::new(
-                    IntervalBound::new(right_value, false),
-                    IntervalBound::new(left_value, false),
-                )
+                Interval::try_new(right_value, left_value)?
             } else {
-                Interval::new(
-                    IntervalBound::new(left_value, false),
-                    IntervalBound::new(right_value, false),
-                )
+                Interval::try_new(left_value, right_value)?
             };
             // Set the calculated interval for the sorted filter expression:
             sorted_filter_expr.set_interval(interval);
@@ -1368,6 +1354,7 @@ pub(crate) fn update_filter_expr_bounds(
 #[cfg(test)]
 mod tests {
     use crate::joins::sliding_window_join_utils::append_probe_indices_in_order;
+
     use arrow_array::{UInt32Array, UInt64Array};
 
     #[test]
