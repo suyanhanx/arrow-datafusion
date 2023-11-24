@@ -153,23 +153,23 @@ fn swap_hash_join(
         &swap_join_type(*hash_join.join_type()),
         partition_mode,
         hash_join.null_equals_null(),
-    )?;
-    if matches!(
+    )
+    .map(|e| Arc::new(e) as _);
+
+    if !matches!(
         hash_join.join_type(),
         JoinType::LeftSemi
             | JoinType::RightSemi
             | JoinType::LeftAnti
             | JoinType::RightAnti
     ) {
-        Ok(Arc::new(new_join))
-    } else {
-        // TODO avoid adding ProjectionExec again and again, only adding Final Projection
-        let proj = ProjectionExec::try_new(
+        return ProjectionExec::try_new(
             swap_reverting_projection(&left.schema(), &right.schema()),
-            Arc::new(new_join),
-        )?;
-        Ok(Arc::new(proj))
+            new_join?,
+        )
+        .map(|e| Arc::new(e) as _);
     }
+    new_join
 }
 
 /// When the order of the join is changed by the optimizer, the columns in
@@ -208,6 +208,7 @@ impl PhysicalOptimizerRule for JoinSelection {
         let lowest_plan = if let Some(optimized_plan) = new_state
             .plans
             .into_iter()
+            .map(|plan_metadata| plan_metadata.plan)
             .filter(|plan| is_plan_streaming(plan).is_ok())
             .min_by(|a, b| cost_of_the_plan(a).cmp(&cost_of_the_plan(b)))
         {

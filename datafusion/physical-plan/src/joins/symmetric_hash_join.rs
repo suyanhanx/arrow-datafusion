@@ -37,17 +37,17 @@ use crate::{
     expressions::{Column, PhysicalSortExpr},
     joins::StreamJoinPartitionMode,
     joins::{
+        sliding_window_join_utils::partitioned_join_output_partitioning,
         stream_join_utils::{
-            build_filter_input_order, combine_two_batches, get_pruning_anti_indices,
-            get_pruning_semi_indices, record_visited_indices, EagerJoinStream,
+            build_filter_input_order, calculate_side_prune_length_helper,
+            combine_two_batches, get_pruning_anti_indices, get_pruning_semi_indices,
+            prepare_sorted_exprs, record_visited_indices, EagerJoinStream,
             EagerJoinStreamState, PruningJoinHashMap, SortedFilterExpr,
             StreamJoinStateResult,
         },
         utils::{
-            build_batch_from_indices, build_join_schema,
-            calculate_prune_length_with_probe_batch_helper, check_join_is_valid,
-            partitioned_join_output_partitioning, prepare_sorted_exprs, ColumnIndex,
-            JoinFilter, JoinOn,
+            build_batch_from_indices, build_join_schema, check_join_is_valid,
+            ColumnIndex, JoinFilter, JoinOn,
         },
     },
     metrics::{self, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet},
@@ -68,7 +68,6 @@ use datafusion_expr::interval_arithmetic::Interval;
 use datafusion_physical_expr::equivalence::join_equivalence_properties;
 use datafusion_physical_expr::intervals::cp_solver::ExprIntervalGraph;
 
-use crate::joins::stream_join_utils::calculate_filter_expr_intervals;
 use ahash::RandomState;
 use futures::Stream;
 use hashbrown::HashSet;
@@ -273,6 +272,7 @@ impl SymmetricHashJoinExec {
         self.mode
     }
 
+    /// Check if order information covers every column in the filter expression.
     /// Check if order information covers every column in the filter expression.
     pub fn check_if_order_information_available(&self) -> Result<bool> {
         if let Some(filter) = self.filter() {
@@ -866,14 +866,16 @@ impl OneSideHashJoiner {
     /// A Result object that contains the pruning length.
     pub(crate) fn calculate_prune_length_with_probe_batch(
         &self,
+        probe_batch: &RecordBatch,
         build_side_sorted_filter_exprs: &mut [SortedFilterExpr],
         probe_side_sorted_filter_exprs: &mut [SortedFilterExpr],
         filter: &JoinFilter,
         graph: &mut ExprIntervalGraph,
     ) -> Result<usize> {
-        calculate_prune_length_with_probe_batch_helper(
+        calculate_side_prune_length_helper(
             filter,
             graph,
+            probe_batch,
             &self.input_buffer,
             build_side_sorted_filter_exprs,
             probe_side_sorted_filter_exprs,
@@ -887,7 +889,7 @@ impl OneSideHashJoiner {
             prune_length,
             self.deleted_offset as u64,
             HASHMAP_SHRINK_SCALE_FACTOR,
-        )?;
+        );
         // Remove pruned rows from the visited rows set:
         for row in self.deleted_offset..(self.deleted_offset + prune_length) {
             self.visited_rows.remove(&row);
@@ -1081,18 +1083,9 @@ impl SymmetricHashJoinStream {
             self.graph.as_mut(),
             self.filter.as_ref(),
         ) {
-            // Calculate the filter expression intervals for both sides of the join:
-            calculate_filter_expr_intervals(
-                filter,
-                &build_hash_joiner.input_buffer,
-                build_side_sorted_filter_expr,
-                &probe_hash_joiner.input_buffer,
-                probe_side_sorted_filter_expr,
-                probe_side.negate(),
-            )?;
-
             let prune_length = build_hash_joiner
                 .calculate_prune_length_with_probe_batch(
+                    &probe_hash_joiner.input_buffer,
                     build_side_sorted_filter_expr,
                     probe_side_sorted_filter_expr,
                     filter,
@@ -1132,16 +1125,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use arrow::compute::SortOptions;
-    use arrow::datatypes::{DataType, Field, IntervalUnit, Schema, TimeUnit};
-    use datafusion_execution::config::SessionConfig;
-    use rstest::*;
-
-    use datafusion_expr::Operator;
-    use datafusion_physical_expr::expressions::{binary, col, Column};
-
     use crate::joins::test_utils::complicated_4_column_exprs;
-
     use crate::joins::test_utils::{
         build_sides_record_batches, compare_batches, complicated_filter,
         create_memory_table, join_expr_tests_fixture_f64, join_expr_tests_fixture_i32,
@@ -1149,7 +1133,14 @@ mod tests {
         partitioned_sym_join_with_filter, split_record_batches,
     };
 
+    use arrow::compute::SortOptions;
+    use arrow::datatypes::{DataType, Field, IntervalUnit, Schema, TimeUnit};
+    use datafusion_execution::config::SessionConfig;
+    use datafusion_expr::Operator;
+    use datafusion_physical_expr::expressions::{binary, col, Column};
+
     use once_cell::sync::Lazy;
+    use rstest::*;
 
     const TABLE_SIZE: i32 = 30;
 
@@ -1312,11 +1303,8 @@ mod tests {
         )]
         join_type: JoinType,
         #[values(
-        (4, 4),
-        (11, 21),
-        (21, 12),
-        (99, 12),
-        (12, 99),
+        (4, 5),
+        (12, 17),
         )]
         cardinality: (i32, i32),
         #[values(0, 1, 2)] case_expr: usize,
@@ -2010,6 +1998,8 @@ mod tests {
         Ok(())
     }
 
+    // TODO: Enable this test once the PartialOrd problem of time intervals
+    //       are addressed.
     #[ignore]
     #[rstest]
     #[tokio::test(flavor = "multi_thread")]

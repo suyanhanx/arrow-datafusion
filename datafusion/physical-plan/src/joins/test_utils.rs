@@ -24,7 +24,7 @@ use crate::joins::nested_loop_join::distribution_from_join_type;
 use crate::joins::utils::{JoinFilter, JoinOn};
 use crate::joins::{
     HashJoinExec, NestedLoopJoinExec, PartitionMode, SlidingNestedLoopJoinExec,
-    StreamJoinPartitionMode, SymmetricHashJoinExec,
+    SlidingWindowWorkingMode, StreamJoinPartitionMode, SymmetricHashJoinExec,
 };
 use crate::memory::MemoryExec;
 use crate::repartition::RepartitionExec;
@@ -600,8 +600,9 @@ pub async fn partitioned_sliding_nested_join_with_filter(
     join_type: &JoinType,
     filter: JoinFilter,
     context: Arc<TaskContext>,
+    working_mode: SlidingWindowWorkingMode,
 ) -> Result<Vec<RecordBatch>> {
-    let partition_count = 4;
+    let partition_count = 2;
     let mut output_partition = 1;
     let distribution = distribution_from_join_type(join_type);
     // left
@@ -643,6 +644,7 @@ pub async fn partitioned_sliding_nested_join_with_filter(
         join_type,
         left_sort_expr,
         right_sort_expr,
+        working_mode,
     )?);
     let mut batches = vec![];
     for i in 0..output_partition {

@@ -1521,7 +1521,7 @@ pub mod owned_table_reference {
 pub struct PhysicalPlanNode {
     #[prost(
         oneof = "physical_plan_node::PhysicalPlanType",
-        tags = "1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 2400, 2500"
+        tags = "1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 2400, 2500, 2700"
     )]
     pub physical_plan_type: ::core::option::Option<physical_plan_node::PhysicalPlanType>,
 }
@@ -1585,6 +1585,10 @@ pub mod physical_plan_node {
         #[prost(message, tag = "2500")]
         SlidingNestedLoopJoin(
             ::prost::alloc::boxed::Box<super::SlidingNestedLoopJoinExecNode>,
+        ),
+        #[prost(message, tag = "2700")]
+        PartitionedHashJoin(
+            ::prost::alloc::boxed::Box<super::PartitionedHashJoinExecNode>,
         ),
     }
 }
@@ -2063,6 +2067,34 @@ pub struct SlidingHashJoinExecNode {
     pub left_sort_exprs: ::prost::alloc::vec::Vec<PhysicalExprNode>,
     #[prost(message, repeated, tag = "10")]
     pub right_sort_exprs: ::prost::alloc::vec::Vec<PhysicalExprNode>,
+    #[prost(enumeration = "SlidingWindowWorkingMode", tag = "11")]
+    pub working_mode: i32,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PartitionedHashJoinExecNode {
+    #[prost(message, optional, boxed, tag = "1")]
+    pub left: ::core::option::Option<::prost::alloc::boxed::Box<PhysicalPlanNode>>,
+    #[prost(message, optional, boxed, tag = "2")]
+    pub right: ::core::option::Option<::prost::alloc::boxed::Box<PhysicalPlanNode>>,
+    #[prost(message, repeated, tag = "3")]
+    pub on: ::prost::alloc::vec::Vec<JoinOn>,
+    #[prost(enumeration = "JoinType", tag = "4")]
+    pub join_type: i32,
+    #[prost(enumeration = "StreamPartitionMode", tag = "6")]
+    pub partition_mode: i32,
+    #[prost(bool, tag = "7")]
+    pub null_equals_null: bool,
+    #[prost(message, optional, tag = "8")]
+    pub filter: ::core::option::Option<JoinFilter>,
+    #[prost(message, repeated, tag = "9")]
+    pub left_sort_exprs: ::prost::alloc::vec::Vec<PhysicalExprNode>,
+    #[prost(message, repeated, tag = "10")]
+    pub right_sort_exprs: ::prost::alloc::vec::Vec<PhysicalExprNode>,
+    #[prost(uint32, tag = "12")]
+    pub fetch_per_key: u32,
+    #[prost(enumeration = "SlidingWindowWorkingMode", tag = "11")]
+    pub working_mode: i32,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -2079,6 +2111,8 @@ pub struct SlidingNestedLoopJoinExecNode {
     pub left_sort_exprs: ::prost::alloc::vec::Vec<PhysicalExprNode>,
     #[prost(message, repeated, tag = "6")]
     pub right_sort_exprs: ::prost::alloc::vec::Vec<PhysicalExprNode>,
+    #[prost(enumeration = "SlidingWindowWorkingMode", tag = "7")]
+    pub working_mode: i32,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -3365,6 +3399,32 @@ impl StreamPartitionMode {
         match value {
             "SINGLE_PARTITION" => Some(Self::SinglePartition),
             "PARTITIONED_EXEC" => Some(Self::PartitionedExec),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum SlidingWindowWorkingMode {
+    Lazy = 0,
+    Eager = 1,
+}
+impl SlidingWindowWorkingMode {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            SlidingWindowWorkingMode::Lazy => "LAZY",
+            SlidingWindowWorkingMode::Eager => "EAGER",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "LAZY" => Some(Self::Lazy),
+            "EAGER" => Some(Self::Eager),
             _ => None,
         }
     }

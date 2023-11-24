@@ -37,8 +37,7 @@ use crate::{
     hash_utils::create_hashes,
     joins::utils::{
         adjust_right_output_partitioning, build_join_schema, check_join_is_valid,
-        estimate_join_statistics, partitioned_join_output_partitioning,
-        BuildProbeJoinMetrics, ColumnIndex, JoinFilter, JoinOn,
+        estimate_join_statistics, BuildProbeJoinMetrics, ColumnIndex, JoinFilter, JoinOn,
     },
     metrics::{ExecutionPlanMetricsSet, MetricsSet},
     DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PhysicalExpr,
@@ -69,6 +68,7 @@ use datafusion_execution::TaskContext;
 use datafusion_physical_expr::equivalence::join_equivalence_properties;
 use datafusion_physical_expr::EquivalenceProperties;
 
+use crate::joins::sliding_window_join_utils::partitioned_join_output_partitioning;
 use ahash::RandomState;
 use futures::{ready, Stream, StreamExt, TryStreamExt};
 

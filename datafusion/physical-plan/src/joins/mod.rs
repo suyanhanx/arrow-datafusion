@@ -65,3 +65,9 @@ pub enum StreamJoinPartitionMode {
     /// Both sides will collected into one partition
     SinglePartition,
 }
+
+#[derive(PartialEq, Debug, Copy, Clone, Hash)]
+pub enum SlidingWindowWorkingMode {
+    Eager,
+    Lazy,
+}

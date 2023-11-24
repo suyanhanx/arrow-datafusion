@@ -14,7 +14,7 @@ use crate::physical_optimizer::utils::{
 use crate::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
 use crate::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use crate::physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use crate::physical_plan::joins::utils::{swap_filter, JoinFilter, JoinOn};
+use crate::physical_plan::joins::utils::{swap_filter, JoinFilter};
 use crate::physical_plan::joins::{
     CrossJoinExec, HashJoinExec, NestedLoopJoinExec, PartitionedHashJoinExec,
     SlidingHashJoinExec, SlidingNestedLoopJoinExec, SortMergeJoinExec,
@@ -29,7 +29,7 @@ use crate::physical_plan::{with_new_children_if_necessary, ExecutionPlan};
 use arrow_schema::SortOptions;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::{Transformed, TreeNode, VisitRecursion};
-use datafusion_common::{internal_err, DataFusionError, JoinType, Result};
+use datafusion_common::{internal_err, plan_err, DataFusionError, JoinType, Result};
 use datafusion_physical_expr::expressions::{Column, LastValue};
 use datafusion_physical_expr::utils::{
     collect_columns, get_indices_of_matching_sort_exprs_with_order_eq,
@@ -42,64 +42,49 @@ use datafusion_physical_plan::joins::prunability::{
 };
 use datafusion_physical_plan::joins::utils::swap_join_on;
 use datafusion_physical_plan::joins::{
-    swap_sliding_hash_join, swap_sliding_nested_loop_join,
+    swap_sliding_hash_join, swap_sliding_nested_loop_join, SlidingWindowWorkingMode,
 };
 use datafusion_physical_plan::windows::{
     get_best_fitting_window, get_window_mode, BoundedWindowAggExec, WindowAggExec,
 };
 
-use itertools::{iproduct, izip, Itertools};
+use itertools::{iproduct, Itertools};
 
-/// This function swaps the inputs of the given SMJ operator.
-fn swap_sort_merge_join(
-    hash_join: &HashJoinExec,
-    keys: Vec<(Column, Column)>,
-    sort_options: Vec<SortOptions>,
-) -> Result<Arc<dyn ExecutionPlan>> {
-    let left = hash_join.left();
-    let right = hash_join.right();
-    let swapped_join_type = swap_join_type(hash_join.join_type);
-    if matches!(swapped_join_type, JoinType::RightSemi) {
-        return Err(DataFusionError::Plan(
-            "RightSemi is not supported for SortMergeJoin".to_owned(),
-        ));
-    }
-    // Sort option will remain same since each tuple of keys from both side will have exactly same
-    // SortOptions.
-    let new_join = SortMergeJoinExec::try_new(
-        right.clone(),
-        left.clone(),
-        swap_join_on(&keys),
-        swapped_join_type,
-        sort_options,
-        hash_join.null_equals_null,
-    )?;
-    if matches!(
-        hash_join.join_type,
-        JoinType::LeftSemi | JoinType::LeftAnti | JoinType::RightAnti
-    ) {
-        Ok(Arc::new(new_join))
-    } else {
-        // TODO avoid adding ProjectionExec again and again, only adding Final Projection
-        let proj = ProjectionExec::try_new(
-            swap_reverting_projection(&left.schema(), &right.schema()),
-            Arc::new(new_join),
-        )?;
-        Ok(Arc::new(proj))
+#[derive(Debug, Clone)]
+pub struct PlanMetadata {
+    pub(crate) plan: Arc<dyn ExecutionPlan>,
+    pub(crate) unbounded_output: bool,
+    pub(crate) children_unboundedness: Vec<bool>,
+}
+
+impl PlanMetadata {
+    pub fn new(
+        plan: Arc<dyn ExecutionPlan>,
+        unbounded_output: bool,
+        children_unboundedness: Vec<bool>,
+    ) -> Self {
+        Self {
+            plan,
+            unbounded_output,
+            children_unboundedness,
+        }
     }
 }
 
-/// Represents the current state of an execution plan in the context of query optimization or analysis.
+/// Represents the current state of an execution plan in the context of query
+/// optimization or analysis.
 ///
-/// `PlanState` acts as a wrapper around a vector of execution plans (`plans`), offering utility methods
-/// to work with these plans and their children, and to apply transformations. This structure is instrumental
-/// in manipulating and understanding the flow of execution in the context of database query optimization.
+/// `PlanState` acts as a wrapper around a vector of execution plans (`plans`),
+/// offering utility methods to work with these plans and their children, and
+/// to apply transformations. This structure is instrumental in manipulating and
+/// understanding the flow of execution in the context of database query optimization.
 ///
-/// It also implements the `TreeNode` trait which provides methods for working with trees of nodes, allowing
-/// for recursive operations on the execution plans and their children.
+/// It also implements the `TreeNode` trait which provides methods for working
+/// with trees of nodes, allowing for recursive operations on the execution plans
+/// and their children.
 #[derive(Debug, Clone)]
 pub struct PlanState {
-    pub(crate) plans: Vec<Arc<dyn ExecutionPlan>>,
+    pub(crate) plans: Vec<PlanMetadata>,
 }
 
 impl PlanState {
@@ -108,7 +93,10 @@ impl PlanState {
     /// # Parameters
     /// - `plan`: The execution plan to be wrapped by this state.
     pub fn new(plan: Arc<dyn ExecutionPlan>) -> Self {
-        PlanState { plans: vec![plan] }
+        let size = plan.children().len();
+        Self {
+            plans: vec![PlanMetadata::new(plan, false, vec![false; size])],
+        }
     }
 
     /// Returns the children of the execution plan as a vector of `PlanState`.
@@ -116,6 +104,7 @@ impl PlanState {
     /// Each child represents a subsequent step or dependency in the execution flow.
     pub fn children(&self) -> Vec<PlanState> {
         self.plans[0]
+            .plan
             .children()
             .into_iter()
             .map(PlanState::new)
@@ -139,25 +128,29 @@ impl TreeNode for PlanState {
         Ok(VisitRecursion::Continue)
     }
 
-    /// Transforms the children of the current execution plan using a provided transformation function.
+    /// Transforms the children of the current execution plan using the given
+    /// transformation function.
     ///
-    /// This method first retrieves the children of the current execution plan. If there are no children,
-    /// it returns the current plan state without any changes. Otherwise, it applies the given transformation
-    /// function to each child, creating a new set of possible execution plans.
+    /// This method first retrieves the children of the current execution plan.
+    /// If there are no children, it returns the current plan state without any
+    /// change. Otherwise, it applies the given transformation function to each
+    /// child, creating a new set of possible execution plans.
     ///
-    /// The method then constructs a cartesian product of all possible child plans and combines them with
-    /// the original plan to generate new execution plans that have the transformed children. This is particularly
-    /// useful in scenarios where multiple transformations or optimizations can be applied, and one wants to
-    /// explore all possible combinations.
+    /// The method then constructs a cartesian product of all possible child
+    /// plans and combines them with the original plan to generate new execution
+    /// plans with the transformed children. This is particularly useful in
+    /// scenarios where multiple transformations or optimizations are applicable,
+    /// and one wants to explore all possible combinations.
     ///
     /// # Type Parameters
     ///
-    /// * `F`: A closure type that takes a `PlanState` and returns a `Result<PlanState>`. This closure is used to
-    ///   transform the children of the current execution plan.
+    /// * `F`: A closure type that takes a `PlanState` and returns a `Result<PlanState>`.
+    ///   This closure is used to transform the children of the current execution plan.
     ///
     /// # Parameters
     ///
-    /// * `transform`: The transformation function to be applied to each child of the execution plan.
+    /// * `transform`: The transformation function to apply to each child of the
+    ///   execution plan.
     ///
     /// # Returns
     ///
@@ -165,14 +158,17 @@ impl TreeNode for PlanState {
     ///
     /// # Errors
     ///
-    /// Returns an error if the transformation fails on any of the children or if there's an issue combining the
-    /// original plan with the transformed children.
-    fn map_children<F>(self, transform: F) -> Result<Self>
+    /// Returns an error if the transformation fails on any of the children or
+    /// if there's an issue combining the original plan with the transformed children.
+    fn map_children<F>(mut self, transform: F) -> Result<Self>
     where
         F: FnMut(Self) -> Result<Self>,
     {
         let children = self.children();
         if children.is_empty() {
+            let mutable_plan_metadata = self.plans.get_mut(0).unwrap();
+            mutable_plan_metadata.unbounded_output =
+                mutable_plan_metadata.plan.unbounded_output(&[])?;
             Ok(self)
         } else {
             // Transform the children nodes:
@@ -187,180 +183,154 @@ impl TreeNode for PlanState {
                 .multi_cartesian_product();
 
             // Combine the plans with the possible children:
-            let new_plans = iproduct!(self.plans.into_iter(), possible_children)
-                .map(|(plan, children)| {
-                    let plan = with_new_children_if_necessary(plan, children)?.into();
-                    Ok(plan)
+            iproduct!(self.plans.into_iter(), possible_children)
+                .map(|(metadata, children_plans)| {
+                    let (children_plans, children_unboundedness): (Vec<_>, Vec<_>) =
+                        children_plans
+                            .into_iter()
+                            .map(|c| (c.plan.clone(), c.unbounded_output))
+                            .unzip();
+                    let plan = with_new_children_if_necessary(
+                        metadata.plan.clone(),
+                        children_plans,
+                    )
+                    .map(|e| e.into())?;
+                    let unbounded_output = plan
+                        .unbounded_output(&children_unboundedness)
+                        .unwrap_or(false);
+                    // PLan output is subject to change in transform:
+                    Ok(PlanMetadata::new(
+                        plan,
+                        unbounded_output,
+                        children_unboundedness,
+                    ))
                 })
-                .collect::<Result<Vec<_>>>()?;
-
-            Ok(PlanState { plans: new_plans })
+                .collect::<Result<_>>()
+                .map(|plans| PlanState { plans })
         }
     }
 }
 
-/// Examines the provided `PlanState` and selectively optimizes certain types of execution plans,
-/// especially joins, to maintain or improve the performance of the query pipeline.
-/// The function inspects each plan in the `PlanState` and applies relevant optimizations
-/// based on the type of plan and its characteristics.
+/// Examines the given `PlanState` and selectively optimizes certain types of
+/// execution plans, especially joins, to improve the performance of the query
+/// pipeline. The function inspects each plan in the given `PlanState` and
+/// applies relevant optimizations based on the plan types and characteristics.
 ///
-/// The primary focus of this function is to handle hash joins, cross joins, nested loop joins,
-/// aggregates, sorts, windows, and other plans with inherent sorting requirements.
+/// The primary focus of this function is to handle hash joins, cross joins,
+/// nested loop joins, aggregates, sorts, windows, and other plans with inherent
+/// sorting requirements.
 ///
-/// # Arguments
+/// # Parameters
 ///
-/// * `requirements`: The `PlanState` containing a collection of execution plans to be optimized.
-/// * `config_options`: Configuration options that might influence the optimization strategies.
+/// * `requirements`: The `PlanState` containing a collection of execution plans
+///   to be optimized.
+/// * `config_options`: Configuration options that might influence optimization
+///   strategies.
 ///
 /// # Returns
 ///
-/// * A `Result` containing a `Transformed` variant indicating the outcome of the transformation.
-///   - `Transformed::Yes`: Indicates successful transformation, and contains the new `PlanState` with optimized plans.
-///   - `Transformed::No`: Would indicate that no transformation took place, but it's not returned by this function.
+/// * A `Result` containing a `Transformed` enumeration indicating the outcome
+///   of the transformation. A `Transformed::Yes` variant indicates a successful
+///   transformation, and contains the new `PlanState` with optimized plans. A
+///   `Transformed::No` variant indicates that no transformation took place.
 pub fn select_joins_to_preserve_pipeline(
     requirements: PlanState,
     config_options: &ConfigOptions,
 ) -> Result<Transformed<PlanState>> {
     let PlanState { plans, .. } = requirements;
 
-    let new_plans: Result<Vec<_>> = plans
-        .iter()
-        .map(|plan| {
-            // Pattern match against the specific types of plans we want to optimize
-            match plan {
-                // Handle hash join optimizations
-                _ if is_hash_join(plan) => handle_hash_join_exec(plan, config_options),
-                // Handle cross joins
-                _ if is_cross_join(plan) => handle_cross_join(plan),
-                // Handle nested loop joins
-                _ if is_nested_loop_join(plan) => {
-                    handle_nested_loop_join_exec(plan, config_options)
-                }
-                // If the plan requires a specific input order (like aggregates or sorts), handle them.
-                // Also handle any plan that inherently has a required input order
-                _ if is_aggregate(plan)
-                    | is_sort(plan)
-                    | plan.required_input_ordering().iter().any(|e| e.is_some()) =>
-                {
-                    let handled_plan = match plan {
-                        _ if is_aggregate(plan) => {
-                            handle_aggregate_exec(plan, config_options)
-                        }
-                        _ if is_sort(plan) => handle_sort_exec(plan),
-                        _ if is_window(plan) => handle_window_execs(plan),
-                        _ => handle_sort_requirements(plan),
-                    };
-
-                    // Filter out plans that have errors in execution. For bounded and unbounded cases,
-                    // we shouldn't propagate invalid plans to the further analysis.
-                    handled_plan.map(|plans| {
-                        plans
-                            .into_iter()
-                            .filter(|p| is_plan_streaming(p).is_ok())
-                            .collect()
-                    })
-                }
-                // If none of the above conditions match, simply clone the plan
-                _ => Ok(vec![plan.clone()]),
-            }
-        })
+    plans
+        .into_iter()
+        .map(|plan_metadata| transform_plan(plan_metadata, config_options))
         .flatten_ok() // Flatten the results to remove nesting
-        .collect();
-
-    Ok(Transformed::Yes(PlanState { plans: new_plans? }))
+        .collect::<Result<_>>()
+        .map(|plans| Transformed::Yes(PlanState { plans }))
 }
 
-/// Ensures that the given `plan` satisfies its required input ordering.
+/// Transforms the given plan based on its type.
 ///
-/// The function checks if the child plans can satisfy the parent's input
-/// ordering requirements. If they can, the plan is deemed valid; otherwise,
-/// an empty vector is returned.
+/// This function dispatches the given plan to different handlers based on the
+/// plan type (like sort, hash join, nested loop join, etc.). Each handler is
+/// responsible for processing and possibly transforming the plan.
 ///
-/// # Arguments
+/// # Parameters
 ///
-/// * `plan` - The execution plan to evaluate.
+/// * `plan_metadata`: Metadata about the current plan.
+/// * `config_options`: Configuration options that may influence transformations.
 ///
 /// # Returns
 ///
-/// Returns a vector containing the original plan if it is valid, or an empty vector otherwise.
-fn handle_sort_requirements(
-    plan: &Arc<dyn ExecutionPlan>,
-) -> Result<Vec<Arc<dyn ExecutionPlan>>> {
-    // Extract children and requirements from the plan for clarity
-    let children = plan.children();
-    let requirements = plan.required_input_ordering();
-
-    // Check the streaming status and validity of the plan with its sources
-    let maybe_streaming = is_plan_streaming(plan);
-
-    let plan_is_valid = match maybe_streaming {
-        // If plan is streaming, check if all children satisfy their requirements
-        Ok(true) => izip!(children, requirements).all(|(child, maybe_requirement)| {
-            // If there's no requirement, it's automatically satisfied
-            let child_eq_properties = child.equivalence_properties();
-            child_eq_properties
-                .ordering_satisfy_requirement(&maybe_requirement.unwrap_or_default())
-        }),
-        // If plan is not streaming but valid with its sources, it's considered valid
-        Ok(false) => true,
-        // If there was an error determining the streaming status, plan is invalid
-        Err(_) => false,
-    };
-
-    // Return the plan if it's valid, or an empty vector otherwise
-    Ok(if plan_is_valid {
-        vec![plan.clone()]
-    } else {
-        vec![]
-    })
-}
-
-/// Handles a potential hash join conversion based on the given execution plan and configuration.
-///
-/// This function checks if the provided execution `plan` can be converted into a hash join
-/// based on certain criteria derived from the `config_options`. If it's convertible,
-/// the converted plans are returned. If not, the original plan is returned.
-///
-/// # Arguments
-///
-/// * `plan` - The execution plan to evaluate for potential hash join conversion.
-/// * `config_options` - The configuration options that influence the decision for conversion.
-///
-/// # Returns
-///
-/// Returns a vector containing the converted plan(s) if the given `plan` can be converted
-/// into a hash join. If conversion isn't feasible, the original plan is returned in the vector.
-fn handle_hash_join_exec(
-    plan: &Arc<dyn ExecutionPlan>,
+/// * A `Result` containing an optional vector of `PlanMetadata` objects. This
+///   represents the potentially transformed plan(s), or `None` if no
+///   transformation took place.
+fn transform_plan(
+    plan_metadata: PlanMetadata,
     config_options: &ConfigOptions,
-) -> Result<Vec<Arc<dyn ExecutionPlan>>> {
-    if let Some(result) = check_hash_join_convertable(plan, config_options)? {
-        return Ok(result);
+) -> Result<Vec<PlanMetadata>> {
+    if is_sort(&plan_metadata.plan) {
+        // Handle sort operations:
+        handle_sort_exec(plan_metadata)
+    } else if is_hash_join(&plan_metadata.plan) {
+        // Handle hash join operations:
+        handle_hash_join(plan_metadata, config_options)
+    } else if is_nested_loop_join(&plan_metadata.plan) {
+        // Handle nested loop join operations:
+        handle_nested_loop_join(plan_metadata, config_options)
+    } else if is_cross_join(&plan_metadata.plan) {
+        // Handle cross join operations:
+        handle_cross_join(plan_metadata)
+    } else if is_aggregate(&plan_metadata.plan) {
+        // Handle aggregation operations:
+        handle_aggregate_exec(plan_metadata, config_options)
+    } else if is_window(&plan_metadata.plan) {
+        // Handle window operations:
+        handle_window_execs(plan_metadata)
+    } else {
+        // Otherwise, leave plan as-is:
+        Ok(vec![plan_metadata])
     }
-    Ok(vec![plan.clone()])
+    .map(|plans| plans.into_iter().filter(check_sort_requirements).collect())
 }
 
-/// Handles a potential cross join conversion based on the given execution plan.
+/// Evaluates whether an execution plan meets its required input ordering.
 ///
-/// This function checks if the provided execution `plan` can be converted from a cross join
-/// based on certain criteria. If it's convertible, the converted plans are returned.
-/// If not, the original plan is returned.
+/// The function checks if the given plan can accommodate sorting, which is the
+/// case when:
+/// - The given plan produces a bounded output, or
+/// - Children plans of the given plan satisfy the plan's input ordering
+///   requirements.
 ///
-/// # Arguments
+/// If either of these conditions hold, returns `Some(plan_metadata)` to
+/// signal this. Otherwise, returns `None` to trigger the deletion of this plan.
 ///
-/// * `plan` - The execution plan to evaluate for potential cross join conversion.
+/// # Parameters
+///
+/// * `plan_metadata`: Information about the execution plan to process.
 ///
 /// # Returns
 ///
-/// Returns a vector containing the converted plan(s) if the given `plan` can be converted
-/// from a cross join. If conversion isn't feasible, the original plan is returned in the vector.
-fn handle_cross_join(
-    plan: &Arc<dyn ExecutionPlan>,
-) -> Result<Vec<Arc<dyn ExecutionPlan>>> {
-    if let Some(result) = check_cross_join_convertable(plan)? {
-        return Ok(result);
+/// * A `Result` object wrapping `Some(plan_metadata)` if the given plan can
+///   accommodate sorting, or `None` otherwise.
+fn check_sort_requirements(plan_metadata: &PlanMetadata) -> bool {
+    match plan_metadata
+        .plan
+        .unbounded_output(&plan_metadata.children_unboundedness)
+    {
+        Ok(true) => plan_metadata
+            .plan
+            .children()
+            .iter()
+            .zip(plan_metadata.plan.required_input_ordering())
+            .all(|(child, maybe_requirements)| {
+                maybe_requirements.map_or(true, |requirements| {
+                    child
+                        .equivalence_properties()
+                        .ordering_satisfy_requirement(&requirements)
+                })
+            }),
+        Ok(false) => true,
+        Err(_) => false,
     }
-    Ok(vec![plan.clone()])
 }
 
 // TODO: This will be improved with new mechanisms.
@@ -376,80 +346,116 @@ pub fn cost_of_the_plan(plan: &Arc<dyn ExecutionPlan>) -> usize {
 
 /// Handles potential modifications to an aggregate execution plan.
 ///
-/// This function evaluates the provided execution `plan` for potential modifications
-/// related to the aggregate execution. If modifications can be applied, the modified plans
-/// are returned; otherwise, the original plan is returned.
+/// This function evaluates the given execution plan for potential modifications
+/// related to the aggregation operation. If modifications are applicable,
+/// returns modified plans.
 ///
-/// The purpose of this function is to optimize and adapt the aggregate execution plan
-/// based on the given configuration options and inherent properties of the plan itself.
+/// # Parameters
 ///
-/// # Arguments
-///
-/// * `plan` - The execution plan to evaluate for potential aggregate modifications.
-/// * `config_options` - The configuration options that may affect the plan modifications.
+/// * `plan_metadata` - Information about the plan to process.
+/// * `config_options` - The configuration options that may affect plan modifications.
 ///
 /// # Returns
 ///
-/// Returns a vector containing the modified plan(s) if the given `plan` can be optimized
-/// as an aggregate execution. If no modifications are feasible, the original plan is returned in the vector.
+/// * A `Result` object containing an optional vector containing alternate
+///   plan(s) if available. If no modifications are feasible, the result object
+///   contains a singleton vector containing the original plan.
 fn handle_aggregate_exec(
-    plan: &Arc<dyn ExecutionPlan>,
+    plan_metadata: PlanMetadata,
     config_options: &ConfigOptions,
-) -> Result<Vec<Arc<dyn ExecutionPlan>>> {
-    // Attempt to downcast the execution plan to an AggregateExec
-    if let Some(aggregation_exec) = plan.as_any().downcast_ref::<AggregateExec>() {
-        // Extract the input plan for the aggregation
+) -> Result<Vec<PlanMetadata>> {
+    // Attempt to downcast the execution plan to an AggregateExec:
+    if let Some(aggregation_exec) =
+        plan_metadata.plan.as_any().downcast_ref::<AggregateExec>()
+    {
+        // Extract the input plan for the aggregation:
         let input_plan = aggregation_exec.input();
-
-        // Find the closest join that can be changed based on the aggregate and input plans
+        // Find the closest join that can be changed:
         let possible_children_plans =
             find_closest_join_and_change(aggregation_exec, input_plan, config_options)?;
-
-        // Extract the group by and aggregate expressions from the aggregate execution
+        // Extract the GROUP BY and aggregate expressions:
         let group_by = aggregation_exec.group_by();
         let aggr_expr = aggregation_exec.aggr_expr();
-
-        // Select the best aggregate streaming plan based on possible children plans and expressions
-        let children_plans_plans = select_best_aggregate_streaming_plan(
+        // Select the best aggregate streaming plan based on possible children
+        // plans and expressions:
+        let children_plans = select_best_aggregate_streaming_plan(
             possible_children_plans,
             group_by,
             aggr_expr,
         )?;
-
-        // If there are no optimized children plans, return the original plan
-        // Otherwise, modify the plan with the new children plans and return
-        return if children_plans_plans.is_empty() {
-            Ok(vec![plan.clone()])
+        // If there are no optimized children plans, return the original plan.
+        // Otherwise, modify the plan with the new children plans and return:
+        if children_plans.is_empty() {
+            Ok(vec![plan_metadata])
         } else {
-            children_plans_plans
+            children_plans
                 .into_iter()
-                .map(|child| plan.clone().with_new_children(vec![child]))
-                .collect()
-        };
+                .map(|child| plan_metadata.plan.clone().with_new_children(vec![child]))
+                .collect::<Result<_>>()
+                .map(|plans| convert_to_plan_metadata(plans, &plan_metadata))
+        }
+    } else {
+        // The provided execution plan isn't an aggregation, return original plan:
+        Ok(vec![plan_metadata])
     }
+}
 
-    // If the provided execution plan isn't an AggregateExec, return the original plan
-    Ok(vec![plan.clone()])
+/// Converts a vector of execution plans to a vector of `PlanMetadata`.
+///
+/// This function takes potential execution plans and maps them to their
+/// corresponding plan metadata, considering whether their output is unbounded.
+///
+/// # Parameters
+/// * `maybe_plans`: An optional vector of execution plans to be converted.
+/// * `plan_metadata`: The metadata of the original plan.
+///
+/// # Returns
+///
+/// * A vector of `PlanMetadata` corresponding to given execution plans.
+fn convert_to_plan_metadata(
+    plans: Vec<Arc<dyn ExecutionPlan>>,
+    plan_metadata: &PlanMetadata,
+) -> Vec<PlanMetadata> {
+    plans
+        .into_iter()
+        .filter_map(|possible_plan| {
+            // Determine if the output of the plan is unbounded
+            possible_plan
+                .unbounded_output(&plan_metadata.children_unboundedness)
+                .ok()
+                .map(|unbounded| (possible_plan, unbounded))
+        })
+        // Convert each plan to PlanMetadata with its unbounded status
+        .map(|(possible_plan, unbounded)| {
+            PlanMetadata::new(
+                possible_plan,
+                unbounded,
+                plan_metadata.children_unboundedness.clone(),
+            )
+        })
+        .collect()
 }
 
 /// Selects the best aggregate streaming plan from a list of possible plans.
 ///
-/// Evaluates a list of potential execution plans to determine which ones
-/// are suitable for streamable aggregation based on several criteria:
-/// - Whether a plan has seen a `PartitionedHashJoinExec`
-/// - Whether the aggregation result of the plan is valid
-/// - The validity of all group by and aggregate expressions
-/// - Whether the plan supports streamable aggregates
-/// - Whether the child plan can be executed without errors
+/// Evaluates a list of potential execution plans to determine which ones are
+/// suitable for streamable aggregation based on several criteria:
+/// - Whether a plan has seen a `PartitionedHashJoinExec`, and if so:
+///     - Whether the plan's aggregation result is valid.
+///     - Whether all GROUP BY and aggregate expressions are valid.
+/// - Whether the plan supports streamable aggregates.
+/// - Whether the child plan can be executed without errors.
 ///
 /// # Parameters
+///
 /// - `possible_plans`: A list of potential execution plans to evaluate.
-/// - `group_by`: The physical group-by expression to consider.
+/// - `group_by`: The physical GROUP BY expression to consider.
 /// - `aggr_expr`: A list of aggregate expressions to evaluate.
 ///
 /// # Returns
-/// Returns a `Result` containing a list of suitable execution plans,
-/// or an error if a plan fails the validation.
+///
+/// * A `Result` containing a list of suitable execution plans, or an error if
+///   a plan fails validation.
 fn select_best_aggregate_streaming_plan(
     possible_plans: Vec<Arc<dyn ExecutionPlan>>,
     group_by: &PhysicalGroupBy,
@@ -458,20 +464,16 @@ fn select_best_aggregate_streaming_plan(
     possible_plans
         .into_iter()
         .filter_map(|plan| {
-            // Flag to track if PartitionedHashJoinExec is encountered
+            // Flag to track if we find a `PartitionedHashJoinExec` (PHJ):
             let mut has_seen_phj = false;
-
-            // Ensure the aggregation result of the plan is valid
-            let phj_is_valid = check_the_aggregation_result_is_valid(&plan, &mut has_seen_phj);
-            if !phj_is_valid {
-                return Some(internal_err!("PartitionHashJoin cannot be interrupt by another unallowed executor."));
+            // Ensure that the plan results in a valid aggregation result:
+            if !check_the_aggregation_result_is_valid(&plan, &mut has_seen_phj) {
+                return Some(internal_err!("PartitionedHashJoinExec cannot be interrupted by an incompatible operator."));
             }
-
-            // If PartitionedHashJoinExec is encountered, check expressions validity
-            let agg_valid_results = if has_seen_phj {
+            // If we find a PHJ, check expressions' validity:
+            let agg_valid_results = !has_seen_phj || {
                 let schema = plan.schema();
-
-                // All group by expressions should probe the right side of a partitioned hash join
+                // All GROUP BY expressions should probe the right side of a PHJ:
                 let group_valid = group_by.expr().iter().all(|(expr, _)| {
                     collect_columns(expr).iter().all(|col| {
                         schema.field(col.index())
@@ -480,8 +482,7 @@ fn select_best_aggregate_streaming_plan(
                             .map_or(false, |v| v.eq("JoinSide::Right"))
                     })
                 });
-
-                // All aggregate expressions should belong to the left side of a partitioned hash join
+                // All aggregate expressions should belong to the left side of a PHJ:
                 let aggr_valid = aggr_expr.iter().all(|expr| {
                     expr.expressions().iter().all(|expr| {
                         collect_columns(expr).iter().all(|col| {
@@ -492,91 +493,72 @@ fn select_best_aggregate_streaming_plan(
                         })
                     })
                 });
-
                 group_valid && aggr_valid
-            } else {
-                true
             };
-
-            // Plan should support streamable aggregates and be streamable itself
-            if get_window_mode(&group_by.input_exprs(), &[], &plan).is_some()
-                && is_plan_streaming(&plan).is_ok()
-                && agg_valid_results {
-                Some(Ok(plan))
-            } else {
-                None
-            }
+            // Plan should support streamable aggregates and be streamable itself:
+            let viable = agg_valid_results
+                && get_window_mode(&group_by.input_exprs(), &[], &plan).is_some();
+            viable.then(|| Ok(plan))
         })
         .collect()
 }
 
-/// Attempts to locate the nearest `HashJoinExec` within the provided execution `plan`
-/// and then modifies it according to the given aggregate plan (`agg_plan`).
+/// Attempts to locate the nearest `SymmetricHashJoinExec` within the given
+/// `plan` and then modifies it according to the given aggregate plan (`agg_plan`).
 ///
-/// # Arguments
+/// # Parameters
 ///
-/// * `agg_plan`: Reference to an `AggregateExec` plan, which provides context for the optimization.
-/// * `plan`: Reference to the current node in the execution plan tree being analyzed.
-/// * `config_options`: Configuration options that may influence the optimization decisions.
+/// * `agg_plan`: Reference to an `AggregateExec` plan, which provides context
+///   for the optimization.
+/// * `plan`: Reference to the current node in the execution plan tree under
+///   consideration.
+/// * `config_options`: Configuration options that may influence the optimization
+///   decisions.
 ///
 /// # Returns
 ///
-/// Returns a `Result` containing a vector of possible modified execution plans (`Arc<dyn ExecutionPlan>`).
-/// The function may generate multiple alternative plans based on the possible children configurations.
+/// * A `Result` containing a vector of possible alternate execution plans
+///   (`Arc<dyn ExecutionPlan>`). The function may generate multiple plans
+///   based on possible children configurations.
 ///
-/// The function will return the original plan encapsulated in a vector if:
-/// 1. The plan node isn't a `HashJoinExec`.
-/// 2. Modifying the `HashJoinExec` according to the `agg_plan` isn't feasible or allowed.
+/// The function will return a single vector containing the original plan if:
+/// 1. The plan node isn't a `SymmetricHashJoinExec`.
+/// 2. Modifying the `SymmetricHashJoinExec` according to the `agg_plan` isn't
+///    feasible.
 ///
-/// In case of any error during the optimization process, an error variant of `Result` will be returned.
+/// In case of any error during the optimization process, returns the error as is.
 ///
 /// # Example
 ///
-/// If the `plan` contains a `HashJoinExec` that can be influenced by `agg_plan`,
-/// this function will generate optimized versions of the plan and return them.
-/// Otherwise, it will go deeper into the tree, recursively trying to find a suitable `HashJoinExec`
-/// and do the necessary modifications.
+/// If the `plan` contains a `SymmetricHashJoinExec` that can be influenced by
+/// `agg_plan`, this function will generate optimized versions of the plan and
+/// return them. Otherwise, it will go deeper into the tree, recursively trying
+/// to find a suitable `SymmetricHashJoinExec` and do the necessary modifications.
 fn find_closest_join_and_change(
     agg_plan: &AggregateExec,
     plan: &Arc<dyn ExecutionPlan>,
     config_options: &ConfigOptions,
 ) -> Result<Vec<Arc<dyn ExecutionPlan>>> {
-    // Attempt to cast the current node to a HashJoinExec
-    if let Some(hash_join) = plan.as_any().downcast_ref::<HashJoinExec>() {
-        // If the current node is a HashJoinExec, then try to modify it based on the agg_plan.
-        return check_hash_join_aggregate_partial_hash_join(
-            agg_plan,
-            hash_join,
-            config_options,
-        )
-        .and_then(|opt| opt.map_or_else(|| Ok(vec![plan.clone()]), Ok));
+    // Attempt to cast the current node to a `SymmetricHashJoinExec` (SHJ):
+    if let Some(shj) = plan.as_any().downcast_ref::<SymmetricHashJoinExec>() {
+        // If the current node is a SHJ, try to modify it based on `agg_plan`:
+        return replace_shj_with_phj(agg_plan, shj, config_options)
+            .map(|opt| vec![opt.unwrap_or_else(|| plan.clone())]);
     }
-
-    // Attempt to cast the current node to a SymmetricHashJoin
-    if let Some(sym_hash_join) = plan.as_any().downcast_ref::<SymmetricHashJoinExec>() {
-        // If the current node is a HashJoinExec, then try to modify it based on the agg_plan.
-        return check_symmetric_hash_join_aggregate_partial_hash_join(
-            agg_plan,
-            sym_hash_join,
-            config_options,
-        )
-        .and_then(|opt| opt.map_or_else(|| Ok(vec![plan.clone()]), Ok));
-    }
-
-    // If the current plan node is not allowed for modification, return the original plan.
+    // If the current plan node inhibit modification, return the original plan:
     if !is_allowed(plan) {
         return Ok(vec![plan.clone()]);
     }
-
-    // For each child of the current plan, recursively attempt to locate and modify a HashJoinExec.
+    // For each child of the current plan, recursively attempt to locate and
+    // modify a SHJ:
     let calculated_children_possibilities = plan
         .children()
         .iter()
         .map(|child| find_closest_join_and_change(agg_plan, child, config_options))
-        .collect::<Result<Vec<Vec<_>>>>()?;
-
-    // Generate all possible combinations of children based on the modified child plans.
-    // This is used to create alternative versions of the current plan with different child configurations.
+        .collect::<Result<Vec<_>>>()?;
+    // Generate all possible combinations of children based on modified child
+    // plans. This is used to create alternative versions of the current plan
+    // with different child configurations.
     calculated_children_possibilities
         .into_iter()
         .map(|v| v.into_iter())
@@ -588,196 +570,134 @@ fn find_closest_join_and_change(
         .collect()
 }
 
-/// Handles the optimization for the nested loop join execution plan.
+/// Examines the given execution plan to determine if it is a window aggregation
+/// (i.e. a `BoundedWindowAggExec` or a `WindowAggExec`). If it is, the function
+/// extracts the window corresponding to the input plan. If not, it returns the
+/// original plan.
 ///
-/// This function checks if the given plan can be converted as a nested loop join based on the
-/// provided configuration options.
+/// # Parameters
 ///
-/// # Arguments
-/// * `plan` - The execution plan to be checked and possibly converted.
-/// * `config_options` - The configuration options that may affect the nested loop join conversion.
-///
-/// # Returns
-/// * A `Result` containing a vector of execution plans after processing.
-fn handle_nested_loop_join_exec(
-    plan: &Arc<dyn ExecutionPlan>,
-    config_options: &ConfigOptions,
-) -> Result<Vec<Arc<dyn ExecutionPlan>>> {
-    if let Some(nested_loop_join) = plan.as_any().downcast_ref::<NestedLoopJoinExec>() {
-        if let Some(result) =
-            check_nested_loop_join_convertable(nested_loop_join, config_options)?
-        {
-            return Ok(result);
-        }
-    }
-    Ok(vec![plan.clone()])
-}
-
-/// Examines the provided execution plan to determine if it is a window aggregation
-/// (`BoundedWindowAggExec` or `WindowAggExec`). If it is, the function extracts the window
-/// corresponding to the input plan. If not, it returns the original plan.
-///
-/// This function facilitates the extraction and processing of window functions in the context
-/// of an execution plan.
-///
-/// # Arguments
-///
-/// * `plan`: The execution plan to inspect for window aggregations.
+/// * `plan_metadata`: Information about the execution plan to inspect for
+///   window aggregations.
 ///
 /// # Returns
 ///
-/// * A `Result` containing a `Vec` with either:
-///   - The extracted window if the provided plan is a window aggregation.
-///   - The original execution plan otherwise.
-fn handle_window_execs(
-    plan: &Arc<dyn ExecutionPlan>,
-) -> Result<Vec<Arc<dyn ExecutionPlan>>> {
-    let new_window = if let Some(exec) =
-        plan.as_any().downcast_ref::<BoundedWindowAggExec>()
+/// * A `Result` wrapping a `Vec` that contains the extracted window
+///   if the given plan is a window aggregation.
+fn handle_window_execs(mut plan_metadata: PlanMetadata) -> Result<Vec<PlanMetadata>> {
+    let new_window = if let Some(exec) = plan_metadata
+        .plan
+        .as_any()
+        .downcast_ref::<BoundedWindowAggExec>()
     {
         get_best_fitting_window(exec.window_expr(), exec.input(), &exec.partition_keys)?
-    } else if let Some(exec) = plan.as_any().downcast_ref::<WindowAggExec>() {
+    } else if let Some(exec) = plan_metadata.plan.as_any().downcast_ref::<WindowAggExec>()
+    {
         get_best_fitting_window(exec.window_expr(), exec.input(), &exec.partition_keys)?
     } else {
         None
     };
-    if let Some(window) = new_window {
-        return Ok(vec![window]);
+    if let Some(new_window) = new_window {
+        plan_metadata.plan = new_window;
     }
-    Ok(vec![plan.clone()])
+    Ok(vec![plan_metadata])
 }
 
-/// Handles the optimization for the sort execution plan.
+/// Handles potential modifications to an sort execution plan.
 ///
-/// This function checks if the given plan can satisfy the required sorting order. If the sorting
-/// requirement is already met, it returns the child of the sort plan, else an empty vector.
+/// This function checks if the given plan can satisfy the ordering requirement.
+/// If the requirement is already met, it returns the child of the sort plan,
+/// or else an empty vector. TODO
 ///
-/// # Arguments
-/// * `plan` - The execution plan to be checked and possibly converted.
+/// # Parameters
+///
+/// * `plan_metadata` - Information about the execution plan to check and
+///   possibly convert.
 ///
 /// # Returns
-/// * A `Result` containing a vector of execution plans after processing.
-fn handle_sort_exec(
-    plan: &Arc<dyn ExecutionPlan>,
-) -> Result<Vec<Arc<dyn ExecutionPlan>>> {
-    if let Some(sort_exec) = plan.as_any().downcast_ref::<SortExec>() {
-        let sort_child = sort_exec.input().clone();
+///
+/// * A `Result` containing an optional vector of `PlanMetadata` after processing.
+fn handle_sort_exec(plan_metadata: PlanMetadata) -> Result<Vec<PlanMetadata>> {
+    if let Some(sort_exec) = plan_metadata.plan.as_any().downcast_ref::<SortExec>() {
+        let child = sort_exec.input().clone();
         let child_requirement =
             PhysicalSortRequirement::from_sort_exprs(sort_exec.expr());
-        return if sort_exec.fetch().is_none()
-            && sort_child
+        if sort_exec.fetch().is_none()
+            && child
                 .equivalence_properties()
                 .ordering_satisfy_requirement(&child_requirement)
         {
-            Ok(vec![sort_child.clone()])
-            // If the plan is OK with bounded data, we can continue without deleting the possible plan.
-        } else if let Ok(false) = is_plan_streaming(plan) {
-            Ok(vec![plan.clone()])
+            let sort_unboundedness = plan_metadata.children_unboundedness[0];
+            let children_unboundedness = child
+                .children()
+                .iter()
+                .map(|p| is_plan_streaming(p).unwrap_or(false))
+                .collect();
+            let result =
+                PlanMetadata::new(child, sort_unboundedness, children_unboundedness);
+            Ok(vec![result])
+        }
+        // If the plan is OK with bounded data, we can continue without deleting
+        // the plan:
+        else if let Ok(false) = plan_metadata
+            .plan
+            .unbounded_output(&plan_metadata.children_unboundedness)
+        {
+            Ok(vec![plan_metadata])
         } else {
             Ok(vec![])
-        };
+        }
+    } else {
+        Ok(vec![plan_metadata])
     }
-    Ok(vec![plan.clone()])
 }
 
-/// Processes an aggregate plan with a partial hash join for optimization.
+/// Attempts to replace the current join execution plan (`SymmetricHashJoinExec`)
+/// with a more optimized partitioned hash join based on specific conditions.
+/// This optimization specifically targets scenarios where both input streams
+/// are unbounded and have filters and orders provided. If certain criteria are
+/// met, the function returns a `PartitionedHashJoinExec` or a swapped variant
+/// with an added projection. This is particularly useful in optimizing the
+/// processing of sliding window joins with aggregations.
 ///
-/// This function examines the aggregate and hash join plans, and applies specific transformations
-/// to optimize the execution depending on the configurations and the state of the plans.
+/// # Parameters
 ///
-/// # Arguments
-/// * `parent_plan` - The aggregate execution plan that acts as a parent to the hash join plan.
-/// * `hash_join` - The hash join execution plan to be processed.
-/// * `config_options` - The configuration options that may affect the optimization process.
-///
-/// # Returns
-/// * A `Result` containing an `Option` of a vector of execution plans after processing.
-///   Returns `None` if no optimization could be applied.
-fn check_hash_join_aggregate_partial_hash_join(
-    parent_plan: &AggregateExec,
-    hash_join: &HashJoinExec,
-    _config_options: &ConfigOptions,
-) -> Result<Option<Vec<Arc<dyn ExecutionPlan>>>> {
-    // Based on various properties of the join and the data streams, determine the
-    // best way to process the hash join.
-    replace_with_partial_hash_join(
-        parent_plan,
-        hash_join.left(),
-        hash_join.right(),
-        hash_join.filter(),
-        hash_join.on.clone(),
-        hash_join.join_type,
-        hash_join.null_equals_null,
-    )
-}
-
-fn check_symmetric_hash_join_aggregate_partial_hash_join(
-    parent_plan: &AggregateExec,
-    sym_hash_join: &SymmetricHashJoinExec,
-    _config_options: &ConfigOptions,
-) -> Result<Option<Vec<Arc<dyn ExecutionPlan>>>> {
-    // Based on various properties of the join and the data streams, determine the
-    // best way to process the hash join.
-    replace_with_partial_hash_join(
-        parent_plan,
-        sym_hash_join.left(),
-        sym_hash_join.right(),
-        sym_hash_join.filter(),
-        sym_hash_join.on().to_vec(),
-        *sym_hash_join.join_type(),
-        sym_hash_join.null_equals_null(),
-    )
-}
-
-/// Attempts to replace the current join execution plan with a more optimized partitioned hash join
-/// based on specific conditions. This optimization specifically targets scenarios where both input
-/// streams are unbounded and have filters and orders provided. If certain criteria are met, the function
-/// returns a `PartitionedHashJoinExec` or a swapped variant with an added projection.
-///
-/// # Arguments
-///
-/// * `parent_plan`: The aggregate execution plan which is the parent node of the current join.
-/// * `left_child`: The left child node of the current join execution plan.
-/// * `right_child`: The right child node of the current join execution plan.
-/// * `filter`: The join filter applied, if any.
-/// * `on`: Specifies which columns the join condition should be based on.
-/// * `join_type`: Type of join (e.g., Inner, Left, Right).
-/// * `null_equals_null`: A boolean flag indicating if null values should be considered equal during the join.
+/// * `parent_plan`: The parent node of the current join execution plan, typically
+///   an `AggregateExec`.
+/// * `shj`: The symmetric hash join execution plan to (potentially) optimize.
+/// * `config_options`: Configuration options that may influence optimization.
 ///
 /// # Returns
 ///
-/// * A `Result` containing an `Option` with a `Vec` of potential optimized execution plans (`Arc<dyn ExecutionPlan>`).
-///   - Returns an optimized plan if conditions are met.
-///   - Returns `None` if no optimization is applied.
-#[allow(clippy::too_many_arguments)]
-fn replace_with_partial_hash_join(
+/// * A `Result` object containing an `Option` with a `Vec` of potential
+///   alternate execution plans (`Arc<dyn ExecutionPlan>`). If no alternates
+///   are possible, the result object contains `None`.
+///
+/// # Errors
+///
+/// This function may return an error if it encounters any issue as it tries to
+/// create alternate plans.
+fn replace_shj_with_phj(
     parent_plan: &AggregateExec,
-    left_child: &Arc<dyn ExecutionPlan>,
-    right_child: &Arc<dyn ExecutionPlan>,
-    filter: Option<&JoinFilter>,
-    on: JoinOn,
-    join_type: JoinType,
-    null_equals_null: bool,
-) -> Result<Option<Vec<Arc<dyn ExecutionPlan>>>> {
+    shj: &SymmetricHashJoinExec,
+    config_options: &ConfigOptions,
+) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    let left_child = shj.left();
+    let right_child = shj.right();
     let left_order = left_child.output_ordering();
     let right_order = right_child.output_ordering();
-    let is_left_unbounded = is_plan_streaming(left_child).unwrap_or(false);
-    let is_right_unbounded = is_plan_streaming(right_child).unwrap_or(false);
-    // To perform the prunability analysis correctly, the columns from the left table
-    // and the columns from the right table must be on the different sides of the join.
-    let filter =
-        filter.map(|filter| separate_columns_of_filter_expression(filter.clone()));
-    match (
-        is_left_unbounded,
-        is_right_unbounded,
-        filter.as_ref(),
-        left_order,
-        right_order,
-    ) {
-        // Both streams are unbounded, and filter with orders are present
-        (true, true, Some(filter), Some(left_order), Some(right_order)) => {
+    // To perform the prunability analysis correctly, columns from the left table
+    // and columns from the right table must be on the different sides of the join.
+    let filter = shj
+        .filter()
+        .cloned()
+        .map(separate_columns_of_filter_expression);
+    match (filter, left_order, right_order) {
+        // Both sides are unbounded and a filter with orders is present:
+        (Some(filter), Some(left_order), Some(right_order)) => {
+            // Check if filter expressions can be pruned based on the data orders
             let (build_prunable, probe_prunable) = is_filter_expr_prunable(
-                filter,
+                &filter,
                 Some(left_order[0].clone()),
                 Some(right_order[0].clone()),
                 &left_child.equivalence_properties(),
@@ -787,114 +707,124 @@ fn replace_with_partial_hash_join(
             let group_by = parent_plan.group_by();
             let mode = parent_plan.mode();
             let aggr_expr = parent_plan.aggr_expr();
-            // TODO: Implement FIRST_VALUE convert into LAST_VALUE.
+            // TODO: Implement FIRST_VALUE/LAST_VALUE conversion.
             let fetch_per_key =
                 if aggr_expr.iter().all(|expr| expr.as_any().is::<LastValue>()) {
                     1
                 } else {
                     return Ok(None);
                 };
-
-            // If probe side can be pruned, apply specific optimization for that case
+            let working_mode = if config_options
+                .execution
+                .prefer_eager_execution_on_sliding_joins
+            {
+                SlidingWindowWorkingMode::Eager
+            } else {
+                SlidingWindowWorkingMode::Lazy
+            };
+            let partition_mode = if config_options.optimizer.repartition_joins {
+                StreamJoinPartitionMode::Partitioned
+            } else {
+                StreamJoinPartitionMode::SinglePartition
+            };
+            // If probe side is prunable, apply specific optimization for that case:
             if probe_prunable
                 && matches!(mode, AggregateMode::Partial)
-                && matches!(join_type, JoinType::Inner | JoinType::Right)
+                && matches!(shj.join_type(), JoinType::Inner | JoinType::Right)
                 && group_by.null_expr().is_empty()
             {
-                // Create a new partitioned hash join plan
-                let partitioned_hash_join = Arc::new(PartitionedHashJoinExec::try_new(
+                // Create a new partitioned hash join plan:
+                PartitionedHashJoinExec::try_new(
                     left_child.clone(),
                     right_child.clone(),
-                    on.clone(),
-                    filter.clone(),
-                    &join_type,
-                    null_equals_null,
+                    shj.on().to_vec(),
+                    filter,
+                    shj.join_type(),
+                    shj.null_equals_null(),
                     left_order.to_vec(),
                     right_order.to_vec(),
                     fetch_per_key,
-                )?);
-                return Ok(Some(vec![partitioned_hash_join]));
-                // If build side can be pruned, apply specific optimization for that case
+                    partition_mode,
+                    working_mode,
+                )
+                .map(|e| Some(Arc::new(e) as _))
+                // If build side is prunable, apply specific optimization for that case:
             } else if build_prunable
                 && matches!(mode, AggregateMode::Partial)
-                && matches!(join_type, JoinType::Inner | JoinType::Left)
+                && matches!(shj.join_type(), JoinType::Inner | JoinType::Left)
                 && group_by.null_expr().is_empty()
             {
-                // Create a new join plan with swapped sides
+                // Create a new join plan with swapped sides:
                 let new_join = PartitionedHashJoinExec::try_new(
                     right_child.clone(),
                     left_child.clone(),
-                    swap_join_on(&on),
-                    swap_filter(filter),
-                    &swap_join_type(join_type),
-                    null_equals_null,
+                    swap_join_on(shj.on()),
+                    swap_filter(&filter),
+                    &swap_join_type(*shj.join_type()),
+                    shj.null_equals_null(),
                     right_order.to_vec(),
                     left_order.to_vec(),
                     fetch_per_key,
+                    partition_mode,
+                    working_mode,
                 )?;
-                // Create a new projection plan
-                let proj = ProjectionExec::try_new(
+                // Create a new projection plan:
+                ProjectionExec::try_new(
                     swap_reverting_projection(
                         &left_child.schema(),
                         &right_child.schema(),
                     ),
                     Arc::new(new_join),
-                )?;
-                return Ok(Some(vec![Arc::new(proj)]));
+                )
+                .map(|e| Some(Arc::new(e) as _))
+            } else {
+                Ok(None)
             }
-            Ok(None)
         }
-        // In all other cases, no specific optimization is applied
+        // There are no alternates in other cases, signal so:
         _ => Ok(None),
     }
 }
 
-/// Checks if a given `HashJoinExec` can be converted into another form of execution plans,
-/// primarily into `SortMergeJoinExec` while still preserving the required conditions.
+/// Checks if a given `HashJoinExec` can be converted into alternate execution
+/// plan(s) while preserving its semantics.
 ///
-/// This function first extracts key properties from the `HashJoinExec` and then determines
-/// the possibility of conversion based on these properties. The conversion mainly involves
-/// replacing `HashJoinExec` with `SortMergeJoinExec` for cases where both left and right children
-/// are unbounded, and the output ordering can be satisfied.
+/// # Parameters
 ///
-/// If conversion is feasible, this function creates the corresponding `SortMergeJoinExec` instances,
-/// handles the possibility of swapping join types, and returns these new plans.
-///
-/// # Arguments
-///
-/// * `hash_join`: A reference to a `HashJoinExec` object, which is the hash join execution plan
-/// that we are checking for convertibility.
-///
-/// * `_config_options`: A reference to a `ConfigOptions` object, which provides the configuration settings.
-/// However, these options are not used in the current function.
+/// * `plan_metadata`: A reference to a `PlanMetadata` object, which contains
+///   information about the hash join in question.
+/// * `config_options`: A reference to a `ConfigOptions` object, which provides
+///   the configuration settings.
 ///
 /// # Returns
 ///
-/// This function returns a `Result` that contains an `Option`. If the `HashJoinExec` can be converted,
-/// the `Option` will contain a `Vec` of `Arc<dyn ExecutionPlan>` objects, each representing a new execution plan.
-/// If conversion is not possible, the function returns `None`. Any errors that occur during the conversion process
-/// will result in an `Err` being returned.
-fn check_hash_join_convertable(
-    plan: &Arc<dyn ExecutionPlan>,
+/// * A `Result` that contains an `Option`. If the `HashJoinExec` has alternates,
+///   the `Option` will contain a `Vec` of alternate `PlanMetadata` objects, each
+///   representing a new execution plan. If there are no alternates, the option
+///   will contain `None`.
+///
+/// # Errors
+///
+/// Any errors that occur during the conversion process will result in an `Err`.
+fn handle_hash_join(
+    plan_metadata: PlanMetadata,
     config_options: &ConfigOptions,
-) -> Result<Option<Vec<Arc<dyn ExecutionPlan>>>> {
-    if let Some(hash_join) = plan.as_any().downcast_ref::<HashJoinExec>() {
-        // To perform the prunability analysis correctly, the columns from the left table
-        // and the columns from the right table must be on the different sides of the join.
+) -> Result<Vec<PlanMetadata>> {
+    if let Some(hash_join) = plan_metadata.plan.as_any().downcast_ref::<HashJoinExec>() {
+        // To perform the prunability analysis correctly, columns from the left table
+        // and columns from the right table must be on the different sides of the join.
         let filter = hash_join
             .filter()
-            .map(|filter| separate_columns_of_filter_expression(filter.clone()));
+            .cloned()
+            .map(separate_columns_of_filter_expression);
         let (on_left, on_right): (Vec<_>, Vec<_>) = hash_join.on.iter().cloned().unzip();
         let left = hash_join.left();
         let right = hash_join.right();
-        let mode = if config_options.optimizer.repartition_joins {
-            StreamJoinPartitionMode::Partitioned
-        } else {
-            StreamJoinPartitionMode::SinglePartition
-        };
-        match (
-            is_plan_streaming(left).unwrap_or(false),
-            is_plan_streaming(right).unwrap_or(false),
+        let left_streaming = plan_metadata.children_unboundedness[0];
+        let right_streaming = plan_metadata.children_unboundedness[1];
+        let result = match (
+            left_streaming,
+            right_streaming,
             filter.as_ref(),
             left.output_ordering(),
             right.output_ordering(),
@@ -905,74 +835,83 @@ fn check_hash_join_convertable(
                     filter,
                     left_order,
                     right_order,
-                    mode,
-                )
+                    config_options,
+                )?
+                .into_iter()
+                .map(|plan| PlanMetadata::new(plan, true, vec![true, true]))
+                .collect()
             }
-            (true, true, None, Some(_left_order), Some(_right_order)) => {
-                handle_sort_merge_join_creation(hash_join, mode, &on_left, &on_right)
-            }
+            (true, true, None, Some(_), Some(_)) => handle_sort_merge_join_creation(
+                hash_join,
+                &on_left,
+                &on_right,
+                config_options,
+            )?
+            .into_iter()
+            .map(|plan| PlanMetadata::new(plan, true, vec![true, true]))
+            .collect(),
             (true, true, maybe_filter, _, _) => {
-                Ok(Some(vec![create_symmetric_hash_join(
-                    hash_join,
-                    maybe_filter,
-                    mode,
-                )?]))
+                let plan =
+                    create_symmetric_hash_join(hash_join, maybe_filter, config_options)?;
+
+                vec![PlanMetadata::new(plan, true, vec![true, true])]
             }
             (true, false, _, _, _) => {
-                let optimized_hash_join = if matches!(
+                if matches!(
                     *hash_join.join_type(),
                     JoinType::Inner
                         | JoinType::Left
                         | JoinType::LeftSemi
                         | JoinType::LeftAnti
                 ) {
-                    swap_join_according_to_unboundedness(hash_join)?
+                    let plan = swap_join_according_to_unboundedness(hash_join)?;
+                    vec![PlanMetadata::new(plan, true, vec![false, true])]
                 } else {
-                    plan.clone()
-                };
-                Ok(Some(vec![optimized_hash_join]))
+                    vec![plan_metadata]
+                }
             }
-            (false, false, _, _, _) => {
-                let optimized_plan = if let Some(opt_plan) =
-                    statistical_join_selection_hash_join(
-                        hash_join,
-                        config_options
-                            .optimizer
-                            .hash_join_single_partition_threshold,
-                    )? {
-                    opt_plan
-                } else {
-                    plan.clone()
-                };
-                Ok(Some(vec![optimized_plan]))
-            }
-            _ => Ok(None),
-        }
+            (false, false, _, _, _) => statistical_join_selection_hash_join(
+                hash_join,
+                config_options
+                    .optimizer
+                    .hash_join_single_partition_threshold,
+            )?
+            .map(|optimized_plan| {
+                vec![PlanMetadata::new(optimized_plan, false, vec![false, false])]
+            })
+            .unwrap_or(vec![plan_metadata]),
+            _ => vec![plan_metadata],
+        };
+        Ok(result)
     } else {
-        Ok(None)
+        Ok(vec![plan_metadata])
     }
 }
-/// Handles the conversion of a `HashJoinExec` into a sliding hash join execution plan or symmetric hash join
-/// depending on whether the filter expression is prunable for both left and right orders.
+
+/// Handles the conversion of a `HashJoinExec` into a sliding hash join or a
+/// a symmetric hash join depending on whether the filter expression is prunable
+/// for left/right sides.
 ///
-/// # Arguments
+/// # Parameters
 ///
 /// * `hash_join`: Reference to the `HashJoinExec` being converted.
 /// * `filter`: Reference to the join filter applied, after the filter rewrite.
 /// * `left_order`: The order for the left side of the join.
 /// * `right_order`: The order for the right side of the join.
-/// * `mode`: The stream join partition mode.
+/// * `config_options`: A reference to a `ConfigOptions` object, which provides
+///   the configuration settings.
 ///
 /// # Returns
 ///
-/// * A `Result` containing an `Option` with a `Vec` of execution plans (`Arc<dyn ExecutionPlan>`).
+/// * A `Result` containing an `Option` with a `Vec` of execution plans
+///   (`Arc<dyn ExecutionPlan>`).
 fn handle_sliding_hash_conversion(
     hash_join: &HashJoinExec,
     filter: &JoinFilter,
     left_order: &[PhysicalSortExpr],
     right_order: &[PhysicalSortExpr],
-    mode: StreamJoinPartitionMode,
-) -> Result<Option<Vec<Arc<dyn ExecutionPlan>>>> {
+    config_options: &ConfigOptions,
+) -> Result<Vec<Arc<dyn ExecutionPlan>>> {
     let (left_prunable, right_prunable) = is_filter_expr_prunable(
         filter,
         Some(left_order[0].clone()),
@@ -982,6 +921,19 @@ fn handle_sliding_hash_conversion(
     )?;
 
     if left_prunable && right_prunable {
+        let working_mode = if config_options
+            .execution
+            .prefer_eager_execution_on_sliding_joins
+        {
+            SlidingWindowWorkingMode::Eager
+        } else {
+            SlidingWindowWorkingMode::Lazy
+        };
+        let mode = if config_options.optimizer.repartition_joins {
+            StreamJoinPartitionMode::Partitioned
+        } else {
+            StreamJoinPartitionMode::SinglePartition
+        };
         let sliding_hash_join = Arc::new(SlidingHashJoinExec::try_new(
             hash_join.left.clone(),
             hash_join.right.clone(),
@@ -992,50 +944,54 @@ fn handle_sliding_hash_conversion(
             left_order.to_vec(),
             right_order.to_vec(),
             mode,
+            working_mode,
         )?);
-        let reversed_sliding_hash_join = swap_sliding_hash_join(&sliding_hash_join)?;
-        Ok(Some(vec![sliding_hash_join, reversed_sliding_hash_join]))
+        swap_sliding_hash_join(&sliding_hash_join).map(|reversed_sliding_hash_join| {
+            vec![sliding_hash_join, reversed_sliding_hash_join]
+        })
     } else {
-        // There is an configuration for allowing not prunable symmetric hash join.
-        Ok(Some(vec![create_symmetric_hash_join(
-            hash_join,
-            Some(filter),
-            mode,
-        )?]))
+        // There is a configuration allowing non-prunable symmetric hash joins:
+        create_symmetric_hash_join(hash_join, Some(filter), config_options)
+            .map(|e| vec![e])
     }
 }
 
 /// Handles the creation of a `SortMergeJoinExec` from a `HashJoinExec`.
 ///
-/// # Arguments
+/// # Parameters
 ///
 /// * `hash_join`: Reference to the `HashJoinExec` being converted.
-/// * `mode`: The stream join partition mode.
-/// * `on_left`: The columns on the left side of the join.
-/// * `on_right`: The columns on the right side of the join.
-/// * `left_order`: The order for the left side of the join.
-/// * `right_order`: The order for the right side of the join.
+/// * `on_left`: Columns on the left side of the join.
+/// * `on_right`: Columns on the right side of the join.
+/// * `config_options`: A reference to a `ConfigOptions` object, which provides
+///   the configuration settings.
 ///
 /// # Returns
 ///
-/// * A `Result` containing an `Option` with a `Vec` of execution plans (`Arc<dyn ExecutionPlan>`).
+/// * A `Result` containing an `Option` with a `Vec` of execution plans
+///   (`Arc<dyn ExecutionPlan>`).
 fn handle_sort_merge_join_creation(
     hash_join: &HashJoinExec,
-    mode: StreamJoinPartitionMode,
     on_left: &[Column],
     on_right: &[Column],
-) -> Result<Option<Vec<Arc<dyn ExecutionPlan>>>> {
+    config_options: &ConfigOptions,
+) -> Result<Vec<Arc<dyn ExecutionPlan>>> {
     // Get left key(s)' sort options:
     let left_satisfied = get_indices_of_matching_sort_exprs_with_order_eq(
         on_left,
         hash_join.left().equivalence_properties(),
     );
     // Get right key(s)' sort options:
+
     let right_satisfied = get_indices_of_matching_sort_exprs_with_order_eq(
         on_right,
         hash_join.right().equivalence_properties(),
     );
-    let mut plans: Vec<Arc<dyn ExecutionPlan>> = vec![];
+    let mut plans = vec![create_symmetric_hash_join(
+        hash_join,
+        hash_join.filter(),
+        config_options,
+    )?];
     if let (
         Some((left_satisfied, left_indices)),
         Some((right_satisfied, right_indices)),
@@ -1073,12 +1029,44 @@ fn handle_sort_merge_join_creation(
             }
         }
     }
-    plans.push(create_symmetric_hash_join(
-        hash_join,
-        hash_join.filter(),
-        mode,
-    )?);
-    Ok(Some(plans))
+    Ok(plans)
+}
+
+/// This function swaps the inputs of the given SMJ operator.
+fn swap_sort_merge_join(
+    hash_join: &HashJoinExec,
+    keys: Vec<(Column, Column)>,
+    sort_options: Vec<SortOptions>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let left = hash_join.left();
+    let right = hash_join.right();
+    let swapped_join_type = swap_join_type(hash_join.join_type);
+    if matches!(swapped_join_type, JoinType::RightSemi) {
+        return plan_err!("RightSemi is not supported for SortMergeJoin");
+    }
+    // Sort option will remain same since each tuple of keys from both side will have exactly same
+    // SortOptions.
+    let new_join = SortMergeJoinExec::try_new(
+        right.clone(),
+        left.clone(),
+        swap_join_on(&keys),
+        swapped_join_type,
+        sort_options,
+        hash_join.null_equals_null,
+    )
+    .map(|e| Arc::new(e) as _);
+
+    if !matches!(
+        hash_join.join_type,
+        JoinType::LeftSemi | JoinType::LeftAnti | JoinType::RightAnti
+    ) {
+        return ProjectionExec::try_new(
+            swap_reverting_projection(&left.schema(), &right.schema()),
+            new_join?,
+        )
+        .map(|e| Arc::new(e) as _);
+    }
+    new_join
 }
 
 /// Creates a symmetric hash join execution plan from a `HashJoinExec`.
@@ -1094,8 +1082,13 @@ fn handle_sort_merge_join_creation(
 fn create_symmetric_hash_join(
     hash_join: &HashJoinExec,
     filter: Option<&JoinFilter>,
-    mode: StreamJoinPartitionMode,
+    config_options: &ConfigOptions,
 ) -> Result<Arc<dyn ExecutionPlan>> {
+    let mode = if config_options.optimizer.repartition_joins {
+        StreamJoinPartitionMode::Partitioned
+    } else {
+        StreamJoinPartitionMode::SinglePartition
+    };
     let plan = Arc::new(SymmetricHashJoinExec::try_new(
         hash_join.left().clone(),
         hash_join.right().clone(),
@@ -1117,20 +1110,25 @@ fn create_symmetric_hash_join(
 /// # Returns
 ///
 /// * A `Result` containing an `Option` with a `Vec` of execution plans (`Arc<dyn ExecutionPlan>`).
-fn check_cross_join_convertable(
-    plan: &Arc<dyn ExecutionPlan>,
-) -> Result<Option<Vec<Arc<dyn ExecutionPlan>>>> {
-    if let Some(cross_join) = plan.as_any().downcast_ref::<CrossJoinExec>() {
-        let optimized_plan =
-            if let Some(opt_plan) = statistical_join_selection_cross_join(cross_join)? {
-                opt_plan
-            } else {
-                plan.clone()
-            };
-        Ok(Some(vec![optimized_plan]))
-    } else {
-        Ok(None)
+fn handle_cross_join(plan_metadata: PlanMetadata) -> Result<Vec<PlanMetadata>> {
+    if let Some(cross_join) = plan_metadata.plan.as_any().downcast_ref::<CrossJoinExec>()
+    {
+        if let Some(plan) = statistical_join_selection_cross_join(cross_join)? {
+            let child_unboundedness = plan_metadata
+                .children_unboundedness
+                .iter()
+                .copied()
+                .rev()
+                .collect::<Vec<_>>();
+            let unbounded = plan.unbounded_output(&child_unboundedness)?;
+            return Ok(vec![PlanMetadata::new(
+                plan,
+                unbounded,
+                child_unboundedness,
+            )]);
+        }
     }
+    Ok(vec![plan_metadata])
 }
 
 /// Checks if a nested loop join is convertible, and if so, converts it.
@@ -1143,55 +1141,82 @@ fn check_cross_join_convertable(
 /// # Returns
 ///
 /// * A `Result` containing an `Option` with a `Vec` of execution plans (`Arc<dyn ExecutionPlan>`).
-fn check_nested_loop_join_convertable(
-    nested_loop_join: &NestedLoopJoinExec,
-    _config_options: &ConfigOptions,
-) -> Result<Option<Vec<Arc<dyn ExecutionPlan>>>> {
-    // To perform the prunability analysis correctly, the columns from the left table
-    // and the columns from the right table must be on the different sides of the join.
-    let filter = nested_loop_join
-        .filter()
-        .map(|filter| separate_columns_of_filter_expression(filter.clone()));
-    let left_order = nested_loop_join.left().output_ordering();
-    let right_order = nested_loop_join.right().output_ordering();
-    let is_left_streaming = is_plan_streaming(nested_loop_join.left())?;
-    let is_right_streaming = is_plan_streaming(nested_loop_join.right())?;
-    match (
-        is_left_streaming,
-        is_right_streaming,
-        filter,
-        left_order,
-        right_order,
-    ) {
-        (true, true, Some(filter), Some(left_order), Some(right_order)) => {
-            let (left_prunable, right_prunable) = is_filter_expr_prunable(
-                &filter,
-                Some(left_order[0].clone()),
-                Some(right_order[0].clone()),
-                &nested_loop_join.left().equivalence_properties(),
-                &nested_loop_join.right().equivalence_properties(),
-            )?;
-            if left_prunable && right_prunable {
-                let sliding_nested_loop_join =
-                    Arc::new(SlidingNestedLoopJoinExec::try_new(
-                        nested_loop_join.left().clone(),
-                        nested_loop_join.right().clone(),
-                        filter.clone(),
-                        nested_loop_join.join_type(),
-                        left_order.to_vec(),
-                        right_order.to_vec(),
-                    )?);
-                let reversed_sliding_nested_loop_join =
-                    swap_sliding_nested_loop_join(&sliding_nested_loop_join)?;
-                Ok(Some(vec![
-                    sliding_nested_loop_join,
-                    reversed_sliding_nested_loop_join,
-                ]))
-            } else {
-                Ok(None)
+fn handle_nested_loop_join(
+    plan_metadata: PlanMetadata,
+    config_options: &ConfigOptions,
+) -> Result<Vec<PlanMetadata>> {
+    if let Some(nested_loop_join) = plan_metadata
+        .plan
+        .as_any()
+        .downcast_ref::<NestedLoopJoinExec>()
+    {
+        // To perform the prunability analysis correctly, the columns from the left table
+        // and the columns from the right table must be on the different sides of the join.
+        let filter = nested_loop_join
+            .filter()
+            .map(|filter| separate_columns_of_filter_expression(filter.clone()));
+        let left_order = nested_loop_join.left().output_ordering();
+        let right_order = nested_loop_join.right().output_ordering();
+        let is_left_streaming = plan_metadata.children_unboundedness[0];
+        let is_right_streaming = plan_metadata.children_unboundedness[1];
+        match (
+            is_left_streaming,
+            is_right_streaming,
+            filter,
+            left_order,
+            right_order,
+        ) {
+            (true, true, Some(filter), Some(left_order), Some(right_order)) => {
+                let (left_prunable, right_prunable) = is_filter_expr_prunable(
+                    &filter,
+                    Some(left_order[0].clone()),
+                    Some(right_order[0].clone()),
+                    &nested_loop_join.left().equivalence_properties(),
+                    &nested_loop_join.right().equivalence_properties(),
+                )?;
+                if left_prunable && right_prunable {
+                    let working_mode = if config_options
+                        .execution
+                        .prefer_eager_execution_on_sliding_joins
+                    {
+                        SlidingWindowWorkingMode::Eager
+                    } else {
+                        SlidingWindowWorkingMode::Lazy
+                    };
+                    let sliding_nested_loop_join =
+                        Arc::new(SlidingNestedLoopJoinExec::try_new(
+                            nested_loop_join.left().clone(),
+                            nested_loop_join.right().clone(),
+                            filter.clone(),
+                            nested_loop_join.join_type(),
+                            left_order.to_vec(),
+                            right_order.to_vec(),
+                            working_mode,
+                        )?);
+                    let reversed_sliding_nested_loop_join =
+                        swap_sliding_nested_loop_join(&sliding_nested_loop_join)?;
+                    let sliding_nested_loop_join_metadata = PlanMetadata::new(
+                        sliding_nested_loop_join,
+                        true,
+                        vec![true, true],
+                    );
+                    let reversed_sliding_nested_loop_join_metadata = PlanMetadata::new(
+                        reversed_sliding_nested_loop_join,
+                        true,
+                        vec![true, true],
+                    );
+                    Ok(vec![
+                        sliding_nested_loop_join_metadata,
+                        reversed_sliding_nested_loop_join_metadata,
+                    ])
+                } else {
+                    Ok(vec![plan_metadata])
+                }
             }
+            _ => Ok(vec![plan_metadata]),
         }
-        _ => Ok(None),
+    } else {
+        Ok(vec![plan_metadata])
     }
 }
 
@@ -3887,7 +3912,7 @@ mod sql_fuzzy_tests {
     use crate::physical_plan::displayable;
     use crate::physical_plan::{collect, ExecutionPlan};
     use crate::prelude::{CsvReadOptions, SessionContext};
-    use arrow::util::pretty::{pretty_format_batches, print_batches};
+    use arrow::util::pretty::pretty_format_batches;
     use arrow_array::RecordBatch;
     use arrow_schema::{DataType, Field, Schema};
     use datafusion_execution::config::SessionConfig;
@@ -4069,8 +4094,6 @@ mod sql_fuzzy_tests {
     async fn experiment(expected_unbounded_plan: &[&str], sql: &str) -> Result<()> {
         let first_batches = unbounded_execution(expected_unbounded_plan, sql).await?;
         let second_batches = bounded_execution(sql).await?;
-        print_batches(&first_batches)?;
-        print_batches(&second_batches)?;
         compare_batches(&first_batches, &second_batches);
         Ok(())
     }

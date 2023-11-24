@@ -14,12 +14,13 @@
 //! This plan uses the [`OneSideHashJoiner`] object to facilitate join calculations
 //! for both its children.
 
-use std::fmt::{Debug, Formatter};
+use std::any::Any;
+use std::fmt::{self, Debug, Formatter};
+use std::mem;
 use std::sync::Arc;
 use std::task::Poll;
+use std::usize;
 use std::vec;
-use std::{any::Any, usize};
-use std::{fmt, mem};
 
 use crate::common::SharedMemoryReservation;
 use crate::expressions::{Column, PhysicalSortExpr};
@@ -28,29 +29,22 @@ use crate::joins::{
     sliding_window_join_utils::{
         adjust_probe_side_indices_by_join_type,
         calculate_build_outer_indices_by_join_type,
-        calculate_the_necessary_build_side_range,
-        check_if_sliding_window_condition_is_met, get_probe_batch,
-        is_batch_suitable_interval_calculation, JoinStreamState,
-    },
-    stream_join_utils::{
-        calculate_filter_expr_intervals, combine_two_batches, record_visited_indices,
-        SortedFilterExpr,
+        calculate_the_necessary_build_side_range_helper, joinable_probe_batch_helper,
+        EagerWindowJoinOperations, LazyJoinStream, LazyJoinStreamState, ProbeBuffer,
     },
     symmetric_hash_join::OneSideHashJoiner,
     utils::{
         build_batch_from_indices, build_join_schema, calculate_join_output_ordering,
-        check_join_is_valid, partitioned_join_output_partitioning, prepare_sorted_exprs,
-        swap_filter, swap_join_on, swap_join_type, swap_reverting_projection,
-        ColumnIndex, JoinFilter, JoinOn,
+        check_join_is_valid, swap_filter, swap_join_on, swap_join_type,
+        swap_reverting_projection, ColumnIndex, JoinFilter, JoinOn,
     },
-    StreamJoinPartitionMode,
+    SlidingWindowWorkingMode, StreamJoinPartitionMode,
 };
-use crate::metrics::{self, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
+use crate::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use crate::projection::ProjectionExec;
-use crate::{DataFusionError, Result};
 use crate::{
-    DisplayAs, DisplayFormatType, Distribution, EquivalenceProperties, ExecutionPlan,
-    Partitioning, RecordBatchStream, SendableRecordBatchStream, Statistics,
+    DataFusionError, DisplayAs, DisplayFormatType, Distribution, EquivalenceProperties,
+    ExecutionPlan, Partitioning, RecordBatchStream, Result, SendableRecordBatchStream,
 };
 
 use arrow::datatypes::{Schema, SchemaRef};
@@ -58,84 +52,22 @@ use arrow::record_batch::RecordBatch;
 use datafusion_common::{internal_err, plan_err, JoinSide, JoinType};
 use datafusion_execution::memory_pool::MemoryConsumer;
 use datafusion_execution::TaskContext;
-use datafusion_physical_expr::equivalence::join_equivalence_properties;
-use datafusion_physical_expr::intervals::ExprIntervalGraph;
+use datafusion_physical_expr::intervals::{ExprIntervalGraph, Interval};
 use datafusion_physical_expr::PhysicalSortRequirement;
 
+use crate::joins::sliding_window_join_utils::partitioned_join_output_partitioning;
+use crate::joins::stream_join_utils::{
+    combine_two_batches, prepare_sorted_exprs, record_visited_indices, EagerJoinStream,
+    EagerJoinStreamState, SortedFilterExpr, StreamJoinStateResult,
+};
+use crate::joins::symmetric_hash_join::StreamJoinMetrics;
 use ahash::RandomState;
-use futures::{ready, Stream, StreamExt};
+use async_trait::async_trait;
+use datafusion_physical_expr::equivalence::join_equivalence_properties;
+use futures::Stream;
 use parking_lot::Mutex;
 
-/// Sliding hash join implementation for sliding window joins.
-/// ```text
-///              Build
-///            +---------+
-///            | a  | b  |        Probe
-///            |---------|       +-------+
-///            | 1  | a  |       | x | y |
-///            |    |    |       |-------|
-///            | 2  | b  |       | 3 | a |
-///            |    |    |       |   |   |
-///            | 3  | c  |       | 4 | v |
-///            |    |    |       |   |   |
-///            | 5  | c  |       | 5 | a |
-///            |    |    |       |   |   |
-///            | 6  | a  |       | 6 | x |
-///            |    |    |       |   |   |
-///            | 8  | a  |       +-------+
-///            |    |    |
-///            | 8  | d  |
-///            |    |    |
-///            | 10 | c  |
-///            |    |    |
-///            | 12 | y  |
-///            |    |    |
-///            +---------+
-///
-///  Query: b=y AND a > x - 3 AND a < x + 8
-///
-///  This query implies a sliding window since
-///  a and x columns ordered in direction.
-///
-///  We use this information for partially materializing
-///  and prune the build side.
-///
-///              Build
-///            +---------+
-///            | a  | b  |        Probe
-///            |---------|       +-------+
-///            | 1  | a  |       | x | y |
-///            |    |    |      /|-------|
-///            | 2  | b  |    /- | 3 | a |
-///            |    |    |   /   |   |   |
-///            | 3  | c  | /-    | 4 | v |
-///            |    |    |-      |   |   |
-///            | 5  | c  |       | 5 | a |
-///            |    |    |       |   |   |
-///            | 6  | a  |       | 6 | x |
-///            |    |    |       |   |   |
-///            | 8  | a  |      |+-------+
-///            |    |    |      /
-///            | 8  | d  |     |
-///            |    |    |     /
-///            | 10 | c  |    |
-///            |    |    |    /
-///            | 12 | y  |   |
-///            |    |    |   /
-///            +---------+  |
-///                         / Sliding Window
-///                        |
-///                        |
-///            -------------
-///
-///
-///  The probe side requires the build side until
-///  the a column has a < 6 + 8 => a < 14. Thus,
-///  we are fetching the build side until we see a value
-///  in column a greater than 14. This is how we guarantee the
-///  probe side is met all possible rows from build side.
-/// ```
-///
+/// Sliding hash join implementation for sliding window joins includes join keys.
 #[derive(Debug)]
 pub struct SlidingHashJoinExec {
     /// Left side stream
@@ -165,70 +97,9 @@ pub struct SlidingHashJoinExec {
     /// The output ordering
     output_ordering: Option<Vec<PhysicalSortExpr>>,
     /// Partition mode
-    pub(crate) mode: StreamJoinPartitionMode,
-}
-
-/// This object encapsulates metrics pertaining to a single input (i.e. side)
-/// of the operator `SlidingHashJoinExec`.
-#[derive(Debug)]
-struct SlidingHashJoinSideMetrics {
-    /// Number of batches consumed by this operator
-    input_batches: metrics::Count,
-    /// Number of rows consumed by this operator
-    input_rows: metrics::Count,
-}
-
-/// Metrics for operator `SlidingHashJoinExec`.
-#[derive(Debug)]
-struct SlidingHashJoinMetrics {
-    /// Number of left batches/rows consumed by this operator
-    left: SlidingHashJoinSideMetrics,
-    /// Number of right batches/rows consumed by this operator
-    right: SlidingHashJoinSideMetrics,
-    /// Memory used by sides in bytes
-    pub(crate) stream_memory_usage: metrics::Gauge,
-    /// Number of batches produced by this operator
-    output_batches: metrics::Count,
-    /// Number of rows produced by this operator
-    output_rows: metrics::Count,
-}
-
-impl SlidingHashJoinMetrics {
-    /// Creates a new `SlidingHashJoinMetrics` object according to the
-    /// given number of partitions and the metrics set.    
-    pub fn new(partition: usize, metrics: &ExecutionPlanMetricsSet) -> Self {
-        let input_batches =
-            MetricBuilder::new(metrics).counter("input_batches", partition);
-        let input_rows = MetricBuilder::new(metrics).counter("input_rows", partition);
-        let left = SlidingHashJoinSideMetrics {
-            input_batches,
-            input_rows,
-        };
-
-        let input_batches =
-            MetricBuilder::new(metrics).counter("input_batches", partition);
-        let input_rows = MetricBuilder::new(metrics).counter("input_rows", partition);
-        let right = SlidingHashJoinSideMetrics {
-            input_batches,
-            input_rows,
-        };
-
-        let stream_memory_usage =
-            MetricBuilder::new(metrics).gauge("stream_memory_usage", partition);
-
-        let output_batches =
-            MetricBuilder::new(metrics).counter("output_batches", partition);
-
-        let output_rows = MetricBuilder::new(metrics).output_rows(partition);
-
-        Self {
-            left,
-            right,
-            output_batches,
-            stream_memory_usage,
-            output_rows,
-        }
-    }
+    pub(crate) partition_mode: StreamJoinPartitionMode,
+    /// Stream working mode
+    pub(crate) working_mode: SlidingWindowWorkingMode,
 }
 
 impl SlidingHashJoinExec {
@@ -243,7 +114,8 @@ impl SlidingHashJoinExec {
         null_equals_null: bool,
         left_sort_exprs: Vec<PhysicalSortExpr>,
         right_sort_exprs: Vec<PhysicalSortExpr>,
-        mode: StreamJoinPartitionMode,
+        partition_mode: StreamJoinPartitionMode,
+        working_mode: SlidingWindowWorkingMode,
     ) -> Result<Self> {
         let left_schema = left.schema();
         let right_schema = right.schema();
@@ -289,7 +161,8 @@ impl SlidingHashJoinExec {
             output_ordering,
             left_sort_exprs,
             right_sort_exprs,
-            mode,
+            partition_mode,
+            working_mode,
         })
     }
 
@@ -333,7 +206,7 @@ impl SlidingHashJoinExec {
 
     /// The partitioning mode of this hash join
     pub fn partition_mode(&self) -> &StreamJoinPartitionMode {
-        &self.mode
+        &self.partition_mode
     }
 
     /// Get null_equals_null
@@ -349,6 +222,10 @@ impl SlidingHashJoinExec {
     /// Get right_sort_exprs
     pub fn right_sort_exprs(&self) -> &Vec<PhysicalSortExpr> {
         &self.right_sort_exprs
+    }
+    /// Get working mode
+    pub fn working_mode(&self) -> SlidingWindowWorkingMode {
+        self.working_mode
     }
 }
 
@@ -400,7 +277,7 @@ impl ExecutionPlan for SlidingHashJoinExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        match self.mode {
+        match self.partition_mode {
             StreamJoinPartitionMode::Partitioned => {
                 let (left_expr, right_expr) = self
                     .on
@@ -429,6 +306,10 @@ impl ExecutionPlan for SlidingHashJoinExec {
         ]
     }
 
+    fn maintains_input_order(&self) -> Vec<bool> {
+        Self::maintains_input_order(self.join_type)
+    }
+
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
         vec![false; 2]
     }
@@ -443,10 +324,6 @@ impl ExecutionPlan for SlidingHashJoinExec {
             Some(JoinSide::Right),
             self.on(),
         )
-    }
-
-    fn maintains_input_order(&self) -> Vec<bool> {
-        Self::maintains_input_order(self.join_type)
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
@@ -467,7 +344,8 @@ impl ExecutionPlan for SlidingHashJoinExec {
                 self.null_equals_null,
                 self.left_sort_exprs.clone(),
                 self.right_sort_exprs.clone(),
-                self.mode,
+                self.partition_mode,
+                self.working_mode,
             )?)),
             _ => internal_err!("SlidingHashJoinExec wrong number of children"),
         }
@@ -507,46 +385,64 @@ impl ExecutionPlan for SlidingHashJoinExec {
         let (on_left, on_right) = self.on.iter().cloned().unzip();
 
         let left_stream = self.left.execute(partition, context.clone())?;
-
         let right_stream = self.right.execute(partition, context.clone())?;
 
         let reservation = Arc::new(Mutex::new(
-            MemoryConsumer::new(format!("SlidingHashJoinStream[{partition}]"))
-                .register(context.memory_pool()),
+            MemoryConsumer::new(if self.working_mode == SlidingWindowWorkingMode::Lazy {
+                format!("LazySlidingHashJoinStream[{partition}]")
+            } else {
+                format!("EagerSlidingHashJoinStream[{partition}]")
+            })
+            .register(context.memory_pool()),
         ));
         reservation.lock().try_grow(graph.size())?;
-
-        Ok(Box::pin(SlidingHashJoinStream {
-            left_stream,
-            right_stream,
-            probe_buffer: ProbeBuffer::new(self.right.schema(), on_right),
-            build_buffer: OneSideHashJoiner::new(
-                JoinSide::Left,
-                on_left,
-                self.left.schema(),
-            ),
+        let join_data = CommonJoinData {
             schema: self.schema(),
             filter: self.filter.clone(),
             join_type: self.join_type,
             random_state: self.random_state.clone(),
             column_indices: self.column_indices.clone(),
-            metrics: SlidingHashJoinMetrics::new(partition, &self.metrics),
+            metrics: StreamJoinMetrics::new(partition, &self.metrics),
             graph,
             left_sorted_filter_expr,
             right_sorted_filter_expr,
+            build_buffer: OneSideHashJoiner::new(
+                JoinSide::Left,
+                on_left,
+                self.left.schema(),
+            ),
             null_equals_null: self.null_equals_null,
             reservation,
-            state: JoinStreamState::PullProbe,
-        }))
+            probe_buffer: ProbeBuffer::new(self.right.schema(), on_right),
+        };
+        let stream = if self.working_mode == SlidingWindowWorkingMode::Lazy {
+            Box::pin(LazySlidingHashJoinStream {
+                left_stream,
+                right_stream,
+                join_data,
+                state: LazyJoinStreamState::PullProbe,
+            }) as _
+        } else {
+            let ratio = context
+                .session_config()
+                .options()
+                .execution
+                .probe_size_batch_size_ratio_for_eager_execution_on_sliding_joins;
+            let batch_size = context.session_config().options().execution.batch_size;
+            let minimum_probe_row_count = (batch_size as f64 * ratio) as usize;
+            Box::pin(EagerSlidingHashJoinStream {
+                left_stream,
+                right_stream,
+                join_data,
+                state: EagerJoinStreamState::PullRight,
+                minimum_probe_row_count,
+            }) as _
+        };
+        Ok(stream)
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
-    }
-
-    fn statistics(&self) -> Result<Statistics> {
-        // TODO stats: it is not possible in general to know the output size of joins
-        Ok(Statistics::new_unknown(&self.schema))
     }
 }
 
@@ -579,7 +475,8 @@ pub fn swap_sliding_hash_join(
         join.null_equals_null,
         right_sort_expr,
         left_sort_expr,
-        join.mode,
+        join.partition_mode,
+        join.working_mode(),
     )?;
     if matches!(
         join.join_type,
@@ -596,48 +493,6 @@ pub fn swap_sliding_hash_join(
             Arc::new(new_join),
         )?;
         Ok(Arc::new(proj))
-    }
-}
-
-/// We use this buffer to keep track of the probe side pulling.
-struct ProbeBuffer {
-    /// The batch used for join operations.
-    current_batch: RecordBatch,
-    /// The batches buffered in `ProbePull` state.
-    candidate_buffer: Vec<RecordBatch>,
-    /// Join keys/columns.
-    on: Vec<Column>,
-}
-
-impl ProbeBuffer {
-    /// Creates a new `ProbeBuffer` with the given schema and join keys.
-    ///
-    /// # Arguments
-    ///
-    /// * `schema` - The schema of the input batches.
-    /// * `on` - A vector storing join columns.
-    ///
-    /// # Returns
-    ///
-    /// A new `BuildSideBuffer`.
-    pub fn new(schema: SchemaRef, on: Vec<Column>) -> Self {
-        Self {
-            current_batch: RecordBatch::new_empty(schema),
-            candidate_buffer: vec![],
-            on,
-        }
-    }
-
-    /// Returns the size of this `ProbeBuffer` in bytes.
-    ///
-    /// # Returns
-    ///
-    /// The size of this `ProbeBuffer` in bytes.
-    pub fn size(&self) -> usize {
-        let mut size = 0;
-        size += self.current_batch.get_array_memory_size();
-        size += std::mem::size_of_val(&self.on);
-        size
     }
 }
 
@@ -678,7 +533,7 @@ fn need_to_produce_result_in_final(join_type: JoinType) -> bool {
 ///
 /// An optional [`RecordBatch`] containing the joined results, or `None` if no
 /// results are to be produced.
-fn build_side_determined_results(
+fn build_side_determined_outer_results(
     build_hash_joiner: &OneSideHashJoiner,
     output_schema: &SchemaRef,
     prune_length: usize,
@@ -734,7 +589,7 @@ fn build_side_determined_results(
 #[allow(clippy::too_many_arguments)]
 fn join_with_probe_batch(
     build_hash_joiner: &mut OneSideHashJoiner,
-    probe_hash_joiner: &ProbeBuffer,
+    probe_on: &[Column],
     schema: &SchemaRef,
     join_type: JoinType,
     filter: &JoinFilter,
@@ -754,7 +609,7 @@ fn join_with_probe_batch(
         &build_hash_joiner.input_buffer,
         probe_batch,
         &build_hash_joiner.on,
-        &probe_hash_joiner.on,
+        probe_on,
         random_state,
         null_equals_null,
         &mut build_hash_joiner.hashes_buffer,
@@ -793,13 +648,7 @@ fn join_with_probe_batch(
     .map(|batch| (batch.num_rows() > 0).then_some(batch))
 }
 
-/// A stream that issues [`RecordBatch`]es as they arrive from the left and
-/// right sides of the join.
-struct SlidingHashJoinStream {
-    /// Left stream
-    left_stream: SendableRecordBatchStream,
-    /// Right stream
-    right_stream: SendableRecordBatchStream,
+struct CommonJoinData {
     /// Left globally sorted filter expression.
     /// This expression is used to range calculations from the left stream.
     left_sorted_filter_expr: Vec<SortedFilterExpr>,
@@ -836,38 +685,14 @@ struct SlidingHashJoinStream {
     /// null values are considered distinct from everything, including other null values.
     null_equals_null: bool,
     /// Metrics for monitoring the performance of the join operation.
-    metrics: SlidingHashJoinMetrics,
+    metrics: StreamJoinMetrics,
     /// Memory reservation for this join operation.
     reservation: SharedMemoryReservation,
-    /// Current state of the stream. This state machine tracks what the stream is
-    /// currently doing or should do next, e.g., pulling data from the probe side,
-    /// pulling data from the build side, performing the join, etc.
-    state: JoinStreamState,
 }
 
-impl RecordBatchStream for SlidingHashJoinStream {
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
-    }
-}
-
-impl Stream for SlidingHashJoinStream {
-    type Item = Result<RecordBatch>;
-
-    fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
-        self.poll_next_impl(cx)
-    }
-}
-
-impl SlidingHashJoinStream {
-    /// Returns the total memory size of the stream. It's the sum of memory size of each field.
+impl CommonJoinData {
     fn size(&self) -> usize {
         let mut size = 0;
-        size += mem::size_of_val(&self.left_stream);
-        size += mem::size_of_val(&self.right_stream);
         size += mem::size_of_val(&self.schema);
         size += mem::size_of_val(&self.filter);
         size += mem::size_of_val(&self.join_type);
@@ -883,284 +708,436 @@ impl SlidingHashJoinStream {
         size
     }
 
-    fn poll_next_impl(
+    /// A helper function to facilitate the join operation on the probe side.
+    ///
+    /// This function extracts references from the current state, performs the join
+    /// with the provided probe batch, and updates internal state accordingly. The join
+    /// result is determined based on the equality of the elements, taking into account
+    /// the specified join type and filters.
+    ///
+    /// After the join operation, this function calculates the prune length to
+    /// optimize the memory usage and handles the anti-join results. It then combines
+    /// the join results and updates internal metrics. Finally, the memory reservation
+    /// is adjusted based on the calculated capacity.
+    ///
+    /// # Arguments
+    ///
+    /// * `joinable_probe_batch` - The `RecordBatch` to be joined from the probe side.
+    ///
+    /// # Returns
+    ///
+    /// * `Result<Option<RecordBatch>>` - The result of the join operation. Returns an
+    ///   `Option<RecordBatch>` where a `Some` value indicates the resulting joined
+    ///   batch and a `None` value indicates no results were produced. An error is
+    ///   returned in case of any failure during the join process.
+    ///
+    /// # Errors
+    ///
+    /// This function can return an error if there's a failure in the join process,
+    /// memory reservation adjustments, or any other internal operation.
+    fn join_probe_side_helper(
         &mut self,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<Option<Result<RecordBatch>>> {
-        loop {
-            match &mut self.state {
-                // When the state is "PullProbe", poll the right (probe) stream:
-                JoinStreamState::PullProbe => {
-                    loop {
-                        match ready!(self.right_stream.poll_next_unpin(cx)) {
-                            Some(Ok(batch)) => {
-                                // Update metrics for polled batch:
-                                self.metrics.right.input_batches.add(1);
-                                self.metrics.right.input_rows.add(batch.num_rows());
+        joinable_probe_batch: &RecordBatch,
+    ) -> Result<Option<RecordBatch>> {
+        // Extract references from the data for clarity and less verbosity later
+        let (
+            probe_side_buffer,
+            build_side_joiner,
+            left_sorted_filter_expr,
+            right_sorted_filter_expr,
+        ) = (
+            &mut self.probe_buffer,
+            &mut self.build_buffer,
+            &mut self.left_sorted_filter_expr,
+            &mut self.right_sorted_filter_expr,
+        );
 
-                                // Check if batch meets interval calculation criteria:
-                                let stop_polling =
-                                    is_batch_suitable_interval_calculation(
-                                        &self.filter,
-                                        &self.right_sorted_filter_expr,
-                                        &batch,
-                                        JoinSide::Right,
-                                    )?;
-                                // Add the batch into candidate buffer:
-                                self.probe_buffer.candidate_buffer.push(batch);
-                                if stop_polling {
-                                    break;
-                                }
-                            }
-                            None => break,
-                            Some(Err(e)) => return Poll::Ready(Some(Err(e))),
-                        }
-                    }
-                    if self.probe_buffer.candidate_buffer.is_empty() {
-                        // If no batches were collected, change state to "ProbeExhausted":
-                        self.state = JoinStreamState::ProbeExhausted;
-                        continue;
-                    }
-                    // Get probe batch by joining all the collected batches:
-                    self.probe_buffer.current_batch = get_probe_batch(mem::take(
-                        &mut self.probe_buffer.candidate_buffer,
-                    ))?;
+        let equal_result = join_with_probe_batch(
+            build_side_joiner,
+            &probe_side_buffer.on,
+            &self.schema,
+            self.join_type,
+            &self.filter,
+            joinable_probe_batch,
+            &self.column_indices,
+            &self.random_state,
+            self.null_equals_null,
+        )?;
 
-                    if self.probe_buffer.current_batch.num_rows() == 0 {
-                        continue;
-                    }
-                    // Update the probe side with the new probe batch:
-                    let calculated_build_side_interval =
-                        calculate_the_necessary_build_side_range(
-                            &self.filter,
-                            &self.build_buffer.input_buffer,
-                            &mut self.graph,
-                            &mut self.left_sorted_filter_expr,
-                            &mut self.right_sorted_filter_expr,
-                            &self.probe_buffer.current_batch,
-                        )?;
-                    // Update state to "PullBuild" with the calculated interval:
-                    self.state = JoinStreamState::PullBuild {
-                        interval: calculated_build_side_interval,
-                    };
-                }
-                JoinStreamState::PullBuild { interval } => {
-                    // Get the expression used to determine the order in which
-                    // rows from the left stream are added to the batches:
-                    let build_interval = interval.clone();
-                    // Keep pulling data from the left stream until a suitable
-                    // range on batches is found:
-                    loop {
-                        match ready!(self.left_stream.poll_next_unpin(cx)) {
-                            Some(Ok(batch)) => {
-                                if batch.num_rows() == 0 {
-                                    continue;
-                                }
-                                self.metrics.left.input_batches.add(1);
-                                self.metrics.left.input_rows.add(batch.num_rows());
+        let prune_length = build_side_joiner.calculate_prune_length_with_probe_batch(
+            joinable_probe_batch,
+            left_sorted_filter_expr,
+            right_sorted_filter_expr,
+            &self.filter,
+            &mut self.graph,
+        )?;
 
-                                self.build_buffer
-                                    .update_internal_state(&batch, &self.random_state)?;
-                                self.build_buffer.offset += batch.num_rows();
+        let anti_result = build_side_determined_outer_results(
+            build_side_joiner,
+            &self.schema,
+            prune_length,
+            joinable_probe_batch.schema(),
+            self.join_type,
+            &self.column_indices,
+        )?;
 
-                                if check_if_sliding_window_condition_is_met(
-                                    &self.filter,
-                                    &batch,
-                                    &build_interval,
-                                )? {
-                                    self.state = JoinStreamState::Join;
-                                    break;
-                                }
-                            }
-                            // If the poll doesn't return any data, check if there
-                            // are any batches. If so, combine them into one and
-                            // update the build buffer's internal state:
-                            None => {
-                                self.state = JoinStreamState::BuildExhausted;
-                                break;
-                            }
-                            Some(Err(e)) => return Poll::Ready(Some(Err(e))),
-                        }
-                    }
-                }
-                JoinStreamState::Join => {
-                    // Create a tuple of references to various objects for convenience:
-                    let (
-                        probe_side_buffer,
-                        build_hash_joiner,
-                        build_side_sorted_filter_expr,
-                        probe_side_sorted_filter_expr,
-                    ) = (
-                        &self.probe_buffer,
-                        &mut self.build_buffer,
-                        &mut self.left_sorted_filter_expr,
-                        &mut self.right_sorted_filter_expr,
-                    );
+        self.build_buffer.prune_internal_state(prune_length)?;
 
-                    // Perform the join operation using probe side batch data.
-                    // The result is a new batch that contains rows from the
-                    // probe side that have matching rows in the build side.
-                    let equal_result = join_with_probe_batch(
-                        build_hash_joiner,
-                        probe_side_buffer,
-                        &self.schema,
-                        self.join_type,
-                        &self.filter,
-                        &probe_side_buffer.current_batch,
-                        &self.column_indices,
-                        &self.random_state,
-                        self.null_equals_null,
-                    )?;
+        let result = combine_two_batches(&self.schema, equal_result, anti_result)?;
 
-                    // Calculate the filter expression intervals for both sides of the join:
-                    calculate_filter_expr_intervals(
-                        &self.filter,
-                        &build_hash_joiner.input_buffer,
-                        build_side_sorted_filter_expr,
-                        &probe_side_buffer.current_batch,
-                        probe_side_sorted_filter_expr,
-                        JoinSide::Left,
-                    )?;
+        let capacity = self.size();
+        self.metrics.stream_memory_usage.set(capacity);
 
-                    // Determine how much of the internal state can be pruned by
-                    // comparing the filter expression intervals:
-                    let prune_length = build_hash_joiner
-                        .calculate_prune_length_with_probe_batch(
-                            build_side_sorted_filter_expr,
-                            probe_side_sorted_filter_expr,
-                            &self.filter,
-                            &mut self.graph,
-                        )?;
+        self.reservation.lock().try_resize(capacity)?;
 
-                    // If some of the internal state can be pruned on build side,
-                    // calculate the "anti" join result. The anti join result
-                    // contains rows from the probe side that do not have matching
-                    // rows in the build side.
-                    let anti_result = build_side_determined_results(
-                        build_hash_joiner,
-                        &self.schema,
-                        prune_length,
-                        probe_side_buffer.current_batch.schema(),
-                        self.join_type,
-                        &self.column_indices,
-                    )?;
-
-                    // Prune the internal state of the build hash joiner:
-                    build_hash_joiner.prune_internal_state(prune_length)?;
-
-                    // Combine the "equal" join result and the "anti" join
-                    // result into a single batch:
-                    let result =
-                        combine_two_batches(&self.schema, equal_result, anti_result)?;
-
-                    // Update the state to "PullProbe", so the next iteration
-                    // will pull from the probe side:
-                    self.state = JoinStreamState::PullProbe;
-
-                    // Calculate the current memory usage of the stream:
-                    let capacity = self.size();
-                    self.metrics.stream_memory_usage.set(capacity);
-
-                    // Attempt to resize the memory reservation to match the
-                    // current memory usage:
-                    self.reservation.lock().try_resize(capacity)?;
-
-                    // If a result batch was produced, update the metrics and
-                    // return the batch:
-                    if let Some(batch) = result {
-                        self.metrics.output_batches.add(1);
-                        self.metrics.output_rows.add(batch.num_rows());
-                        return Poll::Ready(Some(Ok(batch)));
-                    }
-                }
-                // When state is "BuildExhausted", switch to "Join" state:
-                JoinStreamState::BuildExhausted => {
-                    self.state = JoinStreamState::Join;
-                }
-                JoinStreamState::ProbeExhausted => {
-                    // Ready the left stream and match its states.
-                    match ready!(self.left_stream.poll_next_unpin(cx)) {
-                        // If the poll returns some batch of data:
-                        Some(Ok(batch)) => {
-                            // Update the metrics:
-                            self.metrics.left.input_batches.add(1);
-                            self.metrics.left.input_rows.add(batch.num_rows());
-                            // Update the internal state of the build buffer
-                            // with the data batch and random state:
-                            self.build_buffer
-                                .update_internal_state(&batch, &self.random_state)?;
-
-                            let result = build_side_determined_results(
-                                &self.build_buffer,
-                                &self.schema,
-                                self.build_buffer.input_buffer.num_rows(),
-                                self.probe_buffer.current_batch.schema(),
-                                self.join_type,
-                                &self.column_indices,
-                            )?;
-
-                            self.build_buffer.prune_internal_state(
-                                self.build_buffer.input_buffer.num_rows(),
-                            )?;
-
-                            if let Some(batch) = result {
-                                // Update output metrics:
-                                self.metrics.output_batches.add(1);
-                                self.metrics.output_rows.add(batch.num_rows());
-                                return Poll::Ready(Some(Ok(batch)));
-                            }
-                        }
-                        // If the poll doesn't return any data, update the state
-                        // to indicate both streams are exhausted:
-                        None => {
-                            self.state = JoinStreamState::BothExhausted {
-                                final_result: false,
-                            };
-                        }
-                        Some(Err(e)) => return Poll::Ready(Some(Err(e))),
-                    }
-                }
-                // When state is "BothExhausted" with final result as true, we
-                // are done. Return `None`:
-                JoinStreamState::BothExhausted { final_result: true } => {
-                    return Poll::Ready(None)
-                }
-                // When state is "BothExhausted" with final result as false:
-                JoinStreamState::BothExhausted {
-                    final_result: false,
-                } => {
-                    // Create result `RecordBatch` from the build side since
-                    // there will be no new probe batches coming:
-                    let result = build_side_determined_results(
-                        &self.build_buffer,
-                        &self.schema,
-                        self.build_buffer.input_buffer.num_rows(),
-                        self.probe_buffer.current_batch.schema(),
-                        self.join_type,
-                        &self.column_indices,
-                    )?;
-                    // Update state to "BothExhausted" with final result as true:
-                    self.state = JoinStreamState::BothExhausted { final_result: true };
-                    if let Some(batch) = result {
-                        // Update output metrics if we have a result:
-                        self.metrics.output_batches.add(1);
-                        self.metrics.output_rows.add(batch.num_rows());
-                        return Poll::Ready(Some(Ok(batch)));
-                    }
-                }
-            }
+        if let Some(batch) = &result {
+            self.metrics.output_batches.add(1);
+            self.metrics.output_rows.add(batch.num_rows());
+            return Ok(result);
         }
+        Ok(None)
+    }
+}
+/// A stream that issues [`RecordBatch`]es as they arrive from the left and
+/// right sides of the join.
+struct LazySlidingHashJoinStream {
+    /// Join data
+    join_data: CommonJoinData,
+    /// Left stream
+    left_stream: SendableRecordBatchStream,
+    /// Right stream
+    right_stream: SendableRecordBatchStream,
+    /// Current state of the stream. This state machine tracks what the stream is
+    /// currently doing or should do next, e.g., pulling data from the probe side,
+    /// pulling data from the build side, performing the join, etc.
+    state: LazyJoinStreamState,
+}
+
+impl RecordBatchStream for LazySlidingHashJoinStream {
+    fn schema(&self) -> SchemaRef {
+        self.join_data.schema.clone()
+    }
+}
+
+impl Stream for LazySlidingHashJoinStream {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        self.poll_next_impl(cx)
+    }
+}
+
+#[async_trait]
+impl LazyJoinStream for LazySlidingHashJoinStream {
+    fn process_join_operation(
+        &mut self,
+    ) -> Result<StreamJoinStateResult<Option<RecordBatch>>> {
+        let batch = self.join_data.probe_buffer.current_batch.clone();
+        if let Some(batch) = self.join_data.join_probe_side_helper(&batch)? {
+            Ok(StreamJoinStateResult::Ready(Some(batch)))
+        } else {
+            Ok(StreamJoinStateResult::Continue)
+        }
+    }
+
+    fn process_probe_stream_end(
+        &mut self,
+        left_batch: &RecordBatch,
+    ) -> Result<StreamJoinStateResult<Option<RecordBatch>>> {
+        // Update the metrics:
+        self.join_data.metrics.left.input_batches.add(1);
+        self.join_data
+            .metrics
+            .left
+            .input_rows
+            .add(left_batch.num_rows());
+        // Update the internal state of the build buffer
+        // with the data batch and random state:
+        self.update_build_buffer(left_batch)?;
+
+        let result = build_side_determined_outer_results(
+            &self.join_data.build_buffer,
+            &self.join_data.schema,
+            self.join_data.build_buffer.input_buffer.num_rows(),
+            self.join_data.probe_buffer.current_batch.schema(),
+            self.join_data.join_type,
+            &self.join_data.column_indices,
+        )?;
+
+        self.join_data
+            .build_buffer
+            .prune_internal_state(self.join_data.build_buffer.input_buffer.num_rows())?;
+
+        if let Some(batch) = result {
+            // Update output metrics:
+            self.join_data.metrics.output_batches.add(1);
+            self.join_data.metrics.output_rows.add(batch.num_rows());
+            return Ok(StreamJoinStateResult::Ready(Some(batch)));
+        }
+        Ok(StreamJoinStateResult::Continue)
+    }
+
+    fn process_batches_before_finalization(
+        &mut self,
+    ) -> Result<StreamJoinStateResult<Option<RecordBatch>>> {
+        let data = &mut self.join_data;
+        // Create result `RecordBatch` from the build side since
+        // there will be no new probe batches coming:
+        let result = build_side_determined_outer_results(
+            &data.build_buffer,
+            &data.schema,
+            data.build_buffer.input_buffer.num_rows(),
+            data.probe_buffer.current_batch.schema(),
+            data.join_type,
+            &data.column_indices,
+        )?;
+        if let Some(batch) = result {
+            // Update output metrics if we have a result:
+            data.metrics.output_batches.add(1);
+            data.metrics.output_rows.add(batch.num_rows());
+            return Ok(StreamJoinStateResult::Ready(Some(batch)));
+        }
+        Ok(StreamJoinStateResult::Continue)
+    }
+
+    fn mut_probe_stream(&mut self) -> &mut SendableRecordBatchStream {
+        &mut self.right_stream
+    }
+
+    fn mut_build_stream(&mut self) -> &mut SendableRecordBatchStream {
+        &mut self.left_stream
+    }
+
+    fn metrics(&mut self) -> &mut StreamJoinMetrics {
+        &mut self.join_data.metrics
+    }
+
+    fn filter(&self) -> &JoinFilter {
+        &self.join_data.filter
+    }
+
+    fn mut_build_sorted_filter_expr(&mut self) -> &mut [SortedFilterExpr] {
+        &mut self.join_data.left_sorted_filter_expr
+    }
+
+    fn mut_probe_sorted_filter_expr(&mut self) -> &mut [SortedFilterExpr] {
+        &mut self.join_data.right_sorted_filter_expr
+    }
+
+    fn build_sorted_filter_expr(&self) -> &[SortedFilterExpr] {
+        &self.join_data.left_sorted_filter_expr
+    }
+
+    fn probe_sorted_filter_expr(&self) -> &[SortedFilterExpr] {
+        &self.join_data.right_sorted_filter_expr
+    }
+
+    fn probe_buffer(&mut self) -> &mut ProbeBuffer {
+        &mut self.join_data.probe_buffer
+    }
+
+    fn set_state(&mut self, state: LazyJoinStreamState) {
+        self.state = state;
+    }
+
+    fn state(&self) -> LazyJoinStreamState {
+        self.state.clone()
+    }
+
+    fn update_build_buffer(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.join_data
+            .build_buffer
+            .update_internal_state(batch, &self.join_data.random_state)?;
+        self.join_data.build_buffer.offset += batch.num_rows();
+        Ok(())
+    }
+
+    fn calculate_the_necessary_build_side_range(
+        &mut self,
+    ) -> Result<Vec<(PhysicalSortExpr, Interval)>> {
+        calculate_the_necessary_build_side_range_helper(
+            &self.join_data.filter,
+            &self.join_data.build_buffer.input_buffer,
+            &mut self.join_data.graph,
+            &mut self.join_data.left_sorted_filter_expr,
+            &mut self.join_data.right_sorted_filter_expr,
+            &self.join_data.probe_buffer.current_batch,
+        )
+    }
+}
+
+/// A stream that issues [`RecordBatch`]es as they arrive from the left and
+/// right sides of the join.
+struct EagerSlidingHashJoinStream {
+    join_data: CommonJoinData,
+    left_stream: SendableRecordBatchStream,
+    right_stream: SendableRecordBatchStream,
+    /// Current state of the stream. This state machine tracks what the stream is
+    /// currently doing or should do next, e.g., pulling data from the probe side,
+    /// pulling data from the build side, performing the join, etc.
+    state: EagerJoinStreamState,
+    minimum_probe_row_count: usize,
+}
+
+impl RecordBatchStream for EagerSlidingHashJoinStream {
+    fn schema(&self) -> SchemaRef {
+        self.join_data.schema.clone()
+    }
+}
+
+impl Stream for EagerSlidingHashJoinStream {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        self.poll_next_impl(cx)
+    }
+}
+
+impl EagerWindowJoinOperations for EagerSlidingHashJoinStream {
+    fn update_build_buffer_with_batch(&mut self, batch: RecordBatch) -> Result<()> {
+        self.join_data
+            .build_buffer
+            .update_internal_state(&batch, &self.join_data.random_state)?;
+        self.join_data.build_buffer.offset += batch.num_rows();
+        Ok(())
+    }
+
+    fn join_using_joinable_probe_batch(
+        &mut self,
+        joinable_probe_batch: RecordBatch,
+    ) -> Result<Option<RecordBatch>> {
+        self.join_data.join_probe_side_helper(&joinable_probe_batch)
+    }
+
+    fn identify_joinable_probe_batch(&mut self) -> Result<Option<RecordBatch>> {
+        let minimum_probe_row_count = self.minimum_probe_row_count();
+        joinable_probe_batch_helper(
+            &self.join_data.build_buffer.input_buffer,
+            &mut self.join_data.probe_buffer,
+            &self.join_data.filter,
+            &mut self.join_data.graph,
+            &mut self.join_data.left_sorted_filter_expr,
+            &mut self.join_data.right_sorted_filter_expr,
+            minimum_probe_row_count,
+        )
+    }
+
+    fn get_mutable_probe_buffer(&mut self) -> &mut ProbeBuffer {
+        &mut self.join_data.probe_buffer
+    }
+
+    fn minimum_probe_row_count(&self) -> usize {
+        self.minimum_probe_row_count
+    }
+}
+
+impl EagerJoinStream for EagerSlidingHashJoinStream {
+    fn process_batch_from_right(
+        &mut self,
+        batch: RecordBatch,
+    ) -> Result<StreamJoinStateResult<Option<RecordBatch>>> {
+        EagerWindowJoinOperations::handle_right_stream_batch_pull(self, batch)
+    }
+
+    fn process_batch_from_left(
+        &mut self,
+        batch: RecordBatch,
+    ) -> Result<StreamJoinStateResult<Option<RecordBatch>>> {
+        EagerWindowJoinOperations::handle_left_stream_batch_pull(self, batch)
+    }
+
+    fn process_batch_after_left_end(
+        &mut self,
+        right_batch: RecordBatch,
+    ) -> Result<StreamJoinStateResult<Option<RecordBatch>>> {
+        EagerWindowJoinOperations::handle_left_stream_end(self, right_batch)
+    }
+
+    fn process_batch_after_right_end(
+        &mut self,
+        left_batch: RecordBatch,
+    ) -> Result<StreamJoinStateResult<Option<RecordBatch>>> {
+        self.process_batch_from_left(left_batch)
+    }
+
+    fn process_batches_before_finalization(
+        &mut self,
+    ) -> Result<StreamJoinStateResult<Option<RecordBatch>>> {
+        let (probe_side_buffer, build_side_joiner) = (
+            &mut self.join_data.probe_buffer,
+            &mut self.join_data.build_buffer,
+        );
+        // Perform the join operation using probe side batch data.
+        // The result is a new batch that contains rows from the
+        // probe side that have matching rows in the build side.
+        let equal_result = join_with_probe_batch(
+            build_side_joiner,
+            &probe_side_buffer.on,
+            &self.join_data.schema,
+            self.join_data.join_type,
+            &self.join_data.filter,
+            &probe_side_buffer.current_batch,
+            &self.join_data.column_indices,
+            &self.join_data.random_state,
+            self.join_data.null_equals_null,
+        )?;
+
+        // The anti join result contains rows from the build side that do not have matching
+        // rows in the build side.
+        let anti_result = build_side_determined_outer_results(
+            build_side_joiner,
+            &self.join_data.schema,
+            build_side_joiner.input_buffer.num_rows(),
+            probe_side_buffer.current_batch.schema(),
+            self.join_data.join_type,
+            &self.join_data.column_indices,
+        )?;
+
+        // // Combine the "equal" join result and the "anti" join
+        // // result into a single batch:
+        let result =
+            combine_two_batches(&self.join_data.schema, equal_result, anti_result)?;
+
+        // If a result batch was produced, update the metrics and
+        // return the batch:
+        if let Some(batch) = &result {
+            self.join_data.metrics.output_batches.add(1);
+            self.join_data.metrics.output_rows.add(batch.num_rows());
+            return Ok(StreamJoinStateResult::Ready(result));
+        }
+        Ok(StreamJoinStateResult::Continue)
+    }
+
+    fn right_stream(&mut self) -> &mut SendableRecordBatchStream {
+        &mut self.right_stream
+    }
+
+    fn left_stream(&mut self) -> &mut SendableRecordBatchStream {
+        &mut self.left_stream
+    }
+
+    fn set_state(&mut self, state: EagerJoinStreamState) {
+        self.state = state;
+    }
+
+    fn state(&mut self) -> EagerJoinStreamState {
+        self.state.clone()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    const TABLE_SIZE: i32 = 30;
-
-    use std::collections::HashMap;
-    use std::sync::Mutex;
+    const TABLE_SIZE: i32 = 40;
 
     use once_cell::sync::Lazy;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
 
     type TableKey = (i32, i32, usize); // (cardinality.0, cardinality.1, batch_size)
     type TableValue = (Vec<RecordBatch>, Vec<RecordBatch>); // (left, right)
@@ -1204,10 +1181,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::joins::test_utils::complicated_4_column_exprs;
     use crate::joins::test_utils::{
-        build_sides_record_batches, compare_batches, complicated_filter,
-        create_memory_table, join_expr_tests_fixture_i32,
+        build_sides_record_batches, compare_batches, complicated_4_column_exprs,
+        complicated_filter, create_memory_table, join_expr_tests_fixture_i32,
         partitioned_hash_join_with_filter, split_record_batches,
     };
     use crate::joins::utils::JoinOn;
@@ -1216,12 +1192,13 @@ mod tests {
 
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow_schema::SortOptions;
+    use datafusion_execution::config::SessionConfig;
     use datafusion_expr::Operator;
     use datafusion_physical_expr::expressions::{binary, col};
 
-    use datafusion_execution::config::SessionConfig;
     use rstest::*;
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn partitioned_swhj_join_with_filter(
         left: Arc<dyn ExecutionPlan>,
         right: Arc<dyn ExecutionPlan>,
@@ -1230,8 +1207,9 @@ mod tests {
         join_type: &JoinType,
         null_equals_null: bool,
         context: Arc<TaskContext>,
+        working_mode: SlidingWindowWorkingMode,
     ) -> Result<Vec<RecordBatch>> {
-        let partition_count = 4;
+        let partition_count = 2;
         let (left_expr, right_expr) = on
             .iter()
             .map(|(l, r)| (Arc::new(l.clone()) as _, Arc::new(r.clone()) as _))
@@ -1268,6 +1246,7 @@ mod tests {
             left_sort_expr,
             right_sort_expr,
             StreamJoinPartitionMode::Partitioned,
+            working_mode,
         )?);
 
         let mut batches = vec![];
@@ -1292,6 +1271,7 @@ mod tests {
         join_type: JoinType,
         on: JoinOn,
         task_ctx: Arc<TaskContext>,
+        working_mode: SlidingWindowWorkingMode,
     ) -> Result<()> {
         let first_batches = partitioned_swhj_join_with_filter(
             left.clone(),
@@ -1301,6 +1281,7 @@ mod tests {
             &join_type,
             false,
             task_ctx.clone(),
+            working_mode,
         )
         .await?;
         let second_batches = partitioned_hash_join_with_filter(
@@ -1331,21 +1312,16 @@ mod tests {
             JoinType::Full
         )]
         join_type: JoinType,
-        #[values(
-        (4, 5),
-        (11, 21),
-        (31, 71),
-        (99, 12),
-        )]
-        cardinality: (i32, i32),
+        #[values((3, 5), (5, 3))] cardinality: (i32, i32),
         #[values(0, 1, 2, 3, 4, 5, 6, 7)] case_expr: usize,
-        #[values(13, 10)] batch_size: usize,
+        #[values(5, 1, 2)] batch_size: usize,
+        #[values((1.0, 1.0), (1.0, 0.5), (0.5, 1.0))] table_length_ratios: (f64, f64),
+        #[values(SlidingWindowWorkingMode::Lazy, SlidingWindowWorkingMode::Eager)]
+        working_mode: SlidingWindowWorkingMode,
     ) -> Result<()> {
-        // let cfg = SessionConfig::new();
-        // TaskContext::default()
-        // cfg.co
-        // let session_ctx = SessionContext::new();
-        let task_ctx = Arc::new(TaskContext::default());
+        let session_config = SessionConfig::new().with_batch_size(batch_size);
+        let task_ctx =
+            Arc::new(TaskContext::default().with_session_config(session_config));
         let (left_partition, right_partition) =
             get_or_create_table(cardinality, batch_size)?;
         let left_schema = &left_partition[0].schema();
@@ -1358,9 +1334,14 @@ mod tests {
             expr: col("ra1", right_schema)?,
             options: SortOptions::default(),
         }];
+        let (left_ratio, right_ratio) = table_length_ratios;
+        let left_batch_count =
+            ((TABLE_SIZE as usize / batch_size) as f64 * left_ratio) as usize;
+        let right_batch_count =
+            ((TABLE_SIZE as usize / batch_size) as f64 * right_ratio) as usize;
         let (left, right) = create_memory_table(
-            left_partition,
-            right_partition,
+            left_partition[..left_batch_count].to_vec(),
+            right_partition[..right_batch_count].to_vec(),
             vec![left_sorted],
             vec![right_sorted],
         )?;
@@ -1392,77 +1373,24 @@ mod tests {
         ];
         let filter = JoinFilter::new(filter_expr, column_indices, intermediate_schema);
 
-        experiment(left, right, filter, join_type, on, task_ctx).await?;
+        experiment(left, right, filter, join_type, on, task_ctx, working_mode).await?;
         Ok(())
     }
 
+    #[rstest]
     #[tokio::test(flavor = "multi_thread")]
-    async fn join_all_one_ascending_numeric_2() -> Result<()> {
-        let join_type = JoinType::Inner;
-        let cardinality = (4, 5);
-        let case_expr = 1;
-        // let session_ctx = SessionContext::new();
-        // let task_ctx = session_ctx.task_ctx();
-        let task_ctx = Arc::new(TaskContext::default());
-        let (left_partition, right_partition) = get_or_create_table(cardinality, 8)?;
-        let left_schema = &left_partition[0].schema();
-        let right_schema = &right_partition[0].schema();
-        let left_sorted = vec![PhysicalSortExpr {
-            expr: col("la1", left_schema)?,
-            options: SortOptions::default(),
-        }];
-        let right_sorted = vec![PhysicalSortExpr {
-            expr: col("ra1", right_schema)?,
-            options: SortOptions::default(),
-        }];
-        let (left, right) = create_memory_table(
-            left_partition,
-            right_partition,
-            vec![left_sorted],
-            vec![right_sorted],
-        )?;
-
-        let on = vec![(
-            Column::new_with_schema("lc1", left_schema)?,
-            Column::new_with_schema("rc1", right_schema)?,
-        )];
-
-        let intermediate_schema = Schema::new(vec![
-            Field::new("left", DataType::Int32, true),
-            Field::new("right", DataType::Int32, true),
-        ]);
-        let filter_expr = join_expr_tests_fixture_i32(
-            case_expr,
-            col("left", &intermediate_schema)?,
-            col("right", &intermediate_schema)?,
-        );
-
-        let column_indices = vec![
-            ColumnIndex {
-                index: 0,
-                side: JoinSide::Left,
-            },
-            ColumnIndex {
-                index: 0,
-                side: JoinSide::Right,
-            },
-        ];
-        let filter = JoinFilter::new(filter_expr, column_indices, intermediate_schema);
-
-        experiment(left, right, filter, join_type, on, task_ctx).await?;
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn build_null_columns_last() -> Result<()> {
+    async fn build_null_columns_last(
+        #[values(SlidingWindowWorkingMode::Lazy, SlidingWindowWorkingMode::Eager)]
+        working_mode: SlidingWindowWorkingMode,
+    ) -> Result<()> {
         let join_type = JoinType::Full;
         let cardinality = (10, 11);
         let case_expr = 1;
-        let config = SessionConfig::new().with_repartition_joins(false);
-        // let session_ctx = SessionContext::with_config(config);
-        // let task_ctx = session_ctx.task_ctx();
+        let batch_size = 8;
+        let config = SessionConfig::new().with_batch_size(batch_size);
         let task_ctx = Arc::new(TaskContext::default().with_session_config(config));
-        let (left_partition, right_partition) = get_or_create_table(cardinality, 8)?;
+        let (left_partition, right_partition) =
+            get_or_create_table(cardinality, batch_size)?;
         let left_schema = &left_partition[0].schema();
         let right_schema = &right_partition[0].schema();
         let left_sorted = vec![PhysicalSortExpr {
@@ -1512,20 +1440,24 @@ mod tests {
         ];
         let filter = JoinFilter::new(filter_expr, column_indices, intermediate_schema);
 
-        experiment(left, right, filter, join_type, on, task_ctx).await?;
+        experiment(left, right, filter, join_type, on, task_ctx, working_mode).await?;
         Ok(())
     }
 
+    #[rstest]
     #[tokio::test(flavor = "multi_thread")]
-    async fn build_null_columns_first_descending() -> Result<()> {
+    async fn build_null_columns_first_descending(
+        #[values(SlidingWindowWorkingMode::Lazy, SlidingWindowWorkingMode::Eager)]
+        working_mode: SlidingWindowWorkingMode,
+    ) -> Result<()> {
         let join_type = JoinType::Full;
         let cardinality = (10, 11);
         let case_expr = 1;
-        let config = SessionConfig::new().with_repartition_joins(false);
-        // let session_ctx = SessionContext::with_config(config);
-        // let task_ctx = session_ctx.task_ctx();
+        let batch_size = 8;
+        let config = SessionConfig::new().with_batch_size(batch_size);
         let task_ctx = Arc::new(TaskContext::default().with_session_config(config));
-        let (left_partition, right_partition) = get_or_create_table(cardinality, 8)?;
+        let (left_partition, right_partition) =
+            get_or_create_table(cardinality, batch_size)?;
         let left_schema = &left_partition[0].schema();
         let right_schema = &right_partition[0].schema();
         let left_sorted = vec![PhysicalSortExpr {
@@ -1575,7 +1507,7 @@ mod tests {
         ];
         let filter = JoinFilter::new(filter_expr, column_indices, intermediate_schema);
 
-        experiment(left, right, filter, join_type, on, task_ctx).await?;
+        experiment(left, right, filter, join_type, on, task_ctx, working_mode).await?;
         Ok(())
     }
 
@@ -1593,19 +1525,16 @@ mod tests {
             JoinType::Full
         )]
         join_type: JoinType,
-        #[values(
-        (4, 5),
-        (11, 21),
-        (31, 71),
-        (99, 12),
-        )]
-        cardinality: (i32, i32),
+        #[values((3, 5), (5, 3))] cardinality: (i32, i32),
         #[values(0, 1, 2, 3, 4, 5, 6)] case_expr: usize,
+        #[values(SlidingWindowWorkingMode::Lazy, SlidingWindowWorkingMode::Eager)]
+        working_mode: SlidingWindowWorkingMode,
     ) -> Result<()> {
-        // let session_ctx = SessionContext::new();
-        // let task_ctx = session_ctx.task_ctx();
-        let task_ctx = Arc::new(TaskContext::default());
-        let (left_partition, right_partition) = get_or_create_table(cardinality, 8)?;
+        let batch_size = 8;
+        let config = SessionConfig::new().with_batch_size(batch_size);
+        let task_ctx = Arc::new(TaskContext::default().with_session_config(config));
+        let (left_partition, right_partition) =
+            get_or_create_table(cardinality, batch_size)?;
         let left_schema = &left_partition[0].schema();
         let right_schema = &right_partition[0].schema();
         let left_sorted = vec![PhysicalSortExpr {
@@ -1655,7 +1584,7 @@ mod tests {
         ];
         let filter = JoinFilter::new(filter_expr, column_indices, intermediate_schema);
 
-        experiment(left, right, filter, join_type, on, task_ctx).await?;
+        experiment(left, right, filter, join_type, on, task_ctx, working_mode).await?;
         Ok(())
     }
 
@@ -1673,19 +1602,16 @@ mod tests {
             JoinType::Full
         )]
         join_type: JoinType,
-        #[values(
-        (4, 5),
-        (11, 21),
-        (31, 71),
-        (99, 12),
-        )]
-        cardinality: (i32, i32),
+        #[values((3, 5), (5, 3))] cardinality: (i32, i32),
+        #[values(SlidingWindowWorkingMode::Lazy, SlidingWindowWorkingMode::Eager)]
+        working_mode: SlidingWindowWorkingMode,
     ) -> Result<()> {
         // a + b > c + 10 AND a + b < c + 100
-        // let session_ctx = SessionContext::new();
-        // let task_ctx = session_ctx.task_ctx();
-        let task_ctx = Arc::new(TaskContext::default());
-        let (left_partition, right_partition) = get_or_create_table(cardinality, 8)?;
+        let batch_size = 8;
+        let config = SessionConfig::new().with_batch_size(batch_size);
+        let task_ctx = Arc::new(TaskContext::default().with_session_config(config));
+        let (left_partition, right_partition) =
+            get_or_create_table(cardinality, batch_size)?;
         let left_schema = &left_partition[0].schema();
         let right_schema = &right_partition[0].schema();
         let left_sorted = vec![PhysicalSortExpr {
@@ -1735,7 +1661,7 @@ mod tests {
         ];
         let filter = JoinFilter::new(filter_expr, column_indices, intermediate_schema);
 
-        experiment(left, right, filter, join_type, on, task_ctx).await?;
+        experiment(left, right, filter, join_type, on, task_ctx, working_mode).await?;
         Ok(())
     }
 
@@ -1753,20 +1679,16 @@ mod tests {
             JoinType::Full
         )]
         join_type: JoinType,
-        #[values(
-        (4, 4),
-        (11, 21),
-        (21, 12),
-        (99, 12),
-        (12, 99),
-        )]
-        cardinality: (i32, i32),
+        #[values((3, 5), (5, 3))] cardinality: (i32, i32),
         #[values(0, 1, 2)] case_expr: usize,
+        #[values(SlidingWindowWorkingMode::Lazy, SlidingWindowWorkingMode::Eager)]
+        working_mode: SlidingWindowWorkingMode,
     ) -> Result<()> {
-        // let session_ctx = // SessionContext::new();
-        // let task_ctx = session_ctx.task_ctx();
-        let task_ctx = Arc::new(TaskContext::default());
-        let (left_partition, right_partition) = get_or_create_table(cardinality, 8)?;
+        let batch_size = 8;
+        let config = SessionConfig::new().with_batch_size(batch_size);
+        let task_ctx = Arc::new(TaskContext::default().with_session_config(config));
+        let (left_partition, right_partition) =
+            get_or_create_table(cardinality, batch_size)?;
         let left_schema = &left_partition[0].schema();
         let right_schema = &right_partition[0].schema();
         let left_sorted = vec![
@@ -1828,7 +1750,7 @@ mod tests {
         ];
         let filter = JoinFilter::new(filter_expr, column_indices, intermediate_schema);
 
-        experiment(left, right, filter, join_type, on, task_ctx).await?;
+        experiment(left, right, filter, join_type, on, task_ctx, working_mode).await?;
         Ok(())
     }
 }

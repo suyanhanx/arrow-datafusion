@@ -255,6 +255,15 @@ config_namespace! {
         /// Number of files to read in parallel when inferring schema and statistics
         pub meta_fetch_concurrency: usize, default = 32
 
+        /// Prefer eager execution mode for sliding window (prunable) joins.
+        /// These include `SlidingHashJoinExec`, `SlidingNestedLoopJoinExec` etc.
+        pub prefer_eager_execution_on_sliding_joins: bool, default = true
+
+        /// Specify the minimum number of rows we collect from the probe side
+        /// before performing the join operation in eager execution mode for
+        /// sliding window (prunable) joins.
+        pub probe_size_batch_size_ratio_for_eager_execution_on_sliding_joins: f64, default = 1.0
+
         /// Guarantees a minimum level of output files running in parallel.
         /// RecordBatches will be distributed in round robin fashion to each
         /// parallel writer. Each writer is closed and a new file opened once
