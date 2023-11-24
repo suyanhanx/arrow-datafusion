@@ -14,6 +14,11 @@ use crate::joins::sliding_window_join_utils::{
     partitioned_join_output_partitioning, EagerWindowJoinOperations, LazyJoinStream,
     LazyJoinStreamState, ProbeBuffer,
 };
+use crate::joins::stream_join_utils::{
+    get_filter_representation_of_join_side, prepare_sorted_exprs, EagerJoinStream,
+    EagerJoinStreamState, SortedFilterExpr, StreamJoinStateResult,
+};
+use crate::joins::symmetric_hash_join::StreamJoinMetrics;
 use crate::joins::utils::{
     apply_join_filter_to_indices, build_batch_from_indices, build_join_schema,
     calculate_join_output_ordering, check_join_is_valid, ColumnIndex, JoinFilter, JoinOn,
@@ -29,6 +34,7 @@ use arrow::compute::concat_batches;
 use arrow_array::builder::{UInt32Builder, UInt64Builder};
 use arrow_array::{ArrayRef, RecordBatch, UInt32Array, UInt64Array};
 use arrow_schema::{Field, Schema, SchemaRef};
+use datafusion_common::hash_utils::create_hashes;
 use datafusion_common::utils::{
     get_record_batch_at_indices, get_row_at_idx, linear_search,
 };
@@ -37,22 +43,17 @@ use datafusion_common::{
 };
 use datafusion_execution::memory_pool::MemoryConsumer;
 use datafusion_execution::TaskContext;
+use datafusion_expr::interval_arithmetic::Interval;
+use datafusion_physical_expr::equivalence::join_equivalence_properties;
 use datafusion_physical_expr::expressions::Column;
-use datafusion_physical_expr::intervals::{ExprIntervalGraph, Interval};
+use datafusion_physical_expr::intervals::cp_solver::ExprIntervalGraph;
 use datafusion_physical_expr::window::PartitionKey;
 use datafusion_physical_expr::{
     EquivalenceProperties, PhysicalExpr, PhysicalSortExpr, PhysicalSortRequirement,
 };
 
-use crate::joins::stream_join_utils::{
-    get_filter_representation_of_join_side, prepare_sorted_exprs, EagerJoinStream,
-    EagerJoinStreamState, SortedFilterExpr, StreamJoinStateResult,
-};
-use crate::joins::symmetric_hash_join::StreamJoinMetrics;
 use ahash::RandomState;
 use async_trait::async_trait;
-use datafusion_common::hash_utils::create_hashes;
-use datafusion_physical_expr::equivalence::join_equivalence_properties;
 use futures::Stream;
 use hashbrown::raw::RawTable;
 use parking_lot::Mutex;
@@ -604,9 +605,9 @@ impl BuildBuffer {
 
                                 // Get the lower or upper interval based on the sort direction:
                                 let target = if options.descending {
-                                    &interval.lower.value
+                                    interval.lower()
                                 } else {
-                                    &interval.upper.value
+                                    interval.upper()
                                 }
                                 .clone();
 

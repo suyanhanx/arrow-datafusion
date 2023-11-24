@@ -200,10 +200,8 @@ ProjectionExec: expr=[ROW_NUMBER() ORDER BY [u.ts ASC NULLS LAST] RANGE BETWEEN 
 --BoundedWindowAggExec: wdw=[ROW_NUMBER() ORDER BY [u.ts ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW: Ok(Field { name: "ROW_NUMBER() ORDER BY [u.ts ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW", data_type: UInt64, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(IntervalMonthDayNano("NULL")), end_bound: CurrentRow }], mode=[Sorted]
 ----SortPreservingMergeExec: [ts@0 ASC NULLS LAST]
 ------UnionExec
---------ProjectionExec: expr=[ts@0 as ts, currency@2 as currency, amount@1 as amount]
-----------StreamingTableExec: partition_sizes=1, projection=[ts, amount, currency], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST]
---------ProjectionExec: expr=[ts@0 as ts, currency@2 as currency, amount@1 as amount]
-----------StreamingTableExec: partition_sizes=1, projection=[ts, amount, currency], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST]
+--------StreamingTableExec: partition_sizes=1, projection=[ts, currency, amount], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST]
+--------StreamingTableExec: partition_sizes=1, projection=[ts, currency, amount], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST]
 
 query PIT
 SELECT * EXCLUDE(sn) FROM sales_us LIMIT 5

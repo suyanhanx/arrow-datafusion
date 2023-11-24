@@ -33,21 +33,18 @@ use arrow_array::{
     Array, ArrowPrimitiveType, NativeAdapter, PrimitiveArray, RecordBatch,
 };
 use arrow_buffer::{ArrowNativeType, BooleanBufferBuilder};
-use arrow_schema::{Schema, SchemaRef};
-use async_trait::async_trait;
-use arrow_schema::SortOptions;
-use arrow_schema::{Schema, SchemaRef};
-use async_trait::async_trait;
+use arrow_schema::{Schema, SchemaRef, SortOptions};
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::utils::linear_search;
 use datafusion_common::{DataFusionError, JoinSide, Result, ScalarValue};
 use datafusion_execution::SendableRecordBatchStream;
 use datafusion_expr::interval_arithmetic::Interval;
 use datafusion_physical_expr::expressions::Column;
-use datafusion_physical_expr::intervals::{ExprIntervalGraph, Interval, IntervalBound};
+use datafusion_physical_expr::intervals::cp_solver::ExprIntervalGraph;
 use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr::{EquivalenceProperties, PhysicalExpr, PhysicalSortExpr};
 
+use async_trait::async_trait;
 use futures::{ready, FutureExt, StreamExt};
 use hashbrown::raw::RawTable;
 use hashbrown::HashSet;
@@ -1516,7 +1513,7 @@ pub fn build_filter_input_order(
     sort_expr: &PhysicalSortExpr,
     equivalence_properties: &EquivalenceProperties,
 ) -> Result<Vec<SortedFilterExpr>> {
-    let mut additional_sort_exprs: HashSet<PhysicalSortExpr> = HashSet::new();
+    let mut additional_sort_exprs = HashSet::<PhysicalSortExpr>::new();
     additional_sort_exprs.insert(sort_expr.clone());
 
     for ordering in equivalence_properties.oeq_class().iter() {
@@ -1534,18 +1531,19 @@ pub fn build_filter_input_order(
             }
         }
     }
-
     additional_sort_exprs.extend(temp_sort_exprs);
+
     let column_map = map_origin_col_to_filter_col(filter, schema, &side)?;
     let intermediate_schema = get_filter_representation_schema_of_build_side(
         filter.schema(),
         filter.column_indices(),
         side,
     )?;
-    let sorted_filter_exprs = additional_sort_exprs
+
+    additional_sort_exprs
         .into_iter()
         .map(|sort_expr| {
-            let expr = sort_expr.expr.clone();
+            let expr = sort_expr.expr;
             // Get main schema columns:
             let expr_columns = collect_columns(&expr);
             // Calculation is possible with `column_map` since sort exprs belong to a child.
@@ -1571,22 +1569,19 @@ pub fn build_filter_input_order(
                     let build_side_intermediate_expr =
                         converted_filter_expr.clone().transform_up(&|expr| {
                             if let Some(col) = expr.as_any().downcast_ref::<Column>() {
-                                let intermediate_expr = Arc::new(Column::new_with_schema(
-                                    col.name(),
-                                    &intermediate_schema,
-                                )?)
-                                    as _;
-                                Ok(Transformed::Yes(intermediate_expr))
+                                Column::new_with_schema(col.name(), &intermediate_schema)
+                                    .map(|e| Transformed::Yes(Arc::new(e) as _))
                             } else {
                                 Ok(Transformed::No(expr))
                             }
                         })?;
                     return Ok(Some(SortedFilterExpr::new(
                         PhysicalSortExpr {
-                            expr: converted_filter_expr.clone(),
+                            expr: converted_filter_expr,
                             options: sort_expr.options,
                         },
                         build_side_intermediate_expr,
+                        filter.schema(),
                     )));
                 }
             }
@@ -1595,9 +1590,7 @@ pub fn build_filter_input_order(
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .flatten()
-        .collect();
-
-    Ok(sorted_filter_exprs)
+        .collect::<Result<_>>()
 }
 
 /// Convert a physical expression into a filter expression using the given
@@ -1670,14 +1663,17 @@ impl SortedFilterExpr {
     pub fn new(
         filter_expr: PhysicalSortExpr,
         intermediate_batch_filter_expr: Arc<dyn PhysicalExpr>,
-    ) -> Self {
-        Self {
+        filter_schema: &Schema,
+    ) -> Result<Self> {
+        let dt = filter_expr.expr.data_type(filter_schema)?;
+        Ok(Self {
             filter_expr,
             intermediate_batch_filter_expr,
-            interval: Interval::default(),
+            interval: Interval::make_unbounded(&dt)?,
             node_index: 0,
-        }
+        })
     }
+
     /// Get intermediate_batch_filter_expr
     pub fn intermediate_batch_filter_expr(&self) -> Arc<dyn PhysicalExpr> {
         self.intermediate_batch_filter_expr.clone()
@@ -1841,12 +1837,12 @@ pub fn update_filter_expr_interval(
         // Convert the array to a ScalarValue:
         let value = ScalarValue::try_from_array(&array, 0)?;
         // Create a ScalarValue representing positive or negative infinity for the same data type:
-        let unbounded = IntervalBound::make_unbounded(value.data_type())?;
+        let inf = ScalarValue::try_from(value.data_type())?;
         // Update the interval with lower and upper bounds based on the sort option:
         let interval = if sorted_expr.order().descending {
-            Interval::new(unbounded, IntervalBound::new(value, false))
+            Interval::try_new(inf, value)?
         } else {
-            Interval::new(IntervalBound::new(value, false), unbounded)
+            Interval::try_new(value, inf)?
         };
         // Set the calculated interval for the sorted filter expression:
         sorted_expr.set_interval(interval);
@@ -2024,7 +2020,7 @@ pub(crate) fn calculate_side_prune_length_helper(
         .collect::<Vec<_>>();
 
     // Update the physical expression graph using the join filter intervals:
-    graph.update_ranges(&mut filter_intervals)?;
+    graph.update_ranges(&mut filter_intervals, Interval::CERTAINLY_TRUE)?;
 
     let intermediate_batch = get_filter_representation_of_join_side(
         filter.schema(),
@@ -2050,9 +2046,9 @@ pub(crate) fn calculate_side_prune_length_helper(
 
             // Get the lower or upper interval based on the sort direction:
             let target = if options.descending {
-                interval.upper.value
+                interval.upper()
             } else {
-                interval.lower.value
+                interval.lower()
             }
             .clone();
 
@@ -2236,7 +2232,8 @@ pub fn prepare_sorted_exprs(
         let mut sorted_exprs = left_temp_sorted_filter_expr;
         sorted_exprs.extend(right_temp_sorted_filter_expr);
         // Build the expression interval graph:
-        let mut graph = ExprIntervalGraph::try_new(filter.expression().clone())?;
+        let mut graph =
+            ExprIntervalGraph::try_new(filter.expression().clone(), filter.schema())?;
         // Update sorted expressions with node indices:
         update_sorted_exprs_with_node_indices(&mut graph, &mut sorted_exprs);
         // Swap and remove to get the final sorted filter expressions:
@@ -2270,7 +2267,7 @@ pub mod tests {
 
     use arrow::compute::SortOptions;
     use arrow::datatypes::{DataType, Field, Schema};
-    use datafusion_common::{JoinSide, ScalarValue};
+    use datafusion_common::JoinSide;
     use datafusion_expr::Operator;
     use datafusion_physical_expr::expressions::{binary, cast, col};
 
