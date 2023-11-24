@@ -28,22 +28,23 @@ use datafusion::datasource::physical_plan::ParquetExec;
 use datafusion::datasource::physical_plan::{AvroExec, CsvExec};
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::FunctionRegistry;
-use datafusion::physical_plan::aggregates::{create_aggregate_expr, AggregateMode};
-use datafusion::physical_plan::aggregates::{AggregateExec, PhysicalGroupBy};
+use datafusion::physical_plan::aggregates::{
+    create_aggregate_expr, AggregateExec, AggregateMode, PhysicalGroupBy,
+};
 use datafusion::physical_plan::analyze::AnalyzeExec;
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::explain::ExplainExec;
-use datafusion::physical_plan::expressions::{Column, PhysicalSortExpr};
+use datafusion::physical_plan::expressions::PhysicalSortExpr;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::insert::FileSinkExec;
 use datafusion::physical_plan::joins::utils::{ColumnIndex, JoinFilter};
 use datafusion::physical_plan::joins::{
-    CrossJoinExec, NestedLoopJoinExec, SlidingHashJoinExec, SlidingNestedLoopJoinExec,
-    StreamJoinPartitionMode, SymmetricHashJoinExec,
+    CrossJoinExec, HashJoinExec, NestedLoopJoinExec, PartitionMode,
+    PartitionedHashJoinExec, SlidingHashJoinExec, SlidingNestedLoopJoinExec,
+    SlidingWindowWorkingMode, StreamJoinPartitionMode, SymmetricHashJoinExec,
 };
-use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion::physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion::physical_plan::placeholder_row::PlaceholderRowExec;
 use datafusion::physical_plan::projection::ProjectionExec;
@@ -57,6 +58,7 @@ use datafusion::physical_plan::{
     WindowExpr,
 };
 use datafusion_common::{internal_err, not_impl_err, DataFusionError, Result};
+
 use prost::bytes::BufMut;
 use prost::Message;
 
@@ -84,7 +86,7 @@ impl AsExecutionPlan for PhysicalPlanNode {
     where
         Self: Sized,
     {
-        protobuf::PhysicalPlanNode::decode(buf).map_err(|e| {
+        PhysicalPlanNode::decode(buf).map_err(|e| {
             DataFusionError::Internal(format!("failed to decode physical plan: {e:?}"))
         })
     }
@@ -121,7 +123,7 @@ impl AsExecutionPlan for PhysicalPlanNode {
                 explain.verbose,
             ))),
             PhysicalPlanType::Projection(projection) => {
-                let input: Arc<dyn ExecutionPlan> = into_physical_plan(
+                let input = into_physical_plan(
                     &projection.input,
                     registry,
                     runtime,
@@ -137,11 +139,11 @@ impl AsExecutionPlan for PhysicalPlanNode {
                             name.to_string(),
                         ))
                     })
-                    .collect::<Result<Vec<(Arc<dyn PhysicalExpr>, String)>>>()?;
-                Ok(Arc::new(ProjectionExec::try_new(exprs, input)?))
+                    .collect::<Result<_>>()?;
+                ProjectionExec::try_new(exprs, input).map(|e| Arc::new(e) as _)
             }
             PhysicalPlanType::Filter(filter) => {
-                let input: Arc<dyn ExecutionPlan> = into_physical_plan(
+                let input = into_physical_plan(
                     &filter.input,
                     registry,
                     runtime,
@@ -215,7 +217,7 @@ impl AsExecutionPlan for PhysicalPlanNode {
                 )?)))
             }
             PhysicalPlanType::CoalesceBatches(coalesce_batches) => {
-                let input: Arc<dyn ExecutionPlan> = into_physical_plan(
+                let input = into_physical_plan(
                     &coalesce_batches.input,
                     registry,
                     runtime,
@@ -227,12 +229,12 @@ impl AsExecutionPlan for PhysicalPlanNode {
                 )))
             }
             PhysicalPlanType::Merge(merge) => {
-                let input: Arc<dyn ExecutionPlan> =
+                let input =
                     into_physical_plan(&merge.input, registry, runtime, extension_codec)?;
                 Ok(Arc::new(CoalescePartitionsExec::new(input)))
             }
             PhysicalPlanType::Repartition(repart) => {
-                let input: Arc<dyn ExecutionPlan> = into_physical_plan(
+                let input = into_physical_plan(
                     &repart.input,
                     registry,
                     runtime,
@@ -246,7 +248,7 @@ impl AsExecutionPlan for PhysicalPlanNode {
                             .map(|e| {
                                 parse_physical_expr(e, registry, input.schema().as_ref())
                             })
-                            .collect::<Result<Vec<Arc<dyn PhysicalExpr>>, _>>()?;
+                            .collect::<Result<_>>()?;
 
                         Ok(Arc::new(RepartitionExec::try_new(
                             input,
@@ -257,32 +259,30 @@ impl AsExecutionPlan for PhysicalPlanNode {
                         )?))
                     }
                     Some(PartitionMethod::RoundRobin(partition_count)) => {
-                        Ok(Arc::new(RepartitionExec::try_new(
+                        RepartitionExec::try_new(
                             input,
                             Partitioning::RoundRobinBatch(
                                 partition_count.try_into().unwrap(),
                             ),
-                        )?))
+                        )
+                        .map(|e| Arc::new(e) as _)
                     }
                     Some(PartitionMethod::Unknown(partition_count)) => {
-                        Ok(Arc::new(RepartitionExec::try_new(
+                        RepartitionExec::try_new(
                             input,
                             Partitioning::UnknownPartitioning(
                                 partition_count.try_into().unwrap(),
                             ),
-                        )?))
+                        )
+                        .map(|e| Arc::new(e) as _)
                     }
                     _ => internal_err!("Invalid partitioning scheme"),
                 }
             }
             PhysicalPlanType::GlobalLimit(limit) => {
-                let input: Arc<dyn ExecutionPlan> =
+                let input =
                     into_physical_plan(&limit.input, registry, runtime, extension_codec)?;
-                let fetch = if limit.fetch >= 0 {
-                    Some(limit.fetch as usize)
-                } else {
-                    None
-                };
+                let fetch = (limit.fetch >= 0).then_some(limit.fetch as usize);
                 Ok(Arc::new(GlobalLimitExec::new(
                     input,
                     limit.skip as usize,
@@ -290,12 +290,12 @@ impl AsExecutionPlan for PhysicalPlanNode {
                 )))
             }
             PhysicalPlanType::LocalLimit(limit) => {
-                let input: Arc<dyn ExecutionPlan> =
+                let input =
                     into_physical_plan(&limit.input, registry, runtime, extension_codec)?;
                 Ok(Arc::new(LocalLimitExec::new(input, limit.fetch as usize)))
             }
             PhysicalPlanType::Window(window_agg) => {
-                let input: Arc<dyn ExecutionPlan> = into_physical_plan(
+                let input = into_physical_plan(
                     &window_agg.input,
                     registry,
                     runtime,
@@ -303,7 +303,7 @@ impl AsExecutionPlan for PhysicalPlanNode {
                 )?;
                 let input_schema = input.schema();
 
-                let physical_window_expr: Vec<Arc<dyn WindowExpr>> = window_agg
+                let physical_window_expr = window_agg
                     .window_expr
                     .iter()
                     .map(|window_expr| {
@@ -313,7 +313,7 @@ impl AsExecutionPlan for PhysicalPlanNode {
                             input_schema.as_ref(),
                         )
                     })
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .collect::<Result<_>>()?;
 
                 let partition_keys = window_agg
                     .partition_keys
@@ -321,7 +321,7 @@ impl AsExecutionPlan for PhysicalPlanNode {
                     .map(|expr| {
                         parse_physical_expr(expr, registry, input.schema().as_ref())
                     })
-                    .collect::<Result<Vec<Arc<dyn PhysicalExpr>>>>()?;
+                    .collect::<Result<_>>()?;
 
                 if let Some(input_order_mode) = window_agg.input_order_mode.as_ref() {
                     let input_order_mode = match input_order_mode {
@@ -338,22 +338,19 @@ impl AsExecutionPlan for PhysicalPlanNode {
                         }
                     };
 
-                    Ok(Arc::new(BoundedWindowAggExec::try_new(
+                    BoundedWindowAggExec::try_new(
                         physical_window_expr,
                         input,
                         partition_keys,
                         input_order_mode,
                     )?))
                 } else {
-                    Ok(Arc::new(WindowAggExec::try_new(
-                        physical_window_expr,
-                        input,
-                        partition_keys,
-                    )?))
+                    WindowAggExec::try_new(physical_window_expr, input, partition_keys)
+                        .map(|e| Arc::new(e) as _)
                 }
             }
             PhysicalPlanType::Aggregate(hash_agg) => {
-                let input: Arc<dyn ExecutionPlan> = into_physical_plan(
+                let input = into_physical_plan(
                     &hash_agg.input,
                     registry,
                     runtime,
@@ -389,7 +386,7 @@ impl AsExecutionPlan for PhysicalPlanNode {
                         parse_physical_expr(expr, registry, input.schema().as_ref())
                             .map(|expr| (expr, name.to_string()))
                     })
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .collect::<Result<_>>()?;
 
                 let null_expr = hash_agg
                     .null_expr
@@ -399,14 +396,14 @@ impl AsExecutionPlan for PhysicalPlanNode {
                         parse_physical_expr(expr, registry, input.schema().as_ref())
                             .map(|expr| (expr, name.to_string()))
                     })
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .collect::<Result<_>>()?;
 
-                let groups: Vec<Vec<bool>> = if !hash_agg.groups.is_empty() {
+                let groups = if !hash_agg.groups.is_empty() {
                     hash_agg
                         .groups
                         .chunks(num_expr)
                         .map(|g| g.to_vec())
-                        .collect::<Vec<Vec<bool>>>()
+                        .collect()
                 } else {
                     vec![]
                 };
@@ -429,7 +426,7 @@ impl AsExecutionPlan for PhysicalPlanNode {
                     })
                     .collect::<Result<Vec<_>, _>>()?;
 
-                let physical_aggr_expr: Vec<Arc<dyn AggregateExpr>> = hash_agg
+                let physical_aggr_expr = hash_agg
                     .aggr_expr
                     .iter()
                     .zip(hash_agg.aggr_expr_name.iter())
@@ -479,7 +476,7 @@ impl AsExecutionPlan for PhysicalPlanNode {
                             ),
                         }
                     })
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .collect::<Result<_>>()?;
 
                 Ok(Arc::new(AggregateExec::try_new(
                     agg_mode,
@@ -491,19 +488,19 @@ impl AsExecutionPlan for PhysicalPlanNode {
                 )?))
             }
             PhysicalPlanType::HashJoin(hashjoin) => {
-                let left: Arc<dyn ExecutionPlan> = into_physical_plan(
+                let left = into_physical_plan(
                     &hashjoin.left,
                     registry,
                     runtime,
                     extension_codec,
                 )?;
-                let right: Arc<dyn ExecutionPlan> = into_physical_plan(
+                let right = into_physical_plan(
                     &hashjoin.right,
                     registry,
                     runtime,
                     extension_codec,
                 )?;
-                let on: Vec<(Column, Column)> = hashjoin
+                let on = hashjoin
                     .on
                     .iter()
                     .map(|col| {
@@ -549,7 +546,7 @@ impl AsExecutionPlan for PhysicalPlanNode {
                                     side: side.into(),
                                 })
                             })
-                            .collect::<Result<Vec<_>>>()?;
+                            .collect::<Result<_>>()?;
 
                         Ok(JoinFilter::new(expression, column_indices, schema))
                     })
@@ -569,7 +566,7 @@ impl AsExecutionPlan for PhysicalPlanNode {
                     protobuf::PartitionMode::Partitioned => PartitionMode::Partitioned,
                     protobuf::PartitionMode::Auto => PartitionMode::Auto,
                 };
-                Ok(Arc::new(HashJoinExec::try_new(
+                HashJoinExec::try_new(
                     left,
                     right,
                     on,
@@ -577,16 +574,17 @@ impl AsExecutionPlan for PhysicalPlanNode {
                     &join_type.into(),
                     partition_mode,
                     hashjoin.null_equals_null,
-                )?))
+                )
+                .map(|e| Arc::new(e) as _)
             }
             PhysicalPlanType::SymmetricHashJoin(sym_join) => {
-                let left = into_physical_plan(
+                let left: Arc<dyn ExecutionPlan> = into_physical_plan(
                     &sym_join.left,
                     registry,
                     runtime,
                     extension_codec,
                 )?;
-                let right = into_physical_plan(
+                let right: Arc<dyn ExecutionPlan> = into_physical_plan(
                     &sym_join.right,
                     registry,
                     runtime,
@@ -629,7 +627,7 @@ impl AsExecutionPlan for PhysicalPlanNode {
                             .map(|i| {
                                 let side = protobuf::JoinSide::try_from(i.side)
                                     .map_err(|_| proto_error(format!(
-                                        "Received a SymmetricHashJoin message with JoinSide in Filter {}",
+                                        "Received a HashJoinNode message with JoinSide in Filter {}",
                                         i.side))
                                     )?;
 
@@ -638,7 +636,7 @@ impl AsExecutionPlan for PhysicalPlanNode {
                                     side: side.into(),
                                 })
                             })
-                            .collect::<Result<_>>()?;
+                            .collect::<Result<Vec<_>>>()?;
 
                         Ok(JoinFilter::new(expression, column_indices, schema))
                     })
@@ -669,168 +667,6 @@ impl AsExecutionPlan for PhysicalPlanNode {
                     partition_mode,
                 )?))
             }
-            PhysicalPlanType::SlidingHashJoin(sliding_hash_join) => {
-                let left: Arc<dyn ExecutionPlan> = into_physical_plan(
-                    &sliding_hash_join.left,
-                    registry,
-                    runtime,
-                    extension_codec,
-                )?;
-                let right: Arc<dyn ExecutionPlan> = into_physical_plan(
-                    &sliding_hash_join.right,
-                    registry,
-                    runtime,
-                    extension_codec,
-                )?;
-                let on: Vec<(Column, Column)> = sliding_hash_join
-                    .on
-                    .iter()
-                    .map(|col| {
-                        let left = into_required!(col.left)?;
-                        let right = into_required!(col.right)?;
-                        Ok((left, right))
-                    })
-                    .collect::<Result<_>>()?;
-                let join_type = protobuf::JoinType::try_from(sliding_hash_join.join_type)
-                    .map_err(|_| {
-                        proto_error(format!(
-                            "Received a HashJoinNode message with unknown JoinType {}",
-                            sliding_hash_join.join_type
-                        ))
-                    })?;
-                let ok_filter: Result<_> = sliding_hash_join
-                    .filter
-                    .as_ref()
-                    .map(|f| {
-                        let schema = f
-                            .schema
-                            .as_ref()
-                            .ok_or_else(|| proto_error("Missing JoinFilter schema"))?
-                            .try_into()?;
-
-                        let expression = parse_physical_expr(
-                            f.expression.as_ref().ok_or_else(|| {
-                                proto_error("Unexpected empty filter expression")
-                            })?,
-                            registry, &schema
-                        )?;
-                        let column_indices = f.column_indices
-                            .iter()
-                            .map(|i| {
-                                let side = protobuf::JoinSide::try_from(i.side)
-                                    .map_err(|_| proto_error(format!(
-                                        "Received a HashJoinNode message with JoinSide in Filter {}",
-                                        i.side))
-                                    )?;
-
-                                Ok(ColumnIndex{
-                                    index: i.index as usize,
-                                    side: side.into(),
-                                })
-                            })
-                            .collect::<Result<Vec<_>>>()?;
-
-                        Ok(JoinFilter::new(expression, column_indices, schema))
-                    }).transpose();
-
-                let filter = ok_filter?.unwrap();
-
-                let partition_mode =
-                    protobuf::StreamPartitionMode::try_from(sliding_hash_join.partition_mode).map_err(|_| {
-                        proto_error(format!(
-                            "Received a SlidingHashJoin message with unknown PartitionMode {}",
-                            sliding_hash_join.partition_mode
-                        ))
-                    })?;
-                let partition_mode = match partition_mode {
-                    protobuf::StreamPartitionMode::SinglePartition => {
-                        StreamJoinPartitionMode::SinglePartition
-                    }
-                    protobuf::StreamPartitionMode::PartitionedExec => {
-                        StreamJoinPartitionMode::Partitioned
-                    }
-                };
-
-                let left_sort_exprs = sliding_hash_join
-                    .left_sort_exprs
-                    .iter()
-                    .map(|expr| {
-                        let expr = expr.expr_type.as_ref().ok_or_else(|| {
-                            proto_error(format!(
-                                "physical_plan::from_proto() Unexpected expr {self:?}"
-                            ))
-                        })?;
-                        if let protobuf::physical_expr_node::ExprType::Sort(sort_expr) = expr {
-                            let expr = sort_expr
-                                .expr
-                                .as_ref()
-                                .ok_or_else(|| {
-                                    proto_error(format!(
-                                        "physical_plan::from_proto() Unexpected sort expr {self:?}"
-                                    ))
-                                })?
-                                .as_ref();
-                            Ok(PhysicalSortExpr {
-                                expr: parse_physical_expr(expr,registry, left.schema().as_ref())?,
-                                options: SortOptions {
-                                    descending: !sort_expr.asc,
-                                    nulls_first: sort_expr.nulls_first,
-                                },
-                            })
-                        } else {
-                            internal_err!(
-                                "physical_plan::from_proto() {self:?}"
-                            )
-                        }
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-
-                let right_sort_exprs = sliding_hash_join
-                    .right_sort_exprs
-                    .iter()
-                    .map(|expr| {
-                        let expr = expr.expr_type.as_ref().ok_or_else(|| {
-                            proto_error(format!(
-                                "physical_plan::from_proto() Unexpected expr {self:?}"
-                            ))
-                        })?;
-                        if let protobuf::physical_expr_node::ExprType::Sort(sort_expr) = expr {
-                            let expr = sort_expr
-                                .expr
-                                .as_ref()
-                                .ok_or_else(|| {
-                                    proto_error(format!(
-                                        "physical_plan::from_proto() Unexpected sort expr {self:?}"
-                                    ))
-                                })?
-                                .as_ref();
-                            Ok(PhysicalSortExpr {
-                                expr: parse_physical_expr(expr,registry, right.schema().as_ref())?,
-                                options: SortOptions {
-                                    descending: !sort_expr.asc,
-                                    nulls_first: sort_expr.nulls_first,
-                                },
-                            })
-                        } else {
-                            internal_err!(
-                                "physical_plan::from_proto() {self:?}"
-                            )
-                        }
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-
-                Ok(Arc::new(SlidingHashJoinExec::try_new(
-                    left,
-                    right,
-                    on,
-                    filter,
-                    &join_type.into(),
-                    sliding_hash_join.null_equals_null,
-                    left_sort_exprs,
-                    right_sort_exprs,
-                    partition_mode,
-                )?))
-            }
             PhysicalPlanType::SlidingNestedLoopJoin(sliding_nested_loop_join) => {
                 let left: Arc<dyn ExecutionPlan> = into_physical_plan(
                     &sliding_nested_loop_join.left,
@@ -848,9 +684,9 @@ impl AsExecutionPlan for PhysicalPlanNode {
                     protobuf::JoinType::try_from(sliding_nested_loop_join.join_type)
                         .map_err(|_| {
                             proto_error(format!(
-                            "Received a HashJoinNode message with unknown JoinType {}",
-                            sliding_nested_loop_join.join_type
-                        ))
+                        "Received a HashJoinNode message with unknown JoinType {}",
+                        sliding_nested_loop_join.join_type
+                    ))
                         })?;
                 let ok_filter: Result<_> = sliding_nested_loop_join
                     .filter
@@ -956,7 +792,22 @@ impl AsExecutionPlan for PhysicalPlanNode {
                         }
                     })
                     .collect::<Result<Vec<_>, _>>()?;
+                let working_mode =
+                    protobuf::SlidingWindowWorkingMode::try_from(sliding_nested_loop_join.working_mode).map_err(|_| {
+                        proto_error(format!(
+                            "Received a SlidingNestedLoopJoinExec message with unknown SlidingWindowWorkingMode {}",
+                            sliding_nested_loop_join.working_mode
+                        ))
+                    })?;
 
+                let working_mode = match working_mode {
+                    protobuf::SlidingWindowWorkingMode::Lazy => {
+                        SlidingWindowWorkingMode::Lazy
+                    }
+                    protobuf::SlidingWindowWorkingMode::Eager => {
+                        SlidingWindowWorkingMode::Eager
+                    }
+                };
                 Ok(Arc::new(SlidingNestedLoopJoinExec::try_new(
                     left,
                     right,
@@ -964,7 +815,372 @@ impl AsExecutionPlan for PhysicalPlanNode {
                     &join_type.into(),
                     left_sort_exprs,
                     right_sort_exprs,
+                    working_mode,
                 )?))
+            }
+            PhysicalPlanType::SlidingHashJoin(sliding_hash_join) => {
+                let left = into_physical_plan(
+                    &sliding_hash_join.left,
+                    registry,
+                    runtime,
+                    extension_codec,
+                )?;
+                let right = into_physical_plan(
+                    &sliding_hash_join.right,
+                    registry,
+                    runtime,
+                    extension_codec,
+                )?;
+                let on = sliding_hash_join
+                    .on
+                    .iter()
+                    .map(|col| {
+                        let left = into_required!(col.left)?;
+                        let right = into_required!(col.right)?;
+                        Ok((left, right))
+                    })
+                    .collect::<Result<_>>()?;
+                let join_type = protobuf::JoinType::try_from(sliding_hash_join.join_type)
+                    .map_err(|_| {
+                        proto_error(format!(
+                            "Received a SlidingHashJoin message with unknown JoinType {}",
+                            sliding_hash_join.join_type
+                        ))
+                    })?;
+                let ok_filter: Result<_> = sliding_hash_join
+                    .filter
+                    .as_ref()
+                    .map(|f| {
+                        let schema = f
+                            .schema
+                            .as_ref()
+                            .ok_or_else(|| proto_error("Missing JoinFilter schema"))?
+                            .try_into()?;
+
+                        let expression = parse_physical_expr(
+                            f.expression.as_ref().ok_or_else(|| {
+                                proto_error("Unexpected empty filter expression")
+                            })?,
+                            registry, &schema
+                        )?;
+                        let column_indices = f.column_indices
+                            .iter()
+                            .map(|i| {
+                                let side = protobuf::JoinSide::try_from(i.side)
+                                    .map_err(|_| proto_error(format!(
+                                        "Received a SlidingHashJoin message with JoinSide in Filter {}",
+                                        i.side))
+                                    )?;
+
+                                Ok(ColumnIndex{
+                                    index: i.index as usize,
+                                    side: side.into(),
+                                })
+                            })
+                            .collect::<Result<_>>()?;
+
+                        Ok(JoinFilter::new(expression, column_indices, schema))
+                    }).transpose();
+
+                let filter = ok_filter?.unwrap();
+
+                let partition_mode =
+                    protobuf::StreamPartitionMode::try_from(sliding_hash_join.partition_mode).map_err(|_| {
+                        proto_error(format!(
+                            "Received a SlidingHashJoin message with unknown PartitionMode {}",
+                            sliding_hash_join.partition_mode
+                        ))
+                    })?;
+                let partition_mode = match partition_mode {
+                    protobuf::StreamPartitionMode::SinglePartition => {
+                        StreamJoinPartitionMode::SinglePartition
+                    }
+                    protobuf::StreamPartitionMode::PartitionedExec => {
+                        StreamJoinPartitionMode::Partitioned
+                    }
+                };
+
+                let working_mode =
+                    protobuf::SlidingWindowWorkingMode::try_from(sliding_hash_join.working_mode).map_err(|_| {
+                        proto_error(format!(
+                            "Received a SlidingHashJoin message with unknown SlidingWindowWorkingMode {}",
+                            sliding_hash_join.working_mode
+                        ))
+                    })?;
+
+                let working_mode = match working_mode {
+                    protobuf::SlidingWindowWorkingMode::Lazy => {
+                        SlidingWindowWorkingMode::Lazy
+                    }
+                    protobuf::SlidingWindowWorkingMode::Eager => {
+                        SlidingWindowWorkingMode::Eager
+                    }
+                };
+
+                let left_sort_exprs = sliding_hash_join
+                    .left_sort_exprs
+                    .iter()
+                    .map(|expr| {
+                        let expr = expr.expr_type.as_ref().ok_or_else(|| {
+                            proto_error(format!(
+                                "physical_plan::from_proto() Unexpected expr {self:?}"
+                            ))
+                        })?;
+                        if let protobuf::physical_expr_node::ExprType::Sort(sort_expr) = expr {
+                            let expr = sort_expr
+                                .expr
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    proto_error(format!(
+                                        "physical_plan::from_proto() Unexpected sort expr {self:?}"
+                                    ))
+                                })?
+                                .as_ref();
+                            Ok(PhysicalSortExpr {
+                                expr: parse_physical_expr(expr,registry, left.schema().as_ref())?,
+                                options: SortOptions {
+                                    descending: !sort_expr.asc,
+                                    nulls_first: sort_expr.nulls_first,
+                                },
+                            })
+                        } else {
+                            internal_err!(
+                                "physical_plan::from_proto() {self:?}"
+                            )
+                        }
+                    })
+                    .collect::<Result<_>>()?;
+
+                let right_sort_exprs = sliding_hash_join
+                    .right_sort_exprs
+                    .iter()
+                    .map(|expr| {
+                        let expr = expr.expr_type.as_ref().ok_or_else(|| {
+                            proto_error(format!(
+                                "physical_plan::from_proto() Unexpected expr {self:?}"
+                            ))
+                        })?;
+                        if let protobuf::physical_expr_node::ExprType::Sort(sort_expr) = expr {
+                            let expr = sort_expr
+                                .expr
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    proto_error(format!(
+                                        "physical_plan::from_proto() Unexpected sort expr {self:?}"
+                                    ))
+                                })?
+                                .as_ref();
+                            Ok(PhysicalSortExpr {
+                                expr: parse_physical_expr(expr,registry, right.schema().as_ref())?,
+                                options: SortOptions {
+                                    descending: !sort_expr.asc,
+                                    nulls_first: sort_expr.nulls_first,
+                                },
+                            })
+                        } else {
+                            internal_err!(
+                                "physical_plan::from_proto() {self:?}"
+                            )
+                        }
+                    })
+                    .collect::<Result<_>>()?;
+
+                SlidingHashJoinExec::try_new(
+                    left,
+                    right,
+                    on,
+                    filter,
+                    &join_type.into(),
+                    sliding_hash_join.null_equals_null,
+                    left_sort_exprs,
+                    right_sort_exprs,
+                    partition_mode,
+                    working_mode,
+                )
+                .map(|e| Arc::new(e) as _)
+            }
+            PhysicalPlanType::PartitionedHashJoin(partitioned_hash_join) => {
+                let left = into_physical_plan(
+                    &partitioned_hash_join.left,
+                    registry,
+                    runtime,
+                    extension_codec,
+                )?;
+                let right = into_physical_plan(
+                    &partitioned_hash_join.right,
+                    registry,
+                    runtime,
+                    extension_codec,
+                )?;
+                let on = partitioned_hash_join
+                    .on
+                    .iter()
+                    .map(|col| {
+                        let left = into_required!(col.left)?;
+                        let right = into_required!(col.right)?;
+                        Ok((left, right))
+                    })
+                    .collect::<Result<_>>()?;
+                let join_type =
+                    protobuf::JoinType::try_from(partitioned_hash_join.join_type)
+                        .map_err(|_| {
+                            proto_error(format!(
+                        "Received a PartitionedHashJoin message with unknown JoinType {}",
+                        partitioned_hash_join.join_type
+                    ))
+                        })?;
+                let ok_filter: Result<_> = partitioned_hash_join
+                    .filter
+                    .as_ref()
+                    .map(|f| {
+                        let schema = f
+                            .schema
+                            .as_ref()
+                            .ok_or_else(|| proto_error("Missing JoinFilter schema"))?
+                            .try_into()?;
+
+                        let expression = parse_physical_expr(
+                            f.expression.as_ref().ok_or_else(|| {
+                                proto_error("Unexpected empty filter expression")
+                            })?,
+                            registry, &schema
+                        )?;
+                        let column_indices = f.column_indices
+                            .iter()
+                            .map(|i| {
+                                let side = protobuf::JoinSide::try_from(i.side)
+                                    .map_err(|_| proto_error(format!(
+                                        "Received a PartitionedHashJoin message with JoinSide in Filter {}",
+                                        i.side))
+                                    )?;
+
+                                Ok(ColumnIndex{
+                                    index: i.index as usize,
+                                    side: side.into(),
+                                })
+                            })
+                            .collect::<Result<_>>()?;
+
+                        Ok(JoinFilter::new(expression, column_indices, schema))
+                    }).transpose();
+
+                let filter = ok_filter?.unwrap();
+
+                let partition_mode =
+                    protobuf::StreamPartitionMode::try_from(partitioned_hash_join.partition_mode).map_err(|_| {
+                        proto_error(format!(
+                            "Received a PartitionedHashJoin message with unknown PartitionMode {}",
+                            partitioned_hash_join.partition_mode
+                        ))
+                    })?;
+                let partition_mode = match partition_mode {
+                    protobuf::StreamPartitionMode::SinglePartition => {
+                        StreamJoinPartitionMode::SinglePartition
+                    }
+                    protobuf::StreamPartitionMode::PartitionedExec => {
+                        StreamJoinPartitionMode::Partitioned
+                    }
+                };
+
+                let working_mode =
+                    protobuf::SlidingWindowWorkingMode::try_from(partitioned_hash_join.working_mode).map_err(|_| {
+                        proto_error(format!(
+                            "Received a PartitionedHashJoin message with unknown SlidingWindowWorkingMode {}",
+                            partitioned_hash_join.working_mode
+                        ))
+                    })?;
+
+                let working_mode = match working_mode {
+                    protobuf::SlidingWindowWorkingMode::Lazy => {
+                        SlidingWindowWorkingMode::Lazy
+                    }
+                    protobuf::SlidingWindowWorkingMode::Eager => {
+                        SlidingWindowWorkingMode::Eager
+                    }
+                };
+
+                let left_sort_exprs = partitioned_hash_join
+                    .left_sort_exprs
+                    .iter()
+                    .map(|expr| {
+                        let expr = expr.expr_type.as_ref().ok_or_else(|| {
+                            proto_error(format!(
+                                "physical_plan::from_proto() Unexpected expr {self:?}"
+                            ))
+                        })?;
+                        if let protobuf::physical_expr_node::ExprType::Sort(sort_expr) = expr {
+                            let expr = sort_expr
+                                .expr
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    proto_error(format!(
+                                        "physical_plan::from_proto() Unexpected sort expr {self:?}"
+                                    ))
+                                })?
+                                .as_ref();
+                            Ok(PhysicalSortExpr {
+                                expr: parse_physical_expr(expr,registry, left.schema().as_ref())?,
+                                options: SortOptions {
+                                    descending: !sort_expr.asc,
+                                    nulls_first: sort_expr.nulls_first,
+                                },
+                            })
+                        } else {
+                            internal_err!(
+                                "physical_plan::from_proto() {self:?}"
+                            )
+                        }
+                    })
+                    .collect::<Result<_>>()?;
+
+                let right_sort_exprs = partitioned_hash_join
+                    .right_sort_exprs
+                    .iter()
+                    .map(|expr| {
+                        let expr = expr.expr_type.as_ref().ok_or_else(|| {
+                            proto_error(format!(
+                                "physical_plan::from_proto() Unexpected expr {self:?}"
+                            ))
+                        })?;
+                        if let protobuf::physical_expr_node::ExprType::Sort(sort_expr) = expr {
+                            let expr = sort_expr
+                                .expr
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    proto_error(format!(
+                                        "physical_plan::from_proto() Unexpected sort expr {self:?}"
+                                    ))
+                                })?
+                                .as_ref();
+                            Ok(PhysicalSortExpr {
+                                expr: parse_physical_expr(expr,registry, right.schema().as_ref())?,
+                                options: SortOptions {
+                                    descending: !sort_expr.asc,
+                                    nulls_first: sort_expr.nulls_first,
+                                },
+                            })
+                        } else {
+                            internal_err!(
+                                "physical_plan::from_proto() {self:?}"
+                            )
+                        }
+                    })
+                    .collect::<Result<_>>()?;
+
+                PartitionedHashJoinExec::try_new(
+                    left,
+                    right,
+                    on,
+                    filter,
+                    &join_type.into(),
+                    partitioned_hash_join.null_equals_null,
+                    left_sort_exprs,
+                    right_sort_exprs,
+                    partitioned_hash_join.fetch_per_key as usize,
+                    partition_mode,
+                    working_mode,
+                )
+                .map(|e| Arc::new(e) as _)
             }
             PhysicalPlanType::Union(union) => {
                 let mut inputs: Vec<Arc<dyn ExecutionPlan>> = vec![];
@@ -989,13 +1205,13 @@ impl AsExecutionPlan for PhysicalPlanNode {
                 Ok(Arc::new(InterleaveExec::try_new(inputs)?))
             }
             PhysicalPlanType::CrossJoin(crossjoin) => {
-                let left: Arc<dyn ExecutionPlan> = into_physical_plan(
+                let left = into_physical_plan(
                     &crossjoin.left,
                     registry,
                     runtime,
                     extension_codec,
                 )?;
-                let right: Arc<dyn ExecutionPlan> = into_physical_plan(
+                let right = into_physical_plan(
                     &crossjoin.right,
                     registry,
                     runtime,
@@ -1012,7 +1228,7 @@ impl AsExecutionPlan for PhysicalPlanNode {
                 Ok(Arc::new(PlaceholderRowExec::new(schema)))
             }
             PhysicalPlanType::Sort(sort) => {
-                let input: Arc<dyn ExecutionPlan> =
+                let input =
                     into_physical_plan(&sort.input, registry, runtime, extension_codec)?;
                 let exprs = sort
                     .expr
@@ -1046,12 +1262,8 @@ impl AsExecutionPlan for PhysicalPlanNode {
                             )
                         }
                     })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let fetch = if sort.fetch < 0 {
-                    None
-                } else {
-                    Some(sort.fetch as usize)
-                };
+                    .collect::<Result<_>>()?;
+                let fetch = (sort.fetch >= 0).then_some(sort.fetch as usize);
                 let new_sort = SortExec::new(exprs, input)
                     .with_fetch(fetch)
                     .with_preserve_partitioning(sort.preserve_partitioning);
@@ -1059,7 +1271,7 @@ impl AsExecutionPlan for PhysicalPlanNode {
                 Ok(Arc::new(new_sort))
             }
             PhysicalPlanType::SortPreservingMerge(sort) => {
-                let input: Arc<dyn ExecutionPlan> =
+                let input =
                     into_physical_plan(&sort.input, registry, runtime, extension_codec)?;
                 let exprs = sort
                     .expr
@@ -1093,12 +1305,8 @@ impl AsExecutionPlan for PhysicalPlanNode {
                             )
                         }
                     })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let fetch = if sort.fetch < 0 {
-                    None
-                } else {
-                    Some(sort.fetch as usize)
-                };
+                    .collect::<Result<_>>()?;
+                let fetch = (sort.fetch >= 0).then_some(sort.fetch as usize);
                 Ok(Arc::new(
                     SortPreservingMergeExec::new(exprs, input).with_fetch(fetch),
                 ))
@@ -1110,18 +1318,12 @@ impl AsExecutionPlan for PhysicalPlanNode {
                     .map(|i| i.try_into_physical_plan(registry, runtime, extension_codec))
                     .collect::<Result<_>>()?;
 
-                let extension_node = extension_codec.try_decode(
-                    extension.node.as_slice(),
-                    &inputs,
-                    registry,
-                )?;
-
-                Ok(extension_node)
+                extension_codec.try_decode(extension.node.as_slice(), &inputs, registry)
             }
             PhysicalPlanType::NestedLoopJoin(join) => {
-                let left: Arc<dyn ExecutionPlan> =
+                let left =
                     into_physical_plan(&join.left, registry, runtime, extension_codec)?;
-                let right: Arc<dyn ExecutionPlan> =
+                let right =
                     into_physical_plan(&join.right, registry, runtime, extension_codec)?;
                 let join_type =
                     protobuf::JoinType::try_from(join.join_type).map_err(|_| {
@@ -1160,21 +1362,17 @@ impl AsExecutionPlan for PhysicalPlanNode {
                                     side: side.into(),
                                 })
                             })
-                            .collect::<Result<Vec<_>>>()?;
+                            .collect::<Result<_>>()?;
 
                         Ok(JoinFilter::new(expression, column_indices, schema))
                     })
                     .map_or(Ok(None), |v: Result<JoinFilter>| v.map(Some))?;
 
-                Ok(Arc::new(NestedLoopJoinExec::try_new(
-                    left,
-                    right,
-                    filter,
-                    &join_type.into(),
-                )?))
+                NestedLoopJoinExec::try_new(left, right, filter, &join_type.into())
+                    .map(|e| Arc::new(e) as _)
             }
             PhysicalPlanType::Analyze(analyze) => {
-                let input: Arc<dyn ExecutionPlan> = into_physical_plan(
+                let input = into_physical_plan(
                     &analyze.input,
                     registry,
                     runtime,
@@ -1346,7 +1544,7 @@ impl AsExecutionPlan for PhysicalPlanNode {
                 exec.right().to_owned(),
                 extension_codec,
             )?;
-            let on: Vec<protobuf::JoinOn> = exec
+            let on = exec
                 .on()
                 .iter()
                 .map(|tuple| protobuf::JoinOn {
@@ -1564,6 +1762,15 @@ impl AsExecutionPlan for PhysicalPlanNode {
                 })
                 .collect::<Result<Vec<_>>>()?;
 
+            let working_mode = match exec.working_mode() {
+                SlidingWindowWorkingMode::Eager => {
+                    protobuf::SlidingWindowWorkingMode::Eager
+                }
+                SlidingWindowWorkingMode::Lazy => {
+                    protobuf::SlidingWindowWorkingMode::Lazy
+                }
+            };
+
             return Ok(protobuf::PhysicalPlanNode {
                 physical_plan_type: Some(PhysicalPlanType::SlidingHashJoin(Box::new(
                     protobuf::SlidingHashJoinExecNode {
@@ -1576,8 +1783,122 @@ impl AsExecutionPlan for PhysicalPlanNode {
                         filter: Some(filter),
                         left_sort_exprs,
                         right_sort_exprs,
+                        working_mode: working_mode.into(),
                     },
                 ))),
+            });
+        }
+        if let Some(exec) = plan.downcast_ref::<PartitionedHashJoinExec>() {
+            let left = protobuf::PhysicalPlanNode::try_from_physical_plan(
+                exec.left().to_owned(),
+                extension_codec,
+            )?;
+            let right = protobuf::PhysicalPlanNode::try_from_physical_plan(
+                exec.right().to_owned(),
+                extension_codec,
+            )?;
+            let on: Vec<protobuf::JoinOn> = exec
+                .on()
+                .iter()
+                .map(|tuple| protobuf::JoinOn {
+                    left: Some(protobuf::PhysicalColumn {
+                        name: tuple.0.name().to_string(),
+                        index: tuple.0.index() as u32,
+                    }),
+                    right: Some(protobuf::PhysicalColumn {
+                        name: tuple.1.name().to_string(),
+                        index: tuple.1.index() as u32,
+                    }),
+                })
+                .collect();
+            let join_type: protobuf::JoinType = exec.join_type().to_owned().into();
+            let f = exec.filter();
+            let expression = f.expression().to_owned().try_into()?;
+            let column_indices = f
+                .column_indices()
+                .iter()
+                .map(|i| {
+                    let side: protobuf::JoinSide = i.side.to_owned().into();
+                    protobuf::ColumnIndex {
+                        index: i.index as u32,
+                        side: side.into(),
+                    }
+                })
+                .collect();
+            let filter_schema = f.schema().try_into()?;
+            let filter = protobuf::JoinFilter {
+                expression: Some(expression),
+                column_indices,
+                schema: Some(filter_schema),
+            };
+            let partition_mode = match exec.partition_mode() {
+                StreamJoinPartitionMode::SinglePartition => {
+                    protobuf::StreamPartitionMode::SinglePartition
+                }
+                StreamJoinPartitionMode::Partitioned => {
+                    protobuf::StreamPartitionMode::PartitionedExec
+                }
+            };
+
+            let left_sort_exprs = exec
+                .left_sort_exprs()
+                .iter()
+                .map(|expr| {
+                    let sort_expr = Box::new(protobuf::PhysicalSortExprNode {
+                        expr: Some(Box::new(expr.expr.to_owned().try_into()?)),
+                        asc: !expr.options.descending,
+                        nulls_first: expr.options.nulls_first,
+                    });
+                    Ok(protobuf::PhysicalExprNode {
+                        expr_type: Some(protobuf::physical_expr_node::ExprType::Sort(
+                            sort_expr,
+                        )),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            let right_sort_exprs = exec
+                .right_sort_exprs()
+                .iter()
+                .map(|expr| {
+                    let sort_expr = Box::new(protobuf::PhysicalSortExprNode {
+                        expr: Some(Box::new(expr.expr.to_owned().try_into()?)),
+                        asc: !expr.options.descending,
+                        nulls_first: expr.options.nulls_first,
+                    });
+                    Ok(protobuf::PhysicalExprNode {
+                        expr_type: Some(protobuf::physical_expr_node::ExprType::Sort(
+                            sort_expr,
+                        )),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            let working_mode = match exec.working_mode() {
+                SlidingWindowWorkingMode::Eager => {
+                    protobuf::SlidingWindowWorkingMode::Eager
+                }
+                SlidingWindowWorkingMode::Lazy => {
+                    protobuf::SlidingWindowWorkingMode::Lazy
+                }
+            };
+
+            return Ok(protobuf::PhysicalPlanNode {
+                physical_plan_type: Some(PhysicalPlanType::PartitionedHashJoin(
+                    Box::new(protobuf::PartitionedHashJoinExecNode {
+                        left: Some(Box::new(left)),
+                        right: Some(Box::new(right)),
+                        on,
+                        join_type: join_type.into(),
+                        partition_mode: partition_mode.into(),
+                        null_equals_null: exec.null_equals_null(),
+                        filter: Some(filter),
+                        left_sort_exprs,
+                        right_sort_exprs,
+                        fetch_per_key: exec.fetch_per_key() as u32,
+                        working_mode: working_mode.into(),
+                    }),
+                )),
             });
         }
         if let Some(exec) = plan.downcast_ref::<SlidingNestedLoopJoinExec>() {
@@ -1644,6 +1965,15 @@ impl AsExecutionPlan for PhysicalPlanNode {
                 })
                 .collect::<Result<Vec<_>>>()?;
 
+            let working_mode = match exec.working_mode() {
+                SlidingWindowWorkingMode::Eager => {
+                    protobuf::SlidingWindowWorkingMode::Eager
+                }
+                SlidingWindowWorkingMode::Lazy => {
+                    protobuf::SlidingWindowWorkingMode::Lazy
+                }
+            };
+
             return Ok(protobuf::PhysicalPlanNode {
                 physical_plan_type: Some(PhysicalPlanType::SlidingNestedLoopJoin(
                     Box::new(protobuf::SlidingNestedLoopJoinExecNode {
@@ -1653,6 +1983,7 @@ impl AsExecutionPlan for PhysicalPlanNode {
                         filter: Some(filter),
                         left_sort_exprs,
                         right_sort_exprs,
+                        working_mode: working_mode.into(),
                     }),
                 )),
             });
@@ -1695,20 +2026,17 @@ impl AsExecutionPlan for PhysicalPlanNode {
                 .filter_expr()
                 .iter()
                 .map(|expr| expr.to_owned().try_into())
-                .collect::<Result<Vec<_>>>()?;
+                .collect::<Result<_>>()?;
 
             let agg = exec
                 .aggr_expr()
                 .iter()
                 .map(|expr| expr.to_owned().try_into())
-                .collect::<Result<Vec<_>>>()?;
+                .collect::<Result<_>>()?;
             let agg_names = exec
                 .aggr_expr()
                 .iter()
-                .map(|expr| match expr.field() {
-                    Ok(field) => Ok(field.name().clone()),
-                    Err(e) => Err(e),
-                })
+                .map(|expr| expr.field().map(|f| f.name().clone()))
                 .collect::<Result<_>>()?;
 
             let agg_mode = match exec.mode() {
@@ -1733,14 +2061,14 @@ impl AsExecutionPlan for PhysicalPlanNode {
                 .null_expr()
                 .iter()
                 .map(|expr| expr.0.to_owned().try_into())
-                .collect::<Result<Vec<_>>>()?;
+                .collect::<Result<_>>()?;
 
             let group_expr = exec
                 .group_expr()
                 .expr()
                 .iter()
                 .map(|expr| expr.0.to_owned().try_into())
-                .collect::<Result<Vec<_>>>()?;
+                .collect::<Result<_>>()?;
 
             return Ok(protobuf::PhysicalPlanNode {
                 physical_plan_type: Some(PhysicalPlanType::Aggregate(Box::new(
@@ -1869,7 +2197,7 @@ impl AsExecutionPlan for PhysicalPlanNode {
                         hash_expr: exprs
                             .iter()
                             .map(|expr| expr.clone().try_into())
-                            .collect::<Result<Vec<_>>>()?,
+                            .collect::<Result<_>>()?,
                         partition_count: *partition_count as u64,
                     })
                 }
@@ -2043,17 +2371,17 @@ impl AsExecutionPlan for PhysicalPlanNode {
                 extension_codec,
             )?;
 
-            let window_expr =
-                exec.window_expr()
-                    .iter()
-                    .map(|e| e.clone().try_into())
-                    .collect::<Result<Vec<protobuf::PhysicalWindowExprNode>>>()?;
+            let window_expr = exec
+                .window_expr()
+                .iter()
+                .map(|e| e.clone().try_into())
+                .collect::<Result<_>>()?;
 
             let partition_keys = exec
                 .partition_keys
                 .iter()
                 .map(|e| e.clone().try_into())
-                .collect::<Result<Vec<protobuf::PhysicalExprNode>>>()?;
+                .collect::<Result<_>>()?;
 
             return Ok(protobuf::PhysicalPlanNode {
                 physical_plan_type: Some(PhysicalPlanType::Window(Box::new(
@@ -2073,17 +2401,17 @@ impl AsExecutionPlan for PhysicalPlanNode {
                 extension_codec,
             )?;
 
-            let window_expr =
-                exec.window_expr()
-                    .iter()
-                    .map(|e| e.clone().try_into())
-                    .collect::<Result<Vec<protobuf::PhysicalWindowExprNode>>>()?;
+            let window_expr = exec
+                .window_expr()
+                .iter()
+                .map(|e| e.clone().try_into())
+                .collect::<Result<_>>()?;
 
             let partition_keys = exec
                 .partition_keys
                 .iter()
                 .map(|e| e.clone().try_into())
-                .collect::<Result<Vec<protobuf::PhysicalExprNode>>>()?;
+                .collect::<Result<_>>()?;
 
             let input_order_mode = match &exec.input_order_mode {
                 InputOrderMode::Linear => window_agg_exec_node::InputOrderMode::Linear(

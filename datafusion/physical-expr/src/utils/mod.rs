@@ -365,18 +365,13 @@ pub fn get_indices_of_matching_sort_exprs_with_order_eq(
 ) -> Option<(Vec<SortOptions>, Vec<usize>)> {
     let exprs = required_columns
         .iter()
-        .map(|col| Arc::new(col.clone()) as Arc<dyn PhysicalExpr>)
+        .map(|col| Arc::new(col.clone()) as _)
         .collect::<Vec<_>>();
     let (lex_ordering, indices) = equal_properties.find_longest_permutation(&exprs);
-    if indices.len() == required_columns.len() {
-        let sort_options = lex_ordering
-            .into_iter()
-            .map(|item| item.options)
-            .collect::<Vec<_>>();
-        Some((sort_options, indices))
-    } else {
-        None
-    }
+    (indices.len() == required_columns.len()).then(|| {
+        let sort_options = lex_ordering.into_iter().map(|item| item.options).collect();
+        (sort_options, indices)
+    })
 }
 
 /// Merge left and right sort expressions, checking for duplicates.

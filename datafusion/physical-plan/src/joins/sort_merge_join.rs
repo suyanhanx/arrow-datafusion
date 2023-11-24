@@ -33,8 +33,7 @@ use std::task::{Context, Poll};
 use crate::expressions::{Column, PhysicalSortExpr};
 use crate::joins::utils::{
     build_join_schema, calculate_join_output_ordering, check_join_is_valid,
-    estimate_join_statistics, partitioned_join_output_partitioning, swap_join_type,
-    swap_reverting_projection, JoinOn,
+    estimate_join_statistics, swap_join_type, swap_reverting_projection, JoinOn,
 };
 use crate::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
 use crate::{
@@ -55,6 +54,7 @@ use datafusion_execution::TaskContext;
 use datafusion_physical_expr::equivalence::join_equivalence_properties;
 use datafusion_physical_expr::{EquivalenceProperties, PhysicalSortRequirement};
 
+use crate::joins::sliding_window_join_utils::partitioned_join_output_partitioning;
 use crate::joins::HashJoinExec;
 use crate::projection::ProjectionExec;
 use futures::{Stream, StreamExt};

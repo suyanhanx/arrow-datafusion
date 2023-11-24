@@ -4,13 +4,12 @@
 use crate::joins::{
     stream_join_utils::{
         get_pruning_anti_indices, get_pruning_semi_indices, SortedFilterExpr,
+        StreamJoinStateResult,
     },
-    utils::{
-        append_right_indices, get_anti_indices, get_build_side_pruned_exprs,
-        get_filter_representation_of_build_side,
-        get_filter_representation_schema_of_build_side, get_semi_indices, JoinFilter,
-    },
+    utils,
+    utils::{append_right_indices, get_anti_indices, get_semi_indices, JoinFilter},
 };
+use std::task::Poll;
 
 use arrow_array::{
     builder::{PrimitiveBuilder, UInt32Builder, UInt64Builder},
@@ -18,13 +17,823 @@ use arrow_array::{
     ArrowPrimitiveType, NativeAdapter, PrimitiveArray, RecordBatch, UInt32Array,
     UInt64Array,
 };
+use arrow_schema::SchemaRef;
+use async_trait::async_trait;
 use datafusion_common::{DataFusionError, JoinSide, JoinType, Result, ScalarValue};
-use datafusion_physical_expr::{
-    intervals::{ExprIntervalGraph, Interval, IntervalBound},
-    PhysicalSortExpr,
-};
+use datafusion_execution::SendableRecordBatchStream;
+use datafusion_physical_expr::expressions::{Column, PhysicalSortExpr};
+use datafusion_physical_expr::intervals::{ExprIntervalGraph, Interval, IntervalBound};
+use futures::ready;
 
+use crate::joins::stream_join_utils::{
+    calculate_side_prune_length_helper, get_build_side_pruned_exprs,
+    get_filter_representation_of_join_side,
+    get_filter_representation_schema_of_build_side,
+};
+use crate::joins::symmetric_hash_join::StreamJoinMetrics;
+use crate::{handle_async_state, handle_state};
+use arrow::compute::concat_batches;
+use datafusion_physical_expr::Partitioning;
+use futures::{FutureExt, StreamExt};
 use hashbrown::HashSet;
+use std::{mem, usize};
+
+/// We use this buffer to keep track of the probe side pulling.
+pub struct ProbeBuffer {
+    /// The batch used for join operations.
+    pub(crate) current_batch: RecordBatch,
+    /// The batches buffered in `ProbePull` state.
+    pub(crate) candidate_buffer: Vec<RecordBatch>,
+    /// Join keys/columns.
+    pub(crate) on: Vec<Column>,
+}
+
+impl ProbeBuffer {
+    /// Creates a new `ProbeBuffer` with the given schema and join keys.
+    ///
+    /// # Arguments
+    ///
+    /// * `schema` - The schema of the input batches.
+    /// * `on` - A vector storing join columns.
+    ///
+    /// # Returns
+    ///
+    /// A new `ProbeBuffer`.
+    pub fn new(schema: SchemaRef, on: Vec<Column>) -> Self {
+        Self {
+            current_batch: RecordBatch::new_empty(schema),
+            candidate_buffer: vec![],
+            on,
+        }
+    }
+
+    /// Returns the size of this `ProbeBuffer` in bytes.
+    pub fn size(&self) -> usize {
+        let mut size = 0;
+        size += self.current_batch.get_array_memory_size();
+        size += std::mem::size_of_val(&self.on);
+        size
+    }
+}
+
+/// Represents a lazy join computation on two data streams.
+///
+/// The `LazyJoinStream` trait defines the core logic for a lazy join operation
+/// on two streams of record batches. In contrast to an eager join, which
+/// immediately computes the join for the provided data, a lazy join computes
+/// the join as batches are pulled from the input streams. This allows for potential
+/// optimizations, such as skipping batches that are not relevant for the join.
+///
+/// Implementing this trait requires defining various asynchronous methods
+/// representing different stages of the join process, such as pulling data from
+/// the probe and build sides, performing the join, and handling end-of-stream conditions.
+///
+/// ```text
+///              Build
+///            +---------+
+///            | a  | b  |        Probe
+///            |---------|       +-------+
+///            | 1  | a  |       | x | y |
+///            |    |    |       |-------|
+///            | 2  | b  |       | 3 | a |
+///            |    |    |       |   |   |
+///            | 3  | c  |       | 4 | v |
+///            |    |    |       |   |   |
+///            | 5  | c  |       | 5 | a |
+///            |    |    |       |   |   |
+///            | 6  | a  |       | 6 | x |
+///            |    |    |       |   |   |
+///            | 8  | a  |       +-------+
+///            |    |    |
+///            | 8  | d  |
+///            |    |    |
+///            | 10 | c  |
+///            |    |    |
+///            | 12 | y  |
+///            |    |    |
+///            +---------+
+///
+///  Join conditions: b = y AND a > x + 3 AND a < x + 8
+///
+///  These conditions imply a sliding window since left and right side tables
+///  are ordered according to columns `a` and `x`, respectively.
+///
+///  We use this information to partially materialize and prune the build side.
+///
+///              Build
+///            +---------+
+///            | a  | b  |        Probe
+///            |---------|       +-------+
+///            | 1  | a  |       | x | y |
+///            |    |    |      /|-------|
+///            | 2  | b  |    /  | 3 | a |
+///            |    |    |   /   |   |   |
+///            | 3  | c  | /     | 4 | v |
+///            |    |    |/      |   |   |
+///            | 5  | c  |       | 5 | a |
+///            |    |    |       |   |   |
+///            | 6  | a  |       | 6 | x |
+///            |    |    |       |   |   |
+///            | 8  | a  |      |+-------+
+///            |    |    |      /
+///            | 8  | d  |     |
+///            |    |    |     /
+///            | 10 | c  |    |
+///            |    |    |    /
+///            | 12 | y  |   |
+///            |    |    |   /
+///            +---------+  |
+///                         / Joinable range
+///                        |
+///                        |
+///            -------------
+///
+///
+///  Probe side requires data from the build side as long as `a` satisfies
+///  a < 6 + 8 = 14. Thus, we should fetch the build side until we see a value
+///  in column `a` greater than 14. This is how we guarantee that we can match
+///  and emit probe side data with all possible rows from the build side.
+/// ```
+///
+/// # Methods
+///
+/// * `fetch_and_process_next_from_probe_stream`: Asynchronously handles pulling
+///   data from the probe stream.
+/// * `fetch_and_process_build_batches_by_interval`: Asynchronously handles pulling
+///   data from the build stream, given a certain interval of interest.
+/// * `process_join_operation`: Asynchronously performs the join operation on the
+///   current batches.
+/// * `handle_left_stream_end`: Asynchronously handles the situation when the build
+///   stream is exhausted.
+/// * `process_probe_stream_end`: Asynchronously handles the situation when the probe
+///   stream is exhausted.
+/// * `process_batches_before_finalization`: Asynchronously handles the situation when
+///   both streams are exhausted.
+/// * `poll_next_impl`: Continuously polls the next record batch based on the current
+///   state of the join.
+///
+/// Additionally, various helper methods provide access to internal attributes,
+/// metrics, and state management.
+///
+/// # Async Traits
+///
+/// This trait makes use of the `async_trait` attribute to allow asynchronous method definitions.
+#[async_trait]
+pub trait LazyJoinStream {
+    /// Asynchronously pulls the next batch from the right (probe) stream.
+    ///
+    /// This default implementation repeatedly polls the probe stream until it finds a suitable batch for interval
+    /// calculation. If no batches are found, the state is set to `ProbeExhausted`.
+    ///
+    /// # Returns
+    ///
+    /// * `Result<StreamJoinStateResult<Option<RecordBatch>>>` - The state result after processing the probe batch.
+    async fn fetch_and_process_next_from_probe_stream(
+        &mut self,
+    ) -> Result<StreamJoinStateResult<Option<RecordBatch>>> {
+        let mut continue_polling = true;
+        while continue_polling {
+            match self.mut_probe_stream().next().await {
+                Some(Ok(batch)) => {
+                    // Update metrics for polled batch:
+                    self.metrics().right.input_batches.add(1);
+                    self.metrics().right.input_rows.add(batch.num_rows());
+                    // Check if the batch meets interval calculation criteria:
+                    continue_polling = !is_batch_suitable_interval_calculation(
+                        self.filter(),
+                        self.probe_sorted_filter_expr(),
+                        &batch,
+                        JoinSide::Right,
+                    )?;
+                    // Add the batch into the candidate buffer:
+                    self.probe_buffer().candidate_buffer.push(batch);
+                }
+                Some(Err(e)) => return Err(e),
+                None => break,
+            }
+        }
+
+        if self.probe_buffer().candidate_buffer.is_empty() {
+            // If no batches were collected, change state to "ProbeExhausted":
+            self.set_state(LazyJoinStreamState::ProbeExhausted);
+            return Ok(StreamJoinStateResult::Continue);
+        }
+
+        // Get probe batch by joining all the collected batches:
+        self.probe_buffer().current_batch =
+            get_probe_batch(std::mem::take(&mut self.probe_buffer().candidate_buffer))?;
+
+        if self.probe_buffer().current_batch.num_rows() == 0 {
+            return Ok(StreamJoinStateResult::Continue);
+        }
+
+        // Calculate the necessary build side interval with probe RecordBatch
+        let interval = self.calculate_the_necessary_build_side_range()?;
+        // Update state to "PullBuild" with the calculated interval:
+        self.set_state(LazyJoinStreamState::PullBuild { interval });
+        Ok(StreamJoinStateResult::Continue)
+    }
+
+    /// Asynchronously pulls batches from the build stream based on the given
+    /// interval.
+    ///
+    /// Polls the build stream for batches that fit the specified interval. Once
+    /// the suitable buffer is reached, the state transitions to `Join`.
+    ///
+    /// If there are no additional batches arriving on the left side, it becomes safe to proceed
+    /// with the join operation. Furthermore, the probe batch can be safely discarded
+    /// after the operation because it will no longer encounter any rows from the build side.
+    ///
+    /// # Parameters
+    ///
+    /// * `interval: Vec<(PhysicalSortExpr, Interval)>` - The specified interval for
+    ///   the build batches.
+    ///
+    /// # Returns
+    ///
+    /// * `Result<StreamJoinStateResult<Option<RecordBatch>>>` - The state result after processing
+    ///    the build batch.
+    async fn fetch_and_process_build_batches_by_interval(
+        &mut self,
+        interval: Vec<(PhysicalSortExpr, Interval)>,
+    ) -> Result<StreamJoinStateResult<Option<RecordBatch>>> {
+        loop {
+            // Poll the build stream for a batch.
+            match self.mut_build_stream().next().await {
+                Some(Ok(batch)) => {
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    self.metrics().left.input_batches.add(1);
+                    self.metrics().left.input_rows.add(batch.num_rows());
+                    // Update the internal state using this batch.
+                    self.update_build_buffer(&batch)?;
+                    // Check if the batch meets the interval criteria.
+                    if !check_if_sliding_window_condition_is_met(
+                        self.filter(),
+                        &batch,
+                        &interval,
+                    )? {
+                        continue;
+                    }
+                }
+                Some(Err(e)) => return Err(e),
+                None => {}
+            }
+            // If interval criteria are met or we exhaust the stream, switch
+            // state and break the loop:
+            self.set_state(LazyJoinStreamState::Join);
+            break;
+        }
+        Ok(StreamJoinStateResult::Continue)
+    }
+
+    /// Performs the actual join of probe and build batches and handles state
+    /// management.
+    ///
+    /// # Returns
+    ///
+    /// * `Result<StreamJoinStateResult<Option<RecordBatch>>>` - The result after performing the join.
+    fn handle_join_operation(
+        &mut self,
+    ) -> Result<StreamJoinStateResult<Option<RecordBatch>>> {
+        let result = self.process_join_operation();
+        self.set_state(LazyJoinStreamState::PullProbe);
+        result
+    }
+
+    /// Performs the actual join of current probe batch and suitable build buffer. The exact joining
+    /// mechanism should be defined in this method.
+    ///
+    /// # Returns
+    ///
+    /// * `Result<StreamJoinStateResult<Option<RecordBatch>>>` - The result after performing the join.
+    fn process_join_operation(
+        &mut self,
+    ) -> Result<StreamJoinStateResult<Option<RecordBatch>>>;
+
+    /// Asynchronously handles the scenario when the right stream is exhausted.
+    ///
+    /// In this default implementation, when the right stream is exhausted, it
+    /// attempts to pull from the left stream. If a batch is found in the left
+    /// stream, it delegates the handling to `process_batch_after_right_end`.
+    /// If both streams are exhausted, the state is set to indicate both streams
+    /// are exhausted without final results yet.
+    ///
+    /// # Returns
+    ///
+    /// * `Result<StreamJoinStateResult<Option<RecordBatch>>>` - The state result after checking
+    ///   the exhaustion state.
+    async fn handle_probe_stream_end(
+        &mut self,
+    ) -> Result<StreamJoinStateResult<Option<RecordBatch>>> {
+        // Ready the left stream and match its states.
+        match self.mut_build_stream().next().await {
+            // If the poll returns some batch of data:
+            Some(Ok(batch)) => self.process_probe_stream_end(&batch),
+            Some(Err(e)) => Err(e),
+            // If the poll doesn't return any data, update the state
+            // to indicate both streams are exhausted:
+            None => {
+                self.set_state(LazyJoinStreamState::BothExhausted {
+                    final_result: false,
+                });
+                Ok(StreamJoinStateResult::Continue)
+            }
+        }
+    }
+
+    /// Handles scenarios when the probe stream runs out of batches.
+    ///
+    /// This method addresses cases when all batches from the probe stream have
+    /// been processed. It determines the next steps, either transitioning to a
+    /// new state or triggering post-processing actions.
+    ///
+    /// # Returns
+    ///
+    /// * `Result<StreamJoinStateResult<Option<RecordBatch>>>` - The state result after
+    ///   handling the exhaustion of the probe stream.
+    fn process_probe_stream_end(
+        &mut self,
+        left_batch: &RecordBatch,
+    ) -> Result<StreamJoinStateResult<Option<RecordBatch>>>;
+
+    /// Handles the state when both streams are exhausted and final results are
+    /// yet to be produced.
+    ///
+    /// This default implementation switches the state to indicate both streams
+    /// are exhausted with final results and then invokes the handling for this
+    /// specific scenario via `process_batches_before_finalization`.
+    ///
+    /// # Returns
+    ///
+    /// * `Result<StreamJoinStateResult<Option<RecordBatch>>>` - The state result after both
+    ///   streams are exhausted.
+    fn prepare_for_final_results_after_exhaustion(
+        &mut self,
+    ) -> Result<StreamJoinStateResult<Option<RecordBatch>>> {
+        self.set_state(LazyJoinStreamState::BothExhausted { final_result: true });
+        self.process_batches_before_finalization()
+    }
+
+    /// Prepares the stream for delivering final results after both streams are
+    /// exhausted. Once both streams have been fully processed, this method
+    /// ensures that any remaining results are prepared and delivered in the
+    /// correct order, marking the end of the join process.
+    ///
+    /// # Parameters
+    ///
+    /// * `final_result: bool` - Indicates whether the stream has fully finished
+    ///   processing or if more results may come.
+    ///
+    /// # Returns
+    ///
+    /// * `Result<StreamJoinStateResult<Option<RecordBatch>>>` - The state result containing
+    ///   the final results or indicating continuation.
+    fn process_batches_before_finalization(
+        &mut self,
+    ) -> Result<StreamJoinStateResult<Option<RecordBatch>>>;
+
+    fn poll_next_impl(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Result<RecordBatch>>>
+    where
+        Self: Send,
+    {
+        loop {
+            return match self.state() {
+                LazyJoinStreamState::PullProbe => {
+                    handle_async_state!(
+                        self.fetch_and_process_next_from_probe_stream(),
+                        cx
+                    )
+                }
+                LazyJoinStreamState::PullBuild { interval } => {
+                    handle_async_state!(
+                        self.fetch_and_process_build_batches_by_interval(interval),
+                        cx
+                    )
+                }
+                LazyJoinStreamState::ProbeExhausted => {
+                    handle_async_state!(self.handle_probe_stream_end(), cx)
+                }
+                LazyJoinStreamState::Join => {
+                    handle_state!(self.handle_join_operation())
+                }
+                LazyJoinStreamState::BothExhausted {
+                    final_result: false,
+                } => {
+                    handle_state!(self.prepare_for_final_results_after_exhaustion())
+                }
+                LazyJoinStreamState::BothExhausted { final_result: true } => {
+                    Poll::Ready(None)
+                }
+            };
+        }
+    }
+
+    /// Returns a mutable reference to the probe stream.
+    fn mut_probe_stream(&mut self) -> &mut SendableRecordBatchStream;
+
+    /// Returns a mutable reference to the build stream.
+    fn mut_build_stream(&mut self) -> &mut SendableRecordBatchStream;
+
+    /// Returns a mutable reference to the stream metrics.
+    fn metrics(&mut self) -> &mut StreamJoinMetrics;
+
+    /// Returns the filter used for join operations.
+    fn filter(&self) -> &JoinFilter;
+
+    /// Returns a mutable reference to the sorted filter expression for the build side.
+    fn mut_build_sorted_filter_expr(&mut self) -> &mut [SortedFilterExpr];
+
+    /// Returns a mutable reference to the sorted filter expression for the probe side.
+    fn mut_probe_sorted_filter_expr(&mut self) -> &mut [SortedFilterExpr];
+
+    /// Returns a reference to the sorted filter expression for the build side.
+    fn build_sorted_filter_expr(&self) -> &[SortedFilterExpr];
+
+    /// Returns a reference to the sorted filter expression for the probe side.
+    fn probe_sorted_filter_expr(&self) -> &[SortedFilterExpr];
+
+    /// Returns a mutable reference to the probe buffer.
+    fn probe_buffer(&mut self) -> &mut ProbeBuffer;
+
+    /// Sets the current state of the join stream.
+    fn set_state(&mut self, state: LazyJoinStreamState);
+
+    /// Returns the current state of the join stream.
+    fn state(&self) -> LazyJoinStreamState;
+
+    /// Updates the build internal state based on a new batch.
+    fn update_build_buffer(&mut self, batch: &RecordBatch) -> Result<()>;
+
+    /// Calculates the necessary range for the build side based on the current probe buffer.
+    fn calculate_the_necessary_build_side_range(
+        &mut self,
+    ) -> Result<Vec<(PhysicalSortExpr, Interval)>>;
+}
+
+/// `EagerWindowJoinOperations` provides methods for efficiently handling join
+/// operations using a sliding window mechanism. This trait encapsulates methods
+/// for both the build side (i.e., the side on which we maintain a buffer of data)
+/// and the probe side (i.e., the side from which we pull data to match against
+/// the build side).
+///
+/// The trait is designed with an eager approach in mind, meaning that it attempts
+/// to join data as soon as possible rather than waiting for certain conditions
+/// to hold.
+///
+/// ```text
+/// The buffering works like this:
+///
+///    Build             Probe
+///  +---------+       +--------+
+///  | a  | b  |       | x | y  |
+///  |---------|       |---|----|
+///  | 4  | a  |       | 1 | a  |
+///  |    |    |       |   |    |
+///  | 4  | b  |       | 1 | b  |
+///  |    |    |       |   |    |
+///  | 5  | c  |       | 2 | v  |
+///  |    |    |       |   |    |
+///  | 6  | c  |       | 3 | a  |
+///  |    |    |       |   |    |
+///  | 6  | a  |       | 5 | g  |
+///  |    |    |       |   |    |
+///  | 8  | a  |       | 6 | h  |
+///  |    |    |       |   |    |
+///  | 8  | d  |       | 7 | a  |
+///  |    |    |       |   |    |
+///  | 10 | c  |       | 7 | g  |
+///  |    |    |       |   |    |
+///  | 12 | y  |       | 8 | s  |
+///  |    |    |       |   |    |
+///  +---------+       +--------+
+///
+///  Join conditions: b = y AND a > x - 8 AND a < x + 8
+///
+///  These conditions imply a sliding window since left and right side tables
+///  are ordered according to columns `a` and `x`, respectively.
+///
+///  We use this information to select rows and join only once, thus maintaining
+///  the probe side order.
+///
+///    Build             Probe
+///   +---------+       +--------+
+///   | a  | b  |       | x | y  |
+///   |---------|       |---|----|
+///   | 4  | a  |       | 1 | a  |
+///   |    |    |       |   |    |
+///   | 4  | b  |       | 1 | b  |
+///   |    |    |       |   |    | Not joinable
+///   | 5  | c  |       | 2 | v  | for subsequent
+///   |    |    |       |   |    | build data
+///   | 6  | c  |       | 3 | a  | ---------------
+///   |    |    |      ||   |    |               |
+///   | 6  | a  |     / | 5 | g  |               |
+///   |    |    |     | |   |    |               |
+///   | 8  | a  |    /  | 6 | h  |               |
+///   |    |    |    |  |   |    |               |
+///   | 8  | d  |   /   | 7 | a  |               |
+///   |    |    |   |   |   |    |               |
+///   | 10 | c  |  /    | 7 | g  |               |
+///   |    |    |  |    |   |    |               |
+///   | 12 | y  | /     | 8 | s  |               |
+///   |    |    | |     |   |    |               |
+///   +---------+/      +--------+               |
+///        |                                     |
+///        |                       Joinable      |
+///        |                       for subsequent|
+///        |                       build data    |
+///      \ | /                                   |
+///       -|-                     ---------------+
+///
+/// For the first 4 probe rows will not be joinable for upcoming build rows. Thus, we can
+/// use them in join for current buffer and remove them. We can ensure that these rows joined
+/// only once, thus the order of the join output preserved.
+///
+///     Build             Probe
+///   +---------+       +--------+
+///   | a  | b  |       | x | y  |
+///   |---------|       |--------|
+///   | 4  | a  |       | 1 | a  |
+///   |    |    |       |   |    |
+///   | 4  | b  |       | 1 | b  |
+///   |    |    |       |   |    |
+///   | 5  | c  |       | 2 | v  |
+///   |    |    |       |   |    |
+///   | 6  | c  |       | 3 | a  |
+///   |    |    |       |   |    |
+///   | 6  | a  |       +--------+
+///   |    |    |
+///   | 8  | a  |
+///   |    |    |       We utilize this segment of
+///   | 8  | d  |       the probe side for
+///   |    |    |       the join operation
+///   | 10 | c  |       and then discard it.
+///   |    |    |
+///   | 12 | y  |
+///   |    |    |
+///   +---------+
+///
+/// ```
+///
+/// Implementers of this trait are expected to manage the internal buffers of both join sides
+/// and facilitate the join process based on the methods provided here.
+///
+/// Key functionalities include:
+/// - Updating the build side's buffer with new batches of data.
+/// - Determining which probe side batches can be joined with the build side.
+/// - Executing the join operation.
+/// - Handling data streams from both the left and right side.
+///
+/// Implementations should ensure that they manage memory efficiently and handle potential join
+/// edge cases (like non-matching rows) appropriately.
+pub trait EagerWindowJoinOperations {
+    /// Updates the internal build side buffer with the provided batch.
+    ///
+    /// # Arguments
+    ///
+    /// * `batch` - The `RecordBatch` that will be added to the build side buffer.
+    ///
+    /// # Returns
+    ///
+    /// * `Result<()>` - Returns a `Result` indicating the success or failure of the operation.
+    fn update_build_buffer_with_batch(&mut self, batch: RecordBatch) -> Result<()>;
+
+    /// Joins the provided `identify_joinable_probe_batch` with the current build side buffer.
+    ///
+    /// # Arguments
+    ///
+    /// * `joinable_probe_batch` - A `RecordBatch` from the probe side that is joinable with the build side.
+    ///
+    /// # Returns
+    ///
+    /// * `Result<Option<RecordBatch>>` - Returns the joined `RecordBatch` or `None` if no joinable records are found.
+    fn join_using_joinable_probe_batch(
+        &mut self,
+        joinable_probe_batch: RecordBatch,
+    ) -> Result<Option<RecordBatch>>;
+
+    /// Identifies a batch from the probe side that can be joined with the build side.
+    ///
+    /// # Returns
+    ///
+    /// * `Result<Option<RecordBatch>>` - Returns the joinable `RecordBatch` from the probe side or `None` if no joinable batch is found.
+    fn identify_joinable_probe_batch(&mut self) -> Result<Option<RecordBatch>>;
+
+    /// Provides mutable access to the probe buffer.
+    ///
+    /// # Returns
+    ///
+    /// * `&mut ProbeBuffer` - Returns a mutable reference to the probe buffer.
+    fn get_mutable_probe_buffer(&mut self) -> &mut ProbeBuffer;
+
+    /// Handles a batch from the left (build) stream and attempts to pull and join with data from the probe side.
+    ///
+    /// This function is critical in managing batches from the left stream, updating the build buffer with new data,
+    /// identifying joinable batches from the probe side, and subsequently performing the join operation.
+    ///
+    /// # Arguments
+    ///
+    /// * `batch`: The `RecordBatch` from the left (build) stream to be processed.
+    ///
+    /// # Returns
+    ///
+    /// * `Result<StreamJoinStateResult<Option<RecordBatch>>>`: A result wrapping the state result. This can be:
+    ///     - `StreamJoinStateResult::Ready(Some(batch))`: If there is a resultant batch from the join operation.
+    ///     - `StreamJoinStateResult::Continue`: If there is no resultant batch, but the operation was successful.
+    ///     - An `Err` variant: If any error occurs during the process.
+    ///
+    /// # Description
+    ///
+    /// The function starts by updating the build buffer with the incoming batch from the left stream using
+    /// `update_build_buffer_with_batch`. This is essential to maintain an up-to-date state of the build side for future join operations.
+    ///
+    /// Next, it attempts to identify a joinable batch from the probe side using `identify_joinable_probe_batch`. If a joinable
+    /// batch is found, it proceeds to join this batch with the current state of the build buffer using `join_using_joinable_probe_batch`.
+    ///
+    /// The function returns `StreamJoinStateResult::Continue` if no joinable batch is identified, signaling the caller to continue pulling
+    /// more batches.
+    ///
+    /// If a join is performed, the function checks if the result is a non-empty batch. If so, it returns `StreamJoinStateResult::Ready(Some(batch))`,
+    /// wrapping the resultant batch. If the join result is empty, it returns `StreamJoinStateResult::Continue`, signaling that the join was
+    /// successful but did not produce any output rows.
+    ///
+    /// This function ensures that the join operation is consistently applied to batches from the left stream as they arrive,
+    /// facilitating real-time processing of streaming data in a join operation.
+    fn handle_left_stream_batch_pull(
+        &mut self,
+        batch: RecordBatch,
+    ) -> Result<StreamJoinStateResult<Option<RecordBatch>>> {
+        // Incorporating the new batch from the build side into the current state.
+        self.update_build_buffer_with_batch(batch)?;
+
+        // Attempting to identify a batch from the probe side that is ready to be joined.
+        let result = if let Some(batch) = self.identify_joinable_probe_batch()? {
+            self.join_using_joinable_probe_batch(batch)?
+        } else {
+            return Ok(StreamJoinStateResult::Continue);
+        };
+
+        // Producing the final join result based on the outcome of the previous operations.
+        if result.is_some() {
+            Ok(StreamJoinStateResult::Ready(result))
+        } else {
+            Ok(StreamJoinStateResult::Continue)
+        }
+    }
+
+    /// Helper method to handle data pulled from the right side stream.
+    ///
+    /// # Arguments
+    ///
+    /// * `batch` - The `RecordBatch` that has been pulled from the right side stream.
+    ///
+    /// # Returns
+    ///
+    /// * `Result<()>` - Returns a `Result` indicating the success or failure of the operation.
+    fn handle_right_stream_batch_pull(
+        &mut self,
+        batch: RecordBatch,
+    ) -> Result<StreamJoinStateResult<Option<RecordBatch>>> {
+        let schema = self.get_mutable_probe_buffer().current_batch.schema();
+        self.get_mutable_probe_buffer().current_batch = concat_batches(
+            &schema,
+            vec![&self.get_mutable_probe_buffer().current_batch, &batch],
+        )?;
+        Ok(StreamJoinStateResult::Continue)
+    }
+
+    /// Handles the scenario when the left (build) stream is exhausted, and there is more batchs from the right (probe) stream available.
+    ///
+    /// This function plays a crucial role in ensuring that all remaining joinable data is processed correctly once we know
+    /// there will be no more data coming from the left stream. It takes a batch from the right stream as an input
+    /// and performs the necessary join operations to produce the results.
+    ///
+    /// # Arguments
+    ///
+    /// * `right_batch`: The `RecordBatch` from the right (probe) stream to be processed.
+    ///
+    /// # Returns
+    ///
+    /// * `Result<StreamJoinStateResult<Option<RecordBatch>>>`: A result wrapping the state result. This can be:
+    ///     - `StreamJoinStateResult::Ready(Some(batch))`: If there is a resultant batch from the join operation.
+    ///     - `StreamJoinStateResult::Continue`: If there is no resultant batch, but the operation was successful, indicating
+    ///       continue on the stream.
+    ///     - An `Err` variant: If any error occurs during the process.
+    ///
+    /// # Description
+    ///
+    /// This function checks if there are any remaining rows in the probe side buffer. If the buffer is empty, it directly
+    /// proceeds to join the `right_batch`. If the buffer is not empty, it implies that there are some leftover rows from
+    /// previous batches that need to be joined with the build side before proceeding. In this case, it concatenates the
+    /// leftover rows in the buffer with the `right_batch` and then performs the join operation.
+    ///
+    /// This ensures that all rows are accounted for in the join operation, providing accurate and complete results even
+    /// when the build side is exhausted. The buffer is then emptied as it is no longer needed, transforming the scenario
+    /// into a typical hash join operation for any subsequent batches.
+    fn handle_left_stream_end(
+        &mut self,
+        right_batch: RecordBatch,
+    ) -> Result<StreamJoinStateResult<Option<RecordBatch>>> {
+        let batch = if self.get_mutable_probe_buffer().current_batch.num_rows() == 0 {
+            right_batch
+        } else {
+            // Since there will be no more new data from the build side, we can safely join each
+            // incoming probe batch. It becomes similar to a typical HashJoinStream at this point.
+            // Therefore, we empty the buffer as it is no longer needed.
+            let schema = self.get_mutable_probe_buffer().current_batch.schema();
+            let buffer = mem::replace(
+                &mut self.get_mutable_probe_buffer().current_batch,
+                RecordBatch::new_empty(schema.clone()),
+            );
+            concat_batches(&schema, [&buffer, &right_batch])?
+        };
+        let result = self.join_using_joinable_probe_batch(batch)?;
+        if result.is_some() {
+            Ok(StreamJoinStateResult::Ready(result))
+        } else {
+            Ok(StreamJoinStateResult::Continue)
+        }
+    }
+
+    /// Config method for minimum probe row count to increase the vectorized operations.
+    ///
+    /// # Returns
+    ///
+    /// * `usize` - Number of the minimum probe row to join.
+    fn minimum_probe_row_count(&self) -> usize;
+}
+
+/// This function helps finding non-matching rows of probe buffer with the incoming build stream,
+/// so we can join these rows with the current build buffer and then delete it.
+/// It takes in a batch of rows from the build side of the join, a buffer for the probe side,
+/// as well as various expressions and parameters required for filtering and pruning.
+///
+/// # Arguments
+///
+/// * `build_buffer_batch`: A `RecordBatch` representing a batch of rows from the build side of the join.
+/// * `probe_buffer`: A mutable reference to a `ProbeBuffer` which holds the state and data of the probe side.
+/// * `join_filter`: A reference to a `JoinFilter`, containing the filtering criteria for the join.
+/// * `interval_graph`: A mutable reference to an `ExprIntervalGraph`, used for optimizing filter expressions.
+/// * `build_filter_exprs`: A mutable slice of `SortedFilterExpr` for the build side, used for filtering and sorting.
+/// * `probe_filter_exprs`: A mutable slice of `SortedFilterExpr` for the probe side, used for filtering and sorting.
+/// * `minimum_probe_row_count`: The minimum number of rows that should be present in the probe side buffer for the join to be performed.
+///
+/// # Returns
+///
+/// This function returns a `Result` wrapping an `Option<RecordBatch>`.
+/// * If the number of pruned rows on the probe side is less than `minimum_probe_row_count`, it returns `Ok(None)`, indicating that the join should not proceed yet.
+/// * If the pruning is successful and there are enough rows to perform the join, it returns `Ok(Some(RecordBatch))` with the pruned rows.
+/// * If there is any error during the process, it returns an `Err`.
+///
+/// # Description
+///
+/// The function first calculates the length of the probe side that can be pruned based on the
+/// join conditions, filter expressions, and the current state of the build and probe buffers.
+/// This is done using the `calculate_side_prune_length_helper` function. If the number of prunable
+/// rows is less than `minimum_probe_row_count`, the function returns early with `Ok(None)`,
+/// indicating that the join should be delayed.
+///
+/// If there are enough prunable rows, it slices the current probe batch to separate the joinable
+/// rows from the rest. The joinable rows are returned, and the remaining rows are kept in the
+/// probe buffer for future processing.
+///
+/// This helps in reducing the amount of data that needs to be processed in later stages of the
+/// join, potentially leading to performance improvements.
+pub fn joinable_probe_batch_helper(
+    build_buffer_batch: &RecordBatch,
+    probe_buffer: &mut ProbeBuffer,
+    join_filter: &JoinFilter,
+    interval_graph: &mut ExprIntervalGraph,
+    build_filter_exprs: &mut [SortedFilterExpr],
+    probe_filter_exprs: &mut [SortedFilterExpr],
+    minimum_probe_row_count: usize,
+) -> Result<Option<RecordBatch>> {
+    // Calculate the equality results
+    let probe_prune_length = calculate_side_prune_length_helper(
+        join_filter,
+        interval_graph,
+        build_buffer_batch,
+        &probe_buffer.current_batch,
+        probe_filter_exprs,
+        build_filter_exprs,
+        JoinSide::Right,
+    )?;
+
+    if probe_prune_length < minimum_probe_row_count {
+        return Ok(None);
+    }
+    let joinable_probe_batch = probe_buffer.current_batch.slice(0, probe_prune_length);
+    probe_buffer.current_batch = probe_buffer.current_batch.slice(
+        probe_prune_length,
+        probe_buffer.current_batch.num_rows() - probe_prune_length,
+    );
+    Ok(Some(joinable_probe_batch))
+}
 
 /// Determines if the given batch is suitable for interval calculations based on the join
 /// filter and sorted filter expressions.
@@ -53,7 +862,7 @@ pub fn is_batch_suitable_interval_calculation(
         return Ok(false);
     }
 
-    let intermediate_batch = get_filter_representation_of_build_side(
+    let intermediate_batch = get_filter_representation_of_join_side(
         filter.schema(),
         &batch.slice(batch.num_rows() - 1, 1),
         filter.column_indices(),
@@ -97,7 +906,7 @@ pub fn is_batch_suitable_interval_calculation(
 /// * A vector of tuples containing the physical sort expression and its associated interval
 ///   for the build side. These tuples represent the range in which join pruning can occur
 ///   for each expression.
-pub fn calculate_the_necessary_build_side_range(
+pub fn calculate_the_necessary_build_side_range_helper(
     filter: &JoinFilter,
     build_inner_buffer: &RecordBatch,
     graph: &mut ExprIntervalGraph,
@@ -105,6 +914,7 @@ pub fn calculate_the_necessary_build_side_range(
     probe_sorted_filter_exprs: &mut [SortedFilterExpr],
     probe_batch: &RecordBatch,
 ) -> Result<Vec<(PhysicalSortExpr, Interval)>> {
+    let build_side = JoinSide::Left;
     // Calculate the interval for the build side filter expression (if present):
     update_filter_expr_bounds(
         filter,
@@ -112,7 +922,7 @@ pub fn calculate_the_necessary_build_side_range(
         build_sorted_filter_exprs,
         probe_batch,
         probe_sorted_filter_exprs,
-        JoinSide::Right,
+        build_side.negate(),
     )?;
 
     let mut filter_intervals = build_sorted_filter_exprs
@@ -132,13 +942,13 @@ pub fn calculate_the_necessary_build_side_range(
     let intermediate_schema = get_filter_representation_schema_of_build_side(
         filter.schema(),
         filter.column_indices(),
-        JoinSide::Left,
+        build_side,
     )?;
 
     // Filter expressions that can shrink.
     let shrunk_exprs = graph.get_deepest_pruning_exprs()?;
     // Get only build side filter expressions
-    get_build_side_pruned_exprs(shrunk_exprs, intermediate_schema, filter, JoinSide::Left)
+    get_build_side_pruned_exprs(shrunk_exprs, intermediate_schema, filter, build_side)
 }
 
 /// Checks if the sliding window condition is met for the join operation.
@@ -162,7 +972,7 @@ pub fn check_if_sliding_window_condition_is_met(
     incoming_build_batch: &RecordBatch,
     intervals: &[(PhysicalSortExpr, Interval)], // interval in the build side against which we are checking
 ) -> Result<bool> {
-    let latest_build_intermediate_batch = get_filter_representation_of_build_side(
+    let latest_build_intermediate_batch = get_filter_representation_of_join_side(
         filter.schema(),
         &incoming_build_batch.slice(incoming_build_batch.num_rows() - 1, 1),
         filter.column_indices(),
@@ -213,7 +1023,7 @@ pub fn get_probe_batch(mut batches: Vec<RecordBatch>) -> Result<RecordBatch> {
         batches.remove(0)
     } else {
         let schema = batches[0].schema();
-        arrow::compute::concat_batches(&schema, &batches)?
+        concat_batches(&schema, &batches)?
     };
     Ok(probe_batch)
 }
@@ -444,7 +1254,8 @@ where
 /// in throughout its execution. Depending on its current state, the join
 /// operation will perform different actions such as pulling data from the build
 /// side or the probe side, or performing the join itself.
-pub enum JoinStreamState {
+#[derive(Clone)]
+pub enum LazyJoinStreamState {
     /// The action is to pull data from the probe side (right stream).
     /// This state continues to pull data until the probe batches are suitable
     /// for interval calculations, or the probe stream is exhausted.
@@ -460,9 +1271,6 @@ pub enum JoinStreamState {
     /// will be ready and its results will be processed until the build stream
     /// is also exhausted.
     ProbeExhausted,
-    /// The build side is completely processed. In this state, the join operation
-    /// will switch to the "Join" state to perform the final join operation.
-    BuildExhausted,
     /// Both the build and probe sides have been completely processed.
     /// If `final_result` is `false`, a final result may still be produced from
     /// the build side. Otherwise, the join operation is complete.
@@ -507,14 +1315,14 @@ pub(crate) fn update_filter_expr_bounds(
             sorted_filter_expr.set_interval(null_interval.clone());
         });
 
-    let first_probe_intermediate_batch = get_filter_representation_of_build_side(
+    let first_probe_intermediate_batch = get_filter_representation_of_join_side(
         filter.schema(),
         &probe_batch.slice(0, 1),
         filter.column_indices(),
         probe_side,
     )?;
 
-    let last_probe_intermediate_batch = get_filter_representation_of_build_side(
+    let last_probe_intermediate_batch = get_filter_representation_of_join_side(
         filter.schema(),
         &probe_batch.slice(probe_batch.num_rows() - 1, 1),
         filter.column_indices(),
@@ -596,5 +1404,26 @@ mod tests {
 
         assert_eq!(new_left_indices, expected_left_indices);
         assert_eq!(new_right_indices, expected_right_indices);
+    }
+}
+
+/// Calculate the OutputPartitioning for Partitioned Join
+pub fn partitioned_join_output_partitioning(
+    join_type: JoinType,
+    left_partitioning: Partitioning,
+    right_partitioning: Partitioning,
+    left_columns_len: usize,
+) -> Partitioning {
+    match join_type {
+        JoinType::Inner | JoinType::Left | JoinType::LeftSemi | JoinType::LeftAnti => {
+            left_partitioning
+        }
+        JoinType::RightSemi | JoinType::RightAnti => right_partitioning,
+        JoinType::Right => {
+            utils::adjust_right_output_partitioning(right_partitioning, left_columns_len)
+        }
+        JoinType::Full => {
+            Partitioning::UnknownPartitioning(right_partitioning.partition_count())
+        }
     }
 }

@@ -33,10 +33,7 @@ use arrow::record_batch::RecordBatch;
 use datafusion_common::{internal_err, project_schema, DataFusionError, Result};
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::{EquivalenceProperties, LexOrdering};
-
 use futures::Stream;
-
-/// Execution plan for reading in-memory batches of data
 pub struct MemoryExec {
     /// The partitions to query
     partitions: Vec<Vec<RecordBatch>>,

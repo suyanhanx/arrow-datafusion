@@ -69,6 +69,7 @@ use datafusion_execution::TaskContext;
 use datafusion_physical_expr::equivalence::join_equivalence_properties;
 use datafusion_physical_expr::EquivalenceProperties;
 
+use crate::joins::sliding_window_join_utils::partitioned_join_output_partitioning;
 use ahash::RandomState;
 use futures::{ready, Stream, StreamExt, TryStreamExt};
 

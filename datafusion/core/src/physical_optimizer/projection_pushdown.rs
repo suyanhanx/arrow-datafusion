@@ -760,6 +760,7 @@ fn try_swapping_with_sliding_hash_join(
         new_left_sort,
         new_right_sort,
         *sh_join.partition_mode(),
+        sh_join.working_mode(),
     )?)))
 }
 

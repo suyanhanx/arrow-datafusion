@@ -317,6 +317,17 @@ impl SessionConfig {
         self
     }
 
+    /// Set the [`prefer_eager_execution_on_sliding_joins`] to control
+    /// working mode of the sliding join streams.
+    ///
+    /// [`prefer_eager_execution_on_sliding_joins`]: datafusion_common::config::ExecutionOptions::prefer_eager_execution_on_sliding_joins
+    pub fn with_eager_execution_on_sliding_joins(mut self, enable: bool) -> Self {
+        self.options
+            .execution
+            .prefer_eager_execution_on_sliding_joins = enable;
+        self
+    }
+
     /// Convert configuration options to name-value pairs with values
     /// converted to strings.
     ///

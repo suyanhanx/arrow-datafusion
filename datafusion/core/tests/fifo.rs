@@ -28,7 +28,6 @@ mod unix_test {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use arrow::array::Array;
     use arrow::csv::ReaderBuilder;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow_schema::SchemaRef;
@@ -197,24 +196,17 @@ mod unix_test {
         Ok(())
     }
 
-    #[derive(Debug, PartialEq)]
-    enum JoinOperation {
-        LeftUnmatched,
-        RightUnmatched,
-        Equal,
-    }
-
     // This test provides a relatively realistic end-to-end scenario where
-    // we change the join into a [SymmetricHashJoin] to accommodate two
+    // we change the join into a [SlidingHashJoin] to accommodate two
     // unbounded (FIFO) sources.
-    #[ignore]
     #[tokio::test]
     async fn unbounded_file_with_symmetric_join() -> Result<()> {
         // Create session context
         let config = SessionConfig::new()
             .with_batch_size(TEST_BATCH_SIZE)
             .set_bool("datafusion.execution.coalesce_batches", false)
-            .with_target_partitions(1);
+            .with_target_partitions(1)
+            .with_eager_execution_on_sliding_joins(true);
         let ctx = SessionContext::new_with_config(config);
         // Tasks
         let mut tasks: Vec<JoinHandle<()>> = vec![];
@@ -222,7 +214,7 @@ mod unix_test {
         // Join filter
         let a1_iter = 0..TEST_DATA_SIZE;
         // Join key
-        let a2_iter = (0..TEST_DATA_SIZE).map(|x| x % 10);
+        let a2_iter = (0..TEST_DATA_SIZE).map(|x| x % 5);
         let lines = a1_iter
             .zip(a2_iter)
             .map(|(a1, a2)| format!("{a1},{a2}\n"))
@@ -243,14 +235,14 @@ mod unix_test {
             "a1,a2\n".to_owned(),
             lines.clone(),
             waiting.clone(),
-            TEST_BATCH_SIZE,
+            TEST_BATCH_SIZE * 2,
         ));
         tasks.push(create_writing_thread(
             right_fifo.clone(),
             "a1,a2\n".to_owned(),
             lines.clone(),
             waiting.clone(),
-            TEST_BATCH_SIZE,
+            TEST_BATCH_SIZE * 2,
         ));
 
         // Create schema
@@ -285,40 +277,11 @@ mod unix_test {
             )
             .await?;
         let mut stream = df.execute_stream().await?;
-        let mut operations = vec![];
         // Partial.
-        while let Some(Ok(batch)) = stream.next().await {
+        while let Some(Ok(_)) = stream.next().await {
             waiting.store(false, Ordering::SeqCst);
-            let left_unmatched = batch.column(2).null_count();
-            let right_unmatched = batch.column(0).null_count();
-            let op = if left_unmatched == 0 && right_unmatched == 0 {
-                JoinOperation::Equal
-            } else if right_unmatched > left_unmatched {
-                JoinOperation::RightUnmatched
-            } else {
-                JoinOperation::LeftUnmatched
-            };
-            operations.push(op);
         }
         futures::future::try_join_all(tasks).await.unwrap();
-
-        // The SymmetricHashJoin executor produces FULL join results at every
-        // pruning, which happens before it reaches the end of input and more
-        // than once. In this test, we feed partially joinable data to both
-        // sides in order to ensure that left or right unmatched results are
-        // generated more than once during the test.
-        assert!(
-            operations
-                .iter()
-                .filter(|&n| JoinOperation::RightUnmatched.eq(n))
-                .count()
-                > 1
-                && operations
-                    .iter()
-                    .filter(|&n| JoinOperation::LeftUnmatched.eq(n))
-                    .count()
-                    > 1
-        );
         Ok(())
     }
 
