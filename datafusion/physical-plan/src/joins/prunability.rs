@@ -26,8 +26,6 @@ use datafusion_physical_expr::utils::{
 };
 use datafusion_physical_expr::{PhysicalExpr, PhysicalSortExpr, SortProperties};
 
-use itertools::Itertools;
-
 /// Takes information about the join inputs (i.e. tables) and determines
 /// which input can be pruned during the join operation.
 ///
@@ -168,7 +166,7 @@ fn intermediate_schema_sort_expr(
 ///
 /// While transforming a [`PhysicalExpr`] up, each node holds a [`PrunabilityState`]
 /// to propagate these crucial pieces of information.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct PrunabilityState {
     sort_options: SortProperties,
     table_side: TableSide,
@@ -192,35 +190,23 @@ impl Default for PrunabilityState {
 struct ExprPrunability {
     expr: Arc<dyn PhysicalExpr>,
     state: PrunabilityState,
-    children_states: Vec<PrunabilityState>,
+    children: Vec<ExprPrunability>,
 }
 
 impl ExprPrunability {
-    /// Creates a new [`ExprPrunability`] with default states for `expr` and
-    /// its children.
+    /// Creates a new [`ExprPrunability`] tree with empty states.
     fn new(expr: Arc<dyn PhysicalExpr>) -> Self {
-        let size = expr.children().len();
+        let children = expr.children();
         Self {
             expr,
             state: PrunabilityState::default(),
-            children_states: vec![PrunabilityState::default(); size],
+            children: children.into_iter().map(Self::new).collect(),
         }
     }
 
-    /// Updates this [`ExprPrunability`]'s children states with the given states.
-    pub fn with_new_children(mut self, children_states: Vec<PrunabilityState>) -> Self {
-        assert_eq!(self.children_states.len(), children_states.len());
-        self.children_states = children_states;
-        self
-    }
-
-    /// Creates new [`ExprPrunability`] objects for each child of the expression.
-    pub fn children_expr_prunabilities(&self) -> Vec<ExprPrunability> {
-        self.expr
-            .children()
-            .into_iter()
-            .map(ExprPrunability::new)
-            .collect()
+    /// Get state for each child
+    fn children_state(&self) -> Vec<PrunabilityState> {
+        self.children.iter().map(|child| child.state).collect()
     }
 }
 
@@ -276,21 +262,21 @@ fn update_prunability<F: Fn() -> EquivalenceProperties>(
         return Ok(Transformed::Yes(node));
     }
 
-    if !node.children_states.is_empty() {
+    if !node.children.is_empty() {
         // Handle the intermediate (non-leaf) node case:
-        let children = &node.children_states;
+        let children = node.children_state();
         let children_sort_options = children
             .iter()
             .map(|prunability_state| prunability_state.sort_options)
             .collect::<Vec<_>>();
         let parent_sort_options = node.expr.get_ordering(&children_sort_options);
 
-        let parent_table_side = calculate_tableside_from_children(children);
+        let parent_table_side = calculate_tableside_from_children(&children);
 
         let prune_side = if let Ok(DataType::Boolean) = node.expr.data_type(filter_schema)
         {
             if let Some(binary) = node.expr.as_any().downcast_ref::<BinaryExpr>() {
-                calculate_pruneside_from_children(binary, children)
+                calculate_pruneside_from_children(binary, &children)
             } else if let Some(_cast) = node.expr.as_any().downcast_ref::<CastExpr>() {
                 children[0].prune_side
             } else {
@@ -465,8 +451,8 @@ impl TreeNode for ExprPrunability {
     where
         F: FnMut(&Self) -> Result<VisitRecursion>,
     {
-        for child in self.children_expr_prunabilities() {
-            match op(&child)? {
+        for child in &self.children {
+            match op(child)? {
                 VisitRecursion::Continue => {}
                 VisitRecursion::Skip => return Ok(VisitRecursion::Continue),
                 VisitRecursion::Stop => return Ok(VisitRecursion::Stop),
@@ -475,25 +461,19 @@ impl TreeNode for ExprPrunability {
         Ok(VisitRecursion::Continue)
     }
 
-    fn map_children<F>(self, transform: F) -> Result<Self>
+    fn map_children<F>(mut self, transform: F) -> Result<Self>
     where
         F: FnMut(Self) -> Result<Self>,
     {
-        if self.children_states.is_empty() {
+        if self.children.is_empty() {
             Ok(self)
         } else {
-            let child_expr_prunabilities = self.children_expr_prunabilities();
-            // After mapping over the children, the function `F` applies to the
-            // current object and updates its state.
-            Ok(self.with_new_children(
-                child_expr_prunabilities
-                    .into_iter()
-                    // Update children states after this transformation:
-                    .map(transform)
-                    // Extract the state (i.e. prunability) information:
-                    .map_ok(|c| c.state)
-                    .collect::<Result<Vec<_>>>()?,
-            ))
+            self.children = self
+                .children
+                .into_iter()
+                .map(transform)
+                .collect::<Result<Vec<_>>>()?;
+            Ok(self)
         }
     }
 }
