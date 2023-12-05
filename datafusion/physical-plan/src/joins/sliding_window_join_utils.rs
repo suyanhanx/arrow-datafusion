@@ -905,7 +905,6 @@ pub fn is_batch_suitable_interval_calculation(
 ///   for each expression.
 pub fn calculate_the_necessary_build_side_range_helper(
     filter: &JoinFilter,
-    build_inner_buffer: &RecordBatch,
     graph: &mut ExprIntervalGraph,
     build_sorted_filter_exprs: &mut [SortedFilterExpr],
     probe_sorted_filter_exprs: &mut [SortedFilterExpr],
@@ -915,7 +914,6 @@ pub fn calculate_the_necessary_build_side_range_helper(
     // Calculate the interval for the build side filter expression (if present):
     update_filter_expr_bounds(
         filter,
-        build_inner_buffer,
         build_sorted_filter_exprs,
         probe_batch,
         probe_sorted_filter_exprs,
@@ -1287,16 +1285,16 @@ pub enum LazyJoinStreamState {
 /// calculates the actual interval for the probe side based on the sort options.
 pub(crate) fn update_filter_expr_bounds(
     filter: &JoinFilter,
-    build_inner_buffer: &RecordBatch,
     build_sorted_filter_exprs: &mut [SortedFilterExpr],
     probe_batch: &RecordBatch,
     probe_sorted_filter_exprs: &mut [SortedFilterExpr],
     probe_side: JoinSide,
 ) -> Result<()> {
+    let schema = filter.schema();
     // Evaluate the build side order expression to get datatype:
     let build_order_datatype = build_sorted_filter_exprs[0]
         .intermediate_batch_filter_expr()
-        .data_type(&build_inner_buffer.schema())?;
+        .data_type(schema)?;
 
     // Create a null interval using the null scalar value:
     let unbounded_interval = Interval::make_unbounded(&build_order_datatype)?;
@@ -1308,14 +1306,14 @@ pub(crate) fn update_filter_expr_bounds(
         });
 
     let first_probe_intermediate_batch = get_filter_representation_of_join_side(
-        filter.schema(),
+        schema,
         &probe_batch.slice(0, 1),
         filter.column_indices(),
         probe_side,
     )?;
 
     let last_probe_intermediate_batch = get_filter_representation_of_join_side(
-        filter.schema(),
+        schema,
         &probe_batch.slice(probe_batch.num_rows() - 1, 1),
         filter.column_indices(),
         probe_side,

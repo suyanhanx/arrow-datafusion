@@ -960,7 +960,6 @@ impl LazyJoinStream for LazySlidingHashJoinStream {
     ) -> Result<Vec<(PhysicalSortExpr, Interval)>> {
         calculate_the_necessary_build_side_range_helper(
             &self.join_data.filter,
-            &self.join_data.build_buffer.input_buffer,
             &mut self.join_data.graph,
             &mut self.join_data.left_sorted_filter_expr,
             &mut self.join_data.right_sorted_filter_expr,
