@@ -941,7 +941,6 @@ impl CommonJoinData {
         let calculated_necessary_build_side_intervals =
             calculate_the_necessary_build_side_range_helper(
                 &self.filter,
-                &self.build_buffer.latest_batch,
                 &mut self.graph,
                 &mut self.left_sorted_filter_expr,
                 &mut self.right_sorted_filter_expr,
@@ -1265,7 +1264,6 @@ impl LazyJoinStream for LazyPartitionedHashJoinStream {
     ) -> Result<Vec<(PhysicalSortExpr, Interval)>> {
         calculate_the_necessary_build_side_range_helper(
             &self.join_data.filter,
-            &self.join_data.build_buffer.latest_batch,
             &mut self.join_data.graph,
             &mut self.join_data.left_sorted_filter_expr,
             &mut self.join_data.right_sorted_filter_expr,
@@ -1851,7 +1849,6 @@ mod fuzzy_tests {
 
     #[rstest]
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore]
     async fn testing_with_temporal_columns(
         #[values(JoinType::Inner, JoinType::Right)] join_type: JoinType,
         #[values((3, 5), (5, 3))] cardinality: (i32, i32),
