@@ -142,7 +142,7 @@ pub fn check_finiteness_requirements(
     if let Some(exec) = input.plan.as_any().downcast_ref::<SymmetricHashJoinExec>() {
         if !(optimizer_options.allow_symmetric_joins_without_pruning
             || (exec.check_if_order_information_available()?
-                && is_prunable(exec, &input.children_unbounded)))
+                && is_prunable(exec, &input.children_unbounded())))
         {
             const MSG: &str = "Join operation cannot operate on a non-prunable stream without enabling \
                                the 'allow_symmetric_joins_without_pruning' configuration flag";

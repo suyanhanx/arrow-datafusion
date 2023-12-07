@@ -1770,7 +1770,7 @@ mod order_preserving_join_swap_tests {
                 .unwrap()],
                 input.clone(),
                 vec![],
-                crate::physical_plan::windows::PartitionSearchMode::Sorted,
+                datafusion_physical_plan::InputOrderMode::Sorted,
             )
             .unwrap(),
         )

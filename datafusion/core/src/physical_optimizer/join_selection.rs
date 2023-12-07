@@ -1074,7 +1074,6 @@ mod hash_join_tests {
     use arrow::record_batch::RecordBatch;
     use datafusion_common::utils::DataPtr;
     use datafusion_common::JoinType;
-    use datafusion_physical_plan::empty::EmptyExec;
     use std::sync::Arc;
 
     struct TestCase {

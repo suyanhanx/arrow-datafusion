@@ -54,8 +54,7 @@ use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMerge
 use datafusion::physical_plan::union::{InterleaveExec, UnionExec};
 use datafusion::physical_plan::windows::{BoundedWindowAggExec, WindowAggExec};
 use datafusion::physical_plan::{
-    udaf, AggregateExpr, ExecutionPlan, InputOrderMode, Partitioning, PhysicalExpr,
-    WindowExpr,
+    udaf, ExecutionPlan, InputOrderMode, Partitioning, PhysicalExpr,
 };
 use datafusion_common::{internal_err, not_impl_err, DataFusionError, Result};
 
@@ -343,7 +342,8 @@ impl AsExecutionPlan for PhysicalPlanNode {
                         input,
                         partition_keys,
                         input_order_mode,
-                    )?))
+                    )
+                    .map(|e| Arc::new(e) as _)
                 } else {
                     WindowAggExec::try_new(physical_window_expr, input, partition_keys)
                         .map(|e| Arc::new(e) as _)
