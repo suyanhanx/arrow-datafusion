@@ -46,6 +46,7 @@ use arrow::record_batch::RecordBatch;
 
 use arrow_array::LargeStringArray;
 use datafusion_common::cast::as_boolean_array;
+use datafusion_common::scalar::{dt_max_ms, dt_min_ms, mdn_max_ns, mdn_min_ns};
 use datafusion_common::{internal_err, DataFusionError, Result, ScalarValue};
 use datafusion_expr::interval_arithmetic::{apply_operator, Interval};
 use datafusion_expr::type_coercion::binary::get_result_type;
@@ -283,6 +284,16 @@ impl PhysicalExpr for BinaryExpr {
             Operator::Modulo => return apply(&lhs, &rhs, rem),
             Operator::Eq => return apply_cmp(&lhs, &rhs, eq),
             Operator::NotEq => return apply_cmp(&lhs, &rhs, neq),
+            Operator::Lt | Operator::Gt | Operator::LtEq | Operator::GtEq
+            // Assumes the same types are compared, which is being consistent with `temporal_coercion` function.
+                if matches!(
+                    lhs.data_type(),
+                    DataType::Interval(IntervalUnit::DayTime)
+                        | DataType::Interval(IntervalUnit::MonthDayNano)
+                ) =>
+            {
+                return apply_interval_cmp(&lhs, &rhs, self.op)
+            }
             Operator::Lt => return apply_cmp(&lhs, &rhs, lt),
             Operator::Gt => return apply_cmp(&lhs, &rhs, gt),
             Operator::LtEq => return apply_cmp(&lhs, &rhs, lt_eq),
@@ -502,6 +513,103 @@ fn to_result_type_array(
     }
 }
 
+/// Compares two [`ScalarValue::IntervalDayTime`] or [`ScalarValue::IntervalMonthDayNano`]
+/// arrays or scalars. The comparison semantic is that the interval values on both sides
+/// of the comparison work as if they reference a common timestamp. If comparing these
+/// intervals with respect to this reference gives a definite answer, like 1 month and
+/// 1 month + 1 day, answer is given as the result. However, if there is an indefinite
+/// case, like 1 month and 30 days, the result will be false for both greater than and
+/// less than comparisons.
+fn apply_interval_cmp(
+    lhs: &ColumnarValue,
+    rhs: &ColumnarValue,
+    op: Operator,
+) -> Result<ColumnarValue> {
+    // No need to check data length which is already done.
+    let (lhs_min_values, rhs_min_values, lhs_max_values, rhs_max_values) = if lhs
+        .data_type()
+        .eq(&DataType::Interval(IntervalUnit::DayTime))
+    {
+        (
+            dt_in_millis(lhs, dt_min_ms),
+            dt_in_millis(rhs, dt_min_ms),
+            dt_in_millis(lhs, dt_max_ms),
+            dt_in_millis(rhs, dt_max_ms),
+        )
+    } else {
+        (
+            mdn_in_nanos(lhs, mdn_min_ns),
+            mdn_in_nanos(rhs, mdn_min_ns),
+            mdn_in_nanos(lhs, mdn_max_ns),
+            mdn_in_nanos(rhs, mdn_max_ns),
+        )
+    };
+    let eval_op = match op {
+        Operator::Lt => lt,
+        Operator::LtEq => lt_eq,
+        Operator::Gt => gt,
+        Operator::GtEq => gt_eq,
+        _ => unreachable!(),
+    };
+    let (min_eval, max_eval) = (
+        apply(&lhs_min_values, &rhs_min_values, |l, r| {
+            Ok(Arc::new(eval_op(l, r)?))
+        })?,
+        apply(&lhs_max_values, &rhs_max_values, |l, r| {
+            Ok(Arc::new(eval_op(l, r)?))
+        })?,
+    );
+    Ok(definite_interval_cmp(min_eval, max_eval))
+}
+
+fn dt_in_millis(dt: &ColumnarValue, f: fn(i64) -> i64) -> ColumnarValue {
+    use ColumnarValue::*;
+    match dt {
+        Array(dt) => Array(Arc::new(PrimitiveArray::<IntervalDayTimeType>::from_iter(
+            dt.as_primitive::<IntervalDayTimeType>()
+                .iter()
+                .map(|dt| dt.map(f)),
+        ))),
+        Scalar(ScalarValue::IntervalDayTime(dt)) => {
+            Scalar(ScalarValue::IntervalDayTime(dt.map(f)))
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn mdn_in_nanos(mdn: &ColumnarValue, f: fn(i128) -> i128) -> ColumnarValue {
+    use ColumnarValue::*;
+    match mdn {
+        Array(mdn) => Array(Arc::new(
+            PrimitiveArray::<IntervalMonthDayNanoType>::from_iter(
+                mdn.as_primitive::<IntervalMonthDayNanoType>()
+                    .iter()
+                    .map(|mdn| mdn.map(f)),
+            ),
+        )),
+        Scalar(ScalarValue::IntervalMonthDayNano(mdn)) => {
+            Scalar(ScalarValue::IntervalMonthDayNano(mdn.map(f)))
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn definite_interval_cmp(v1: ColumnarValue, v2: ColumnarValue) -> ColumnarValue {
+    use ColumnarValue::*;
+    match (v1, v2) {
+        (Array(v1), Array(v2)) => Array(Arc::new(BooleanArray::from_iter(
+            v1.as_boolean()
+                .iter()
+                .zip(v2.as_boolean())
+                .map(|(v1, v2)| v1.and_then(|v1| v2.map(|v2| v1 & v2))),
+        ))),
+        (Scalar(ScalarValue::Boolean(v1)), Scalar(ScalarValue::Boolean(v2))) => {
+            Scalar(ScalarValue::Boolean(v1.and_then(|v1| v2.map(|v2| v1 & v2))))
+        }
+        _ => unreachable!(),
+    }
+}
+
 impl BinaryExpr {
     /// Evaluate the expression of the left input is an array and
     /// right is literal - use scalar operations
@@ -633,6 +741,7 @@ mod tests {
     use std::cmp::Ordering;
     use std::collections::{HashMap, HashSet};
     use std::ops::Neg;
+    use std::sync::Arc;
 
     use super::*;
     use crate::expressions::{col, lit, Column};
@@ -5320,5 +5429,179 @@ mod tests {
         )?);
 
         Ok(())
+    }
+
+    #[test]
+    fn interval_dt_mdn_cmp() {
+        // DayTime definitely true cases:
+        let a = ColumnarValue::Array(Arc::new(IntervalDayTimeArray::from(vec![
+            Some(IntervalDayTimeType::make_value(0, -5)),
+            Some(IntervalDayTimeType::make_value(3, -1_000_000)),
+            Some(IntervalDayTimeType::make_value(4, -1000)),
+            Some(IntervalDayTimeType::make_value(10, 20)),
+            Some(IntervalDayTimeType::make_value(1, 2)),
+        ])));
+        let b = ColumnarValue::Array(Arc::new(IntervalDayTimeArray::from(vec![
+            Some(IntervalDayTimeType::make_value(0, -10)),
+            Some(IntervalDayTimeType::make_value(3, -2_000_000)),
+            Some(IntervalDayTimeType::make_value(2, 1000)),
+            Some(IntervalDayTimeType::make_value(5, 6)),
+            Some(IntervalDayTimeType::make_value(1, 1)),
+        ])));
+        let res = apply_interval_cmp(&a, &b, Operator::Gt).unwrap();
+        let res_eq = apply_interval_cmp(&a, &b, Operator::GtEq).unwrap();
+        let ColumnarValue::Array(arr) = res else {
+            panic!()
+        };
+        for i in arr.as_any().downcast_ref::<BooleanArray>().unwrap() {
+            assert!(i.unwrap());
+        }
+        let ColumnarValue::Array(arr) = res_eq else {
+            panic!()
+        };
+        for i in arr.as_any().downcast_ref::<BooleanArray>().unwrap() {
+            assert!(i.unwrap());
+        }
+        let res = apply_interval_cmp(&b, &a, Operator::Lt).unwrap();
+        let res_eq = apply_interval_cmp(&b, &a, Operator::LtEq).unwrap();
+        let ColumnarValue::Array(arr) = res else {
+            panic!()
+        };
+        for i in arr.as_any().downcast_ref::<BooleanArray>().unwrap() {
+            assert!(i.unwrap());
+        }
+        let ColumnarValue::Array(arr) = res_eq else {
+            panic!()
+        };
+        for i in arr.as_any().downcast_ref::<BooleanArray>().unwrap() {
+            assert!(i.unwrap());
+        }
+        // DayTime indefinite cases:
+        let a = ColumnarValue::Array(Arc::new(IntervalDayTimeArray::from(vec![
+            Some(IntervalDayTimeType::make_value(1, 0)),
+            Some(IntervalDayTimeType::make_value(3, -86_400_001)),
+        ])));
+        let b = ColumnarValue::Array(Arc::new(IntervalDayTimeArray::from(vec![
+            Some(IntervalDayTimeType::make_value(0, 86_400_999)),
+            Some(IntervalDayTimeType::make_value(2, 0)),
+        ])));
+        let res = apply_interval_cmp(&a, &b, Operator::Gt).unwrap();
+        let res_eq = apply_interval_cmp(&a, &b, Operator::GtEq).unwrap();
+        let ColumnarValue::Array(arr) = res else {
+            panic!()
+        };
+        for i in arr.as_any().downcast_ref::<BooleanArray>().unwrap() {
+            assert!(!i.unwrap());
+        }
+        let ColumnarValue::Array(arr) = res_eq else {
+            panic!()
+        };
+        for i in arr.as_any().downcast_ref::<BooleanArray>().unwrap() {
+            assert!(!i.unwrap());
+        }
+        let res = apply_interval_cmp(&b, &a, Operator::Lt).unwrap();
+        let res_eq = apply_interval_cmp(&b, &a, Operator::LtEq).unwrap();
+        let ColumnarValue::Array(arr) = res else {
+            panic!()
+        };
+        for i in arr.as_any().downcast_ref::<BooleanArray>().unwrap() {
+            assert!(!i.unwrap());
+        }
+        let ColumnarValue::Array(arr) = res_eq else {
+            panic!()
+        };
+        for i in arr.as_any().downcast_ref::<BooleanArray>().unwrap() {
+            assert!(!i.unwrap());
+        }
+        // MonthDayNano definitely true cases:
+        let a = ColumnarValue::Array(Arc::new(IntervalMonthDayNanoArray::from(vec![
+            Some(IntervalMonthDayNanoType::make_value(0, 0, 1)),
+            Some(IntervalMonthDayNanoType::make_value(0, 1, -1_000_000_000)),
+            Some(IntervalMonthDayNanoType::make_value(3, 2, -100_000_000_000)),
+            Some(IntervalMonthDayNanoType::make_value(
+                0,
+                1,
+                86_401_000_000_001,
+            )),
+            Some(IntervalMonthDayNanoType::make_value(1, 32, 0)),
+        ])));
+        let b = ColumnarValue::Array(Arc::new(IntervalMonthDayNanoArray::from(vec![
+            Some(IntervalMonthDayNanoType::make_value(0, 0, 0)),
+            Some(IntervalMonthDayNanoType::make_value(0, 1, -8_000_000_000)),
+            Some(IntervalMonthDayNanoType::make_value(1, 25, 100_000_000_000)),
+            Some(IntervalMonthDayNanoType::make_value(0, 2, 0)),
+            Some(IntervalMonthDayNanoType::make_value(2, 0, 0)),
+        ])));
+        let res = apply_interval_cmp(&a, &b, Operator::Gt).unwrap();
+        let res_eq = apply_interval_cmp(&a, &b, Operator::GtEq).unwrap();
+        let ColumnarValue::Array(arr) = res else {
+            panic!()
+        };
+        for i in arr.as_any().downcast_ref::<BooleanArray>().unwrap() {
+            assert!(i.unwrap());
+        }
+        let ColumnarValue::Array(arr) = res_eq else {
+            panic!()
+        };
+        for i in arr.as_any().downcast_ref::<BooleanArray>().unwrap() {
+            assert!(i.unwrap());
+        }
+        let res = apply_interval_cmp(&b, &a, Operator::Lt).unwrap();
+        let res_eq = apply_interval_cmp(&b, &a, Operator::LtEq).unwrap();
+        let ColumnarValue::Array(arr) = res else {
+            panic!()
+        };
+        for i in arr.as_any().downcast_ref::<BooleanArray>().unwrap() {
+            assert!(i.unwrap());
+        }
+        let ColumnarValue::Array(arr) = res_eq else {
+            panic!()
+        };
+        for i in arr.as_any().downcast_ref::<BooleanArray>().unwrap() {
+            assert!(i.unwrap());
+        }
+        // MonthDayNano indefinite cases:
+        let a = ColumnarValue::Array(Arc::new(IntervalMonthDayNanoArray::from(vec![
+            Some(IntervalMonthDayNanoType::make_value(0, 30, 0)),
+            Some(IntervalMonthDayNanoType::make_value(1, 0, 1_000_000_000)),
+            Some(IntervalMonthDayNanoType::make_value(
+                0,
+                0,
+                86_400_000_000_000,
+            )),
+        ])));
+        let b = ColumnarValue::Array(Arc::new(IntervalMonthDayNanoArray::from(vec![
+            Some(IntervalMonthDayNanoType::make_value(1, 0, 0)),
+            Some(IntervalMonthDayNanoType::make_value(2, -29, 8_000_000_000)),
+            Some(IntervalMonthDayNanoType::make_value(0, 1, 0)),
+        ])));
+        let res = apply_interval_cmp(&a, &b, Operator::Gt).unwrap();
+        let res_eq = apply_interval_cmp(&a, &b, Operator::GtEq).unwrap();
+        let ColumnarValue::Array(arr) = res else {
+            panic!()
+        };
+        for i in arr.as_any().downcast_ref::<BooleanArray>().unwrap() {
+            assert!(!i.unwrap());
+        }
+        let ColumnarValue::Array(arr) = res_eq else {
+            panic!()
+        };
+        for i in arr.as_any().downcast_ref::<BooleanArray>().unwrap() {
+            assert!(!i.unwrap());
+        }
+        let res = apply_interval_cmp(&b, &a, Operator::Lt).unwrap();
+        let res_eq = apply_interval_cmp(&b, &a, Operator::LtEq).unwrap();
+        let ColumnarValue::Array(arr) = res else {
+            panic!()
+        };
+        for i in arr.as_any().downcast_ref::<BooleanArray>().unwrap() {
+            assert!(!i.unwrap());
+        }
+        let ColumnarValue::Array(arr) = res_eq else {
+            panic!()
+        };
+        for i in arr.as_any().downcast_ref::<BooleanArray>().unwrap() {
+            assert!(!i.unwrap());
+        }
     }
 }

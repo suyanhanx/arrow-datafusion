@@ -428,9 +428,11 @@ impl PartialOrd for ScalarValue {
             (TimestampNanosecond(_, _), _) => None,
             (IntervalYearMonth(v1), IntervalYearMonth(v2)) => v1.partial_cmp(v2),
             (IntervalYearMonth(_), _) => None,
-            (IntervalDayTime(v1), IntervalDayTime(v2)) => v1.partial_cmp(v2),
+            (IntervalDayTime(v1), IntervalDayTime(v2)) => interval_dt_cmp(v1, v2),
             (IntervalDayTime(_), _) => None,
-            (IntervalMonthDayNano(v1), IntervalMonthDayNano(v2)) => v1.partial_cmp(v2),
+            (IntervalMonthDayNano(v1), IntervalMonthDayNano(v2)) => {
+                interval_mdn_cmp(v1, v2)
+            }
             (IntervalMonthDayNano(_), _) => None,
             (DurationSecond(v1), DurationSecond(v2)) => v1.partial_cmp(v2),
             (DurationSecond(_), _) => None,
@@ -461,6 +463,67 @@ impl PartialOrd for ScalarValue {
             (Null, _) => None,
         }
     }
+}
+
+/// Compares two [`i64`] extracted from [`ScalarValue::IntervalDayTime`].
+/// The comparison semantic is that the interval values on both sides of the comparison
+/// work as if they reference a common timestamp. If comparing these intervals with
+/// respect to this reference gives a definite answer, answer is given as the result.
+/// However, if there is an indefinite case the result will be false for both greater
+/// than and less than comparisons.
+fn interval_dt_cmp(v1: &Option<i64>, v2: &Option<i64>) -> Option<Ordering> {
+    let evaluate_min = v1.map(dt_min_ms).partial_cmp(&v2.map(dt_min_ms));
+    let evaluate_max = v1.map(dt_max_ms).partial_cmp(&v2.map(dt_max_ms));
+    definite_comparison(evaluate_min, evaluate_max)
+}
+
+/// Compares two [`i128`] extracted from [`ScalarValue::IntervalMonthDayNano`].
+/// The comparison semantic is that the interval values on both sides of the comparison
+/// work as if they reference a common timestamp. If comparing these intervals with
+/// respect to this reference gives a definite answer, answer is given as the result.
+/// However, if there is an indefinite case the result will be false for both greater
+/// than and less than comparisons.
+fn interval_mdn_cmp(v1: &Option<i128>, v2: &Option<i128>) -> Option<Ordering> {
+    let evaluate_min = v1.map(mdn_min_ns).partial_cmp(&v2.map(mdn_min_ns));
+    let evaluate_max = v1.map(mdn_max_ns).partial_cmp(&v2.map(mdn_max_ns));
+    definite_comparison(evaluate_min, evaluate_max)
+}
+
+fn definite_comparison(min: Option<Ordering>, max: Option<Ordering>) -> Option<Ordering> {
+    match (min, max) {
+        (Some(l_o), Some(r_o)) if l_o == r_o => min,
+        _ => None,
+    }
+}
+
+/// Minimum value that the [`ScalarValue::IntervalDayTime`] can take in milliseconds.
+pub fn dt_min_ms(dt: i64) -> i64 {
+    let d = dt >> 32;
+    let m = dt as i32 as i64;
+    d * (86_400_000) + m
+}
+
+/// Maximum value that the [`ScalarValue::IntervalDayTime`] can take in milliseconds.
+pub fn dt_max_ms(dt: i64) -> i64 {
+    let d = dt >> 32;
+    let m = dt as i32 as i64;
+    d * (86_400_000 + 1_000) + m
+}
+
+/// Minimum value that the [`ScalarValue::IntervalMonthDayNano`] can take in nanoseconds.
+pub fn mdn_min_ns(mdn: i128) -> i128 {
+    let m = (mdn >> 96) as i32;
+    let d = (mdn >> 64) as i32;
+    let n = mdn as i64;
+    ((m as i128 * 28) + d as i128) * (86_400_000_000_000) + n as i128
+}
+
+/// Maximum value that the [`ScalarValue::IntervalMonthDayNano`] can take in nanoseconds.
+pub fn mdn_max_ns(mdn: i128) -> i128 {
+    let m = (mdn >> 96) as i32;
+    let d = (mdn >> 64) as i32;
+    let n = mdn as i64;
+    ((m as i128 * 31) + d as i128) * (86_400_000_000_000 + 1_000_000_000) + n as i128
 }
 
 impl Eq for ScalarValue {}
