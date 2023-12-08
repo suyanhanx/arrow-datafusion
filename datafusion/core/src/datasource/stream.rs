@@ -66,7 +66,6 @@ impl TableProviderFactory for StreamTableFactory {
             .with_header(cmd.has_header)
             .with_batch_size(state.config().batch_size())
             .with_constraints(cmd.constraints.clone());
-
         Ok(Arc::new(StreamTable(Arc::new(config))))
     }
 }
