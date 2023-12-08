@@ -2008,9 +2008,6 @@ mod tests {
         Ok(())
     }
 
-    // TODO: Enable this test once the PartialOrd problem of time intervals
-    //       are addressed.
-    #[ignore]
     #[rstest]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_with_interval_columns(
