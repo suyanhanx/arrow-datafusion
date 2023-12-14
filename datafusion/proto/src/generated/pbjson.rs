@@ -956,6 +956,503 @@ impl<'de> serde::Deserialize<'de> for AggregateUdfExprNode {
         deserializer.deserialize_struct("datafusion.AggregateUDFExprNode", FIELDS, GeneratedVisitor)
     }
 }
+impl serde::Serialize for AggregativeHashJoinExecNode {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if self.left.is_some() {
+            len += 1;
+        }
+        if self.right.is_some() {
+            len += 1;
+        }
+        if !self.on.is_empty() {
+            len += 1;
+        }
+        if self.join_type != 0 {
+            len += 1;
+        }
+        if self.partition_mode != 0 {
+            len += 1;
+        }
+        if self.null_equals_null {
+            len += 1;
+        }
+        if self.filter.is_some() {
+            len += 1;
+        }
+        if !self.left_sort_exprs.is_empty() {
+            len += 1;
+        }
+        if !self.right_sort_exprs.is_empty() {
+            len += 1;
+        }
+        if self.fetch_per_key != 0 {
+            len += 1;
+        }
+        if self.working_mode != 0 {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("datafusion.AggregativeHashJoinExecNode", len)?;
+        if let Some(v) = self.left.as_ref() {
+            struct_ser.serialize_field("left", v)?;
+        }
+        if let Some(v) = self.right.as_ref() {
+            struct_ser.serialize_field("right", v)?;
+        }
+        if !self.on.is_empty() {
+            struct_ser.serialize_field("on", &self.on)?;
+        }
+        if self.join_type != 0 {
+            let v = JoinType::try_from(self.join_type)
+                .map_err(|_| serde::ser::Error::custom(format!("Invalid variant {}", self.join_type)))?;
+            struct_ser.serialize_field("joinType", &v)?;
+        }
+        if self.partition_mode != 0 {
+            let v = StreamPartitionMode::try_from(self.partition_mode)
+                .map_err(|_| serde::ser::Error::custom(format!("Invalid variant {}", self.partition_mode)))?;
+            struct_ser.serialize_field("partitionMode", &v)?;
+        }
+        if self.null_equals_null {
+            struct_ser.serialize_field("nullEqualsNull", &self.null_equals_null)?;
+        }
+        if let Some(v) = self.filter.as_ref() {
+            struct_ser.serialize_field("filter", v)?;
+        }
+        if !self.left_sort_exprs.is_empty() {
+            struct_ser.serialize_field("leftSortExprs", &self.left_sort_exprs)?;
+        }
+        if !self.right_sort_exprs.is_empty() {
+            struct_ser.serialize_field("rightSortExprs", &self.right_sort_exprs)?;
+        }
+        if self.fetch_per_key != 0 {
+            struct_ser.serialize_field("fetchPerKey", &self.fetch_per_key)?;
+        }
+        if self.working_mode != 0 {
+            let v = SlidingWindowWorkingMode::try_from(self.working_mode)
+                .map_err(|_| serde::ser::Error::custom(format!("Invalid variant {}", self.working_mode)))?;
+            struct_ser.serialize_field("workingMode", &v)?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for AggregativeHashJoinExecNode {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "left",
+            "right",
+            "on",
+            "join_type",
+            "joinType",
+            "partition_mode",
+            "partitionMode",
+            "null_equals_null",
+            "nullEqualsNull",
+            "filter",
+            "left_sort_exprs",
+            "leftSortExprs",
+            "right_sort_exprs",
+            "rightSortExprs",
+            "fetch_per_key",
+            "fetchPerKey",
+            "working_mode",
+            "workingMode",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Left,
+            Right,
+            On,
+            JoinType,
+            PartitionMode,
+            NullEqualsNull,
+            Filter,
+            LeftSortExprs,
+            RightSortExprs,
+            FetchPerKey,
+            WorkingMode,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "left" => Ok(GeneratedField::Left),
+                            "right" => Ok(GeneratedField::Right),
+                            "on" => Ok(GeneratedField::On),
+                            "joinType" | "join_type" => Ok(GeneratedField::JoinType),
+                            "partitionMode" | "partition_mode" => Ok(GeneratedField::PartitionMode),
+                            "nullEqualsNull" | "null_equals_null" => Ok(GeneratedField::NullEqualsNull),
+                            "filter" => Ok(GeneratedField::Filter),
+                            "leftSortExprs" | "left_sort_exprs" => Ok(GeneratedField::LeftSortExprs),
+                            "rightSortExprs" | "right_sort_exprs" => Ok(GeneratedField::RightSortExprs),
+                            "fetchPerKey" | "fetch_per_key" => Ok(GeneratedField::FetchPerKey),
+                            "workingMode" | "working_mode" => Ok(GeneratedField::WorkingMode),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = AggregativeHashJoinExecNode;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct datafusion.AggregativeHashJoinExecNode")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<AggregativeHashJoinExecNode, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut left__ = None;
+                let mut right__ = None;
+                let mut on__ = None;
+                let mut join_type__ = None;
+                let mut partition_mode__ = None;
+                let mut null_equals_null__ = None;
+                let mut filter__ = None;
+                let mut left_sort_exprs__ = None;
+                let mut right_sort_exprs__ = None;
+                let mut fetch_per_key__ = None;
+                let mut working_mode__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Left => {
+                            if left__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("left"));
+                            }
+                            left__ = map_.next_value()?;
+                        }
+                        GeneratedField::Right => {
+                            if right__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("right"));
+                            }
+                            right__ = map_.next_value()?;
+                        }
+                        GeneratedField::On => {
+                            if on__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("on"));
+                            }
+                            on__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::JoinType => {
+                            if join_type__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("joinType"));
+                            }
+                            join_type__ = Some(map_.next_value::<JoinType>()? as i32);
+                        }
+                        GeneratedField::PartitionMode => {
+                            if partition_mode__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("partitionMode"));
+                            }
+                            partition_mode__ = Some(map_.next_value::<StreamPartitionMode>()? as i32);
+                        }
+                        GeneratedField::NullEqualsNull => {
+                            if null_equals_null__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("nullEqualsNull"));
+                            }
+                            null_equals_null__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::Filter => {
+                            if filter__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("filter"));
+                            }
+                            filter__ = map_.next_value()?;
+                        }
+                        GeneratedField::LeftSortExprs => {
+                            if left_sort_exprs__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("leftSortExprs"));
+                            }
+                            left_sort_exprs__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::RightSortExprs => {
+                            if right_sort_exprs__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("rightSortExprs"));
+                            }
+                            right_sort_exprs__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::FetchPerKey => {
+                            if fetch_per_key__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("fetchPerKey"));
+                            }
+                            fetch_per_key__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::WorkingMode => {
+                            if working_mode__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("workingMode"));
+                            }
+                            working_mode__ = Some(map_.next_value::<SlidingWindowWorkingMode>()? as i32);
+                        }
+                    }
+                }
+                Ok(AggregativeHashJoinExecNode {
+                    left: left__,
+                    right: right__,
+                    on: on__.unwrap_or_default(),
+                    join_type: join_type__.unwrap_or_default(),
+                    partition_mode: partition_mode__.unwrap_or_default(),
+                    null_equals_null: null_equals_null__.unwrap_or_default(),
+                    filter: filter__,
+                    left_sort_exprs: left_sort_exprs__.unwrap_or_default(),
+                    right_sort_exprs: right_sort_exprs__.unwrap_or_default(),
+                    fetch_per_key: fetch_per_key__.unwrap_or_default(),
+                    working_mode: working_mode__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("datafusion.AggregativeHashJoinExecNode", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for AggregativeNestedLoopJoinExecNode {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if self.left.is_some() {
+            len += 1;
+        }
+        if self.right.is_some() {
+            len += 1;
+        }
+        if self.join_type != 0 {
+            len += 1;
+        }
+        if self.filter.is_some() {
+            len += 1;
+        }
+        if !self.left_sort_exprs.is_empty() {
+            len += 1;
+        }
+        if !self.right_sort_exprs.is_empty() {
+            len += 1;
+        }
+        if self.fetch_per_key != 0 {
+            len += 1;
+        }
+        if self.working_mode != 0 {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("datafusion.AggregativeNestedLoopJoinExecNode", len)?;
+        if let Some(v) = self.left.as_ref() {
+            struct_ser.serialize_field("left", v)?;
+        }
+        if let Some(v) = self.right.as_ref() {
+            struct_ser.serialize_field("right", v)?;
+        }
+        if self.join_type != 0 {
+            let v = JoinType::try_from(self.join_type)
+                .map_err(|_| serde::ser::Error::custom(format!("Invalid variant {}", self.join_type)))?;
+            struct_ser.serialize_field("joinType", &v)?;
+        }
+        if let Some(v) = self.filter.as_ref() {
+            struct_ser.serialize_field("filter", v)?;
+        }
+        if !self.left_sort_exprs.is_empty() {
+            struct_ser.serialize_field("leftSortExprs", &self.left_sort_exprs)?;
+        }
+        if !self.right_sort_exprs.is_empty() {
+            struct_ser.serialize_field("rightSortExprs", &self.right_sort_exprs)?;
+        }
+        if self.fetch_per_key != 0 {
+            struct_ser.serialize_field("fetchPerKey", &self.fetch_per_key)?;
+        }
+        if self.working_mode != 0 {
+            let v = SlidingWindowWorkingMode::try_from(self.working_mode)
+                .map_err(|_| serde::ser::Error::custom(format!("Invalid variant {}", self.working_mode)))?;
+            struct_ser.serialize_field("workingMode", &v)?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for AggregativeNestedLoopJoinExecNode {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "left",
+            "right",
+            "join_type",
+            "joinType",
+            "filter",
+            "left_sort_exprs",
+            "leftSortExprs",
+            "right_sort_exprs",
+            "rightSortExprs",
+            "fetch_per_key",
+            "fetchPerKey",
+            "working_mode",
+            "workingMode",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Left,
+            Right,
+            JoinType,
+            Filter,
+            LeftSortExprs,
+            RightSortExprs,
+            FetchPerKey,
+            WorkingMode,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "left" => Ok(GeneratedField::Left),
+                            "right" => Ok(GeneratedField::Right),
+                            "joinType" | "join_type" => Ok(GeneratedField::JoinType),
+                            "filter" => Ok(GeneratedField::Filter),
+                            "leftSortExprs" | "left_sort_exprs" => Ok(GeneratedField::LeftSortExprs),
+                            "rightSortExprs" | "right_sort_exprs" => Ok(GeneratedField::RightSortExprs),
+                            "fetchPerKey" | "fetch_per_key" => Ok(GeneratedField::FetchPerKey),
+                            "workingMode" | "working_mode" => Ok(GeneratedField::WorkingMode),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = AggregativeNestedLoopJoinExecNode;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct datafusion.AggregativeNestedLoopJoinExecNode")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<AggregativeNestedLoopJoinExecNode, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut left__ = None;
+                let mut right__ = None;
+                let mut join_type__ = None;
+                let mut filter__ = None;
+                let mut left_sort_exprs__ = None;
+                let mut right_sort_exprs__ = None;
+                let mut fetch_per_key__ = None;
+                let mut working_mode__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Left => {
+                            if left__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("left"));
+                            }
+                            left__ = map_.next_value()?;
+                        }
+                        GeneratedField::Right => {
+                            if right__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("right"));
+                            }
+                            right__ = map_.next_value()?;
+                        }
+                        GeneratedField::JoinType => {
+                            if join_type__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("joinType"));
+                            }
+                            join_type__ = Some(map_.next_value::<JoinType>()? as i32);
+                        }
+                        GeneratedField::Filter => {
+                            if filter__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("filter"));
+                            }
+                            filter__ = map_.next_value()?;
+                        }
+                        GeneratedField::LeftSortExprs => {
+                            if left_sort_exprs__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("leftSortExprs"));
+                            }
+                            left_sort_exprs__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::RightSortExprs => {
+                            if right_sort_exprs__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("rightSortExprs"));
+                            }
+                            right_sort_exprs__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::FetchPerKey => {
+                            if fetch_per_key__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("fetchPerKey"));
+                            }
+                            fetch_per_key__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::WorkingMode => {
+                            if working_mode__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("workingMode"));
+                            }
+                            working_mode__ = Some(map_.next_value::<SlidingWindowWorkingMode>()? as i32);
+                        }
+                    }
+                }
+                Ok(AggregativeNestedLoopJoinExecNode {
+                    left: left__,
+                    right: right__,
+                    join_type: join_type__.unwrap_or_default(),
+                    filter: filter__,
+                    left_sort_exprs: left_sort_exprs__.unwrap_or_default(),
+                    right_sort_exprs: right_sort_exprs__.unwrap_or_default(),
+                    fetch_per_key: fetch_per_key__.unwrap_or_default(),
+                    working_mode: working_mode__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("datafusion.AggregativeNestedLoopJoinExecNode", FIELDS, GeneratedVisitor)
+    }
+}
 impl serde::Serialize for AliasNode {
     #[allow(deprecated)]
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
@@ -15606,282 +16103,6 @@ impl<'de> serde::Deserialize<'de> for PartitionedFile {
         deserializer.deserialize_struct("datafusion.PartitionedFile", FIELDS, GeneratedVisitor)
     }
 }
-impl serde::Serialize for PartitionedHashJoinExecNode {
-    #[allow(deprecated)]
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeStruct;
-        let mut len = 0;
-        if self.left.is_some() {
-            len += 1;
-        }
-        if self.right.is_some() {
-            len += 1;
-        }
-        if !self.on.is_empty() {
-            len += 1;
-        }
-        if self.join_type != 0 {
-            len += 1;
-        }
-        if self.partition_mode != 0 {
-            len += 1;
-        }
-        if self.null_equals_null {
-            len += 1;
-        }
-        if self.filter.is_some() {
-            len += 1;
-        }
-        if !self.left_sort_exprs.is_empty() {
-            len += 1;
-        }
-        if !self.right_sort_exprs.is_empty() {
-            len += 1;
-        }
-        if self.fetch_per_key != 0 {
-            len += 1;
-        }
-        if self.working_mode != 0 {
-            len += 1;
-        }
-        let mut struct_ser = serializer.serialize_struct("datafusion.PartitionedHashJoinExecNode", len)?;
-        if let Some(v) = self.left.as_ref() {
-            struct_ser.serialize_field("left", v)?;
-        }
-        if let Some(v) = self.right.as_ref() {
-            struct_ser.serialize_field("right", v)?;
-        }
-        if !self.on.is_empty() {
-            struct_ser.serialize_field("on", &self.on)?;
-        }
-        if self.join_type != 0 {
-            let v = JoinType::try_from(self.join_type)
-                .map_err(|_| serde::ser::Error::custom(format!("Invalid variant {}", self.join_type)))?;
-            struct_ser.serialize_field("joinType", &v)?;
-        }
-        if self.partition_mode != 0 {
-            let v = StreamPartitionMode::try_from(self.partition_mode)
-                .map_err(|_| serde::ser::Error::custom(format!("Invalid variant {}", self.partition_mode)))?;
-            struct_ser.serialize_field("partitionMode", &v)?;
-        }
-        if self.null_equals_null {
-            struct_ser.serialize_field("nullEqualsNull", &self.null_equals_null)?;
-        }
-        if let Some(v) = self.filter.as_ref() {
-            struct_ser.serialize_field("filter", v)?;
-        }
-        if !self.left_sort_exprs.is_empty() {
-            struct_ser.serialize_field("leftSortExprs", &self.left_sort_exprs)?;
-        }
-        if !self.right_sort_exprs.is_empty() {
-            struct_ser.serialize_field("rightSortExprs", &self.right_sort_exprs)?;
-        }
-        if self.fetch_per_key != 0 {
-            struct_ser.serialize_field("fetchPerKey", &self.fetch_per_key)?;
-        }
-        if self.working_mode != 0 {
-            let v = SlidingWindowWorkingMode::try_from(self.working_mode)
-                .map_err(|_| serde::ser::Error::custom(format!("Invalid variant {}", self.working_mode)))?;
-            struct_ser.serialize_field("workingMode", &v)?;
-        }
-        struct_ser.end()
-    }
-}
-impl<'de> serde::Deserialize<'de> for PartitionedHashJoinExecNode {
-    #[allow(deprecated)]
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        const FIELDS: &[&str] = &[
-            "left",
-            "right",
-            "on",
-            "join_type",
-            "joinType",
-            "partition_mode",
-            "partitionMode",
-            "null_equals_null",
-            "nullEqualsNull",
-            "filter",
-            "left_sort_exprs",
-            "leftSortExprs",
-            "right_sort_exprs",
-            "rightSortExprs",
-            "fetch_per_key",
-            "fetchPerKey",
-            "working_mode",
-            "workingMode",
-        ];
-
-        #[allow(clippy::enum_variant_names)]
-        enum GeneratedField {
-            Left,
-            Right,
-            On,
-            JoinType,
-            PartitionMode,
-            NullEqualsNull,
-            Filter,
-            LeftSortExprs,
-            RightSortExprs,
-            FetchPerKey,
-            WorkingMode,
-        }
-        impl<'de> serde::Deserialize<'de> for GeneratedField {
-            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
-            where
-                D: serde::Deserializer<'de>,
-            {
-                struct GeneratedVisitor;
-
-                impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
-                    type Value = GeneratedField;
-
-                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                        write!(formatter, "expected one of: {:?}", &FIELDS)
-                    }
-
-                    #[allow(unused_variables)]
-                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
-                    where
-                        E: serde::de::Error,
-                    {
-                        match value {
-                            "left" => Ok(GeneratedField::Left),
-                            "right" => Ok(GeneratedField::Right),
-                            "on" => Ok(GeneratedField::On),
-                            "joinType" | "join_type" => Ok(GeneratedField::JoinType),
-                            "partitionMode" | "partition_mode" => Ok(GeneratedField::PartitionMode),
-                            "nullEqualsNull" | "null_equals_null" => Ok(GeneratedField::NullEqualsNull),
-                            "filter" => Ok(GeneratedField::Filter),
-                            "leftSortExprs" | "left_sort_exprs" => Ok(GeneratedField::LeftSortExprs),
-                            "rightSortExprs" | "right_sort_exprs" => Ok(GeneratedField::RightSortExprs),
-                            "fetchPerKey" | "fetch_per_key" => Ok(GeneratedField::FetchPerKey),
-                            "workingMode" | "working_mode" => Ok(GeneratedField::WorkingMode),
-                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
-                        }
-                    }
-                }
-                deserializer.deserialize_identifier(GeneratedVisitor)
-            }
-        }
-        struct GeneratedVisitor;
-        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
-            type Value = PartitionedHashJoinExecNode;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("struct datafusion.PartitionedHashJoinExecNode")
-            }
-
-            fn visit_map<V>(self, mut map_: V) -> std::result::Result<PartitionedHashJoinExecNode, V::Error>
-                where
-                    V: serde::de::MapAccess<'de>,
-            {
-                let mut left__ = None;
-                let mut right__ = None;
-                let mut on__ = None;
-                let mut join_type__ = None;
-                let mut partition_mode__ = None;
-                let mut null_equals_null__ = None;
-                let mut filter__ = None;
-                let mut left_sort_exprs__ = None;
-                let mut right_sort_exprs__ = None;
-                let mut fetch_per_key__ = None;
-                let mut working_mode__ = None;
-                while let Some(k) = map_.next_key()? {
-                    match k {
-                        GeneratedField::Left => {
-                            if left__.is_some() {
-                                return Err(serde::de::Error::duplicate_field("left"));
-                            }
-                            left__ = map_.next_value()?;
-                        }
-                        GeneratedField::Right => {
-                            if right__.is_some() {
-                                return Err(serde::de::Error::duplicate_field("right"));
-                            }
-                            right__ = map_.next_value()?;
-                        }
-                        GeneratedField::On => {
-                            if on__.is_some() {
-                                return Err(serde::de::Error::duplicate_field("on"));
-                            }
-                            on__ = Some(map_.next_value()?);
-                        }
-                        GeneratedField::JoinType => {
-                            if join_type__.is_some() {
-                                return Err(serde::de::Error::duplicate_field("joinType"));
-                            }
-                            join_type__ = Some(map_.next_value::<JoinType>()? as i32);
-                        }
-                        GeneratedField::PartitionMode => {
-                            if partition_mode__.is_some() {
-                                return Err(serde::de::Error::duplicate_field("partitionMode"));
-                            }
-                            partition_mode__ = Some(map_.next_value::<StreamPartitionMode>()? as i32);
-                        }
-                        GeneratedField::NullEqualsNull => {
-                            if null_equals_null__.is_some() {
-                                return Err(serde::de::Error::duplicate_field("nullEqualsNull"));
-                            }
-                            null_equals_null__ = Some(map_.next_value()?);
-                        }
-                        GeneratedField::Filter => {
-                            if filter__.is_some() {
-                                return Err(serde::de::Error::duplicate_field("filter"));
-                            }
-                            filter__ = map_.next_value()?;
-                        }
-                        GeneratedField::LeftSortExprs => {
-                            if left_sort_exprs__.is_some() {
-                                return Err(serde::de::Error::duplicate_field("leftSortExprs"));
-                            }
-                            left_sort_exprs__ = Some(map_.next_value()?);
-                        }
-                        GeneratedField::RightSortExprs => {
-                            if right_sort_exprs__.is_some() {
-                                return Err(serde::de::Error::duplicate_field("rightSortExprs"));
-                            }
-                            right_sort_exprs__ = Some(map_.next_value()?);
-                        }
-                        GeneratedField::FetchPerKey => {
-                            if fetch_per_key__.is_some() {
-                                return Err(serde::de::Error::duplicate_field("fetchPerKey"));
-                            }
-                            fetch_per_key__ = 
-                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
-                            ;
-                        }
-                        GeneratedField::WorkingMode => {
-                            if working_mode__.is_some() {
-                                return Err(serde::de::Error::duplicate_field("workingMode"));
-                            }
-                            working_mode__ = Some(map_.next_value::<SlidingWindowWorkingMode>()? as i32);
-                        }
-                    }
-                }
-                Ok(PartitionedHashJoinExecNode {
-                    left: left__,
-                    right: right__,
-                    on: on__.unwrap_or_default(),
-                    join_type: join_type__.unwrap_or_default(),
-                    partition_mode: partition_mode__.unwrap_or_default(),
-                    null_equals_null: null_equals_null__.unwrap_or_default(),
-                    filter: filter__,
-                    left_sort_exprs: left_sort_exprs__.unwrap_or_default(),
-                    right_sort_exprs: right_sort_exprs__.unwrap_or_default(),
-                    fetch_per_key: fetch_per_key__.unwrap_or_default(),
-                    working_mode: working_mode__.unwrap_or_default(),
-                })
-            }
-        }
-        deserializer.deserialize_struct("datafusion.PartitionedHashJoinExecNode", FIELDS, GeneratedVisitor)
-    }
-}
 impl serde::Serialize for PhysicalAggregateExprNode {
     #[allow(deprecated)]
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
@@ -18169,8 +18390,11 @@ impl serde::Serialize for PhysicalPlanNode {
                 physical_plan_node::PhysicalPlanType::SlidingNestedLoopJoin(v) => {
                     struct_ser.serialize_field("slidingNestedLoopJoin", v)?;
                 }
-                physical_plan_node::PhysicalPlanType::PartitionedHashJoin(v) => {
-                    struct_ser.serialize_field("partitionedHashJoin", v)?;
+                physical_plan_node::PhysicalPlanType::AggregativeHashJoin(v) => {
+                    struct_ser.serialize_field("aggregativeHashJoin", v)?;
+                }
+                physical_plan_node::PhysicalPlanType::AggregativeNestedLoopJoin(v) => {
+                    struct_ser.serialize_field("aggregativeNestedLoopJoin", v)?;
                 }
             }
         }
@@ -18224,8 +18448,10 @@ impl<'de> serde::Deserialize<'de> for PhysicalPlanNode {
             "slidingHashJoin",
             "sliding_nested_loop_join",
             "slidingNestedLoopJoin",
-            "partitioned_hash_join",
-            "partitionedHashJoin",
+            "aggregative_hash_join",
+            "aggregativeHashJoin",
+            "aggregative_nested_loop_join",
+            "aggregativeNestedLoopJoin",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -18256,7 +18482,8 @@ impl<'de> serde::Deserialize<'de> for PhysicalPlanNode {
             SymmetricHashJoin,
             SlidingHashJoin,
             SlidingNestedLoopJoin,
-            PartitionedHashJoin,
+            AggregativeHashJoin,
+            AggregativeNestedLoopJoin,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -18304,7 +18531,8 @@ impl<'de> serde::Deserialize<'de> for PhysicalPlanNode {
                             "symmetricHashJoin" | "symmetric_hash_join" => Ok(GeneratedField::SymmetricHashJoin),
                             "slidingHashJoin" | "sliding_hash_join" => Ok(GeneratedField::SlidingHashJoin),
                             "slidingNestedLoopJoin" | "sliding_nested_loop_join" => Ok(GeneratedField::SlidingNestedLoopJoin),
-                            "partitionedHashJoin" | "partitioned_hash_join" => Ok(GeneratedField::PartitionedHashJoin),
+                            "aggregativeHashJoin" | "aggregative_hash_join" => Ok(GeneratedField::AggregativeHashJoin),
+                            "aggregativeNestedLoopJoin" | "aggregative_nested_loop_join" => Ok(GeneratedField::AggregativeNestedLoopJoin),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -18509,11 +18737,18 @@ impl<'de> serde::Deserialize<'de> for PhysicalPlanNode {
                             physical_plan_type__ = map_.next_value::<::std::option::Option<_>>()?.map(physical_plan_node::PhysicalPlanType::SlidingNestedLoopJoin)
 ;
                         }
-                        GeneratedField::PartitionedHashJoin => {
+                        GeneratedField::AggregativeHashJoin => {
                             if physical_plan_type__.is_some() {
-                                return Err(serde::de::Error::duplicate_field("partitionedHashJoin"));
+                                return Err(serde::de::Error::duplicate_field("aggregativeHashJoin"));
                             }
-                            physical_plan_type__ = map_.next_value::<::std::option::Option<_>>()?.map(physical_plan_node::PhysicalPlanType::PartitionedHashJoin)
+                            physical_plan_type__ = map_.next_value::<::std::option::Option<_>>()?.map(physical_plan_node::PhysicalPlanType::AggregativeHashJoin)
+;
+                        }
+                        GeneratedField::AggregativeNestedLoopJoin => {
+                            if physical_plan_type__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("aggregativeNestedLoopJoin"));
+                            }
+                            physical_plan_type__ = map_.next_value::<::std::option::Option<_>>()?.map(physical_plan_node::PhysicalPlanType::AggregativeNestedLoopJoin)
 ;
                         }
                     }

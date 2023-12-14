@@ -37,7 +37,6 @@ use crate::{
     expressions::{Column, PhysicalSortExpr},
     joins::StreamJoinPartitionMode,
     joins::{
-        sliding_window_join_utils::partitioned_join_output_partitioning,
         stream_join_utils::{
             build_filter_input_order, calculate_side_prune_length_helper,
             combine_two_batches, get_pruning_anti_indices, get_pruning_semi_indices,
@@ -47,7 +46,7 @@ use crate::{
         },
         utils::{
             build_batch_from_indices, build_join_schema, check_join_is_valid,
-            ColumnIndex, JoinFilter, JoinOn,
+            partitioned_join_output_partitioning, ColumnIndex, JoinFilter, JoinOn,
         },
     },
     metrics::{self, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet},
@@ -1126,9 +1125,9 @@ mod tests {
     use super::*;
     use crate::joins::test_utils::complicated_4_column_exprs;
     use crate::joins::test_utils::{
-        build_sides_record_batches, compare_batches, complicated_filter,
-        create_memory_table, join_expr_tests_fixture_f64, join_expr_tests_fixture_i32,
-        join_expr_tests_fixture_temporal, partitioned_hash_join_with_filter,
+        aggregative_hash_join_with_filter, build_sides_record_batches, compare_batches,
+        complicated_filter, create_memory_table, join_expr_tests_fixture_f64,
+        join_expr_tests_fixture_i32, join_expr_tests_fixture_temporal,
         partitioned_sym_join_with_filter, split_record_batches,
     };
 
@@ -1200,7 +1199,7 @@ mod tests {
             task_ctx.clone(),
         )
         .await?;
-        let second_batches = partitioned_hash_join_with_filter(
+        let second_batches = aggregative_hash_join_with_filter(
             left, right, on, filter, &join_type, false, task_ctx,
         )
         .await?;

@@ -16,7 +16,7 @@ use crate::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use crate::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use crate::physical_plan::joins::utils::{swap_filter, JoinFilter};
 use crate::physical_plan::joins::{
-    CrossJoinExec, HashJoinExec, NestedLoopJoinExec, PartitionedHashJoinExec,
+    AggregativeHashJoinExec, CrossJoinExec, HashJoinExec, NestedLoopJoinExec,
     SlidingHashJoinExec, SlidingNestedLoopJoinExec, SortMergeJoinExec,
     StreamJoinPartitionMode, SymmetricHashJoinExec,
 };
@@ -440,7 +440,7 @@ fn convert_to_plan_metadata(
 ///
 /// Evaluates a list of potential execution plans to determine which ones are
 /// suitable for streamable aggregation based on several criteria:
-/// - Whether a plan has seen a `PartitionedHashJoinExec`, and if so:
+/// - Whether a plan has seen an `AggregativeHashJoinExec`, and if so:
 ///     - Whether the plan's aggregation result is valid.
 ///     - Whether all GROUP BY and aggregate expressions are valid.
 /// - Whether the plan supports streamable aggregates.
@@ -464,31 +464,31 @@ fn select_best_aggregate_streaming_plan(
     possible_plans
         .into_iter()
         .filter_map(|plan| {
-            // Flag to track if we find a `PartitionedHashJoinExec` (PHJ):
-            let mut has_seen_phj = false;
+            // Flag to track if we find an `AggregativeHashJoinExec` (AHJ):
+            let mut has_seen_ahj = false;
             // Ensure that the plan results in a valid aggregation result:
-            if !check_the_aggregation_result_is_valid(&plan, &mut has_seen_phj) {
-                return Some(internal_err!("PartitionedHashJoinExec cannot be interrupted by an incompatible operator."));
+            if !check_the_aggregation_result_is_valid(&plan, &mut has_seen_ahj) {
+                return Some(internal_err!("AggregativeHashJoinExec cannot be interrupted by an incompatible operator."));
             }
-            // If we find a PHJ, check expressions' validity:
-            let agg_valid_results = !has_seen_phj || {
+            // If we find a AHJ, check expressions' validity:
+            let agg_valid_results = !has_seen_ahj || {
                 let schema = plan.schema();
-                // All GROUP BY expressions should probe the right side of a PHJ:
+                // All GROUP BY expressions should probe the right side of a AHJ:
                 let group_valid = group_by.expr().iter().all(|(expr, _)| {
                     collect_columns(expr).iter().all(|col| {
                         schema.field(col.index())
                             .metadata()
-                            .get("PartitionedHashJoinExec")
+                            .get("AggregativeHashJoinExec")
                             .map_or(false, |v| v.eq("JoinSide::Right"))
                     })
                 });
-                // All aggregate expressions should belong to the left side of a PHJ:
+                // All aggregate expressions should belong to the left side of a AHJ:
                 let aggr_valid = aggr_expr.iter().all(|expr| {
                     expr.expressions().iter().all(|expr| {
                         collect_columns(expr).iter().all(|col| {
                             schema.field(col.index())
                                 .metadata()
-                                .get("PartitionedHashJoinExec")
+                                .get("AggregativeHashJoinExec")
                                 .map_or(false, |v| v.eq("JoinSide::Left"))
                         })
                     })
@@ -542,7 +542,7 @@ fn find_closest_join_and_change(
     // Attempt to cast the current node to a `SymmetricHashJoinExec` (SHJ):
     if let Some(shj) = plan.as_any().downcast_ref::<SymmetricHashJoinExec>() {
         // If the current node is a SHJ, try to modify it based on `agg_plan`:
-        return replace_shj_with_phj(agg_plan, shj, config_options)
+        return replace_shj_with_ahj(agg_plan, shj, config_options)
             .map(|opt| vec![opt.unwrap_or_else(|| plan.clone())]);
     }
     // If the current plan node inhibit modification, return the original plan:
@@ -653,10 +653,10 @@ fn handle_sort_exec(plan_metadata: PlanMetadata) -> Result<Vec<PlanMetadata>> {
 }
 
 /// Attempts to replace the current join execution plan (`SymmetricHashJoinExec`)
-/// with a more optimized partitioned hash join based on specific conditions.
+/// with a more optimized aggregative hash join based on specific conditions.
 /// This optimization specifically targets scenarios where both input streams
 /// are unbounded and have filters and orders provided. If certain criteria are
-/// met, the function returns a `PartitionedHashJoinExec` or a swapped variant
+/// met, the function returns an `AggregativeHashJoinExec` or a swapped variant
 /// with an added projection. This is particularly useful in optimizing the
 /// processing of sliding window joins with aggregations.
 ///
@@ -677,7 +677,7 @@ fn handle_sort_exec(plan_metadata: PlanMetadata) -> Result<Vec<PlanMetadata>> {
 ///
 /// This function may return an error if it encounters any issue as it tries to
 /// create alternate plans.
-fn replace_shj_with_phj(
+fn replace_shj_with_ahj(
     parent_plan: &AggregateExec,
     shj: &SymmetricHashJoinExec,
     config_options: &ConfigOptions,
@@ -733,8 +733,8 @@ fn replace_shj_with_phj(
                 && matches!(shj.join_type(), JoinType::Inner | JoinType::Right)
                 && group_by.null_expr().is_empty()
             {
-                // Create a new partitioned hash join plan:
-                PartitionedHashJoinExec::try_new(
+                // Create a new aggregative hash join plan:
+                AggregativeHashJoinExec::try_new(
                     left_child.clone(),
                     right_child.clone(),
                     shj.on().to_vec(),
@@ -755,7 +755,7 @@ fn replace_shj_with_phj(
                 && group_by.null_expr().is_empty()
             {
                 // Create a new join plan with swapped sides:
-                let new_join = PartitionedHashJoinExec::try_new(
+                let new_join = AggregativeHashJoinExec::try_new(
                     right_child.clone(),
                     left_child.clone(),
                     swap_join_on(shj.on()),
@@ -1221,7 +1221,7 @@ fn handle_nested_loop_join(
 }
 
 /// Determines if the given execution plan node type is allowed before encountering
-/// a `PartitionedHashJoinExec` node in the plan tree.
+/// an `AggregativeHashJoinExec` node in the plan tree.
 ///
 /// # Parameters
 /// * `plan`: The execution plan node to check.
@@ -1234,7 +1234,7 @@ fn handle_nested_loop_join(
 ///   * `SortPreservingMergeExec`
 ///   * `ProjectionExec`
 ///   * `RepartitionExec`
-///   * `PartitionedHashJoinExec`
+///   * `AggregativeHashJoinExec`
 /// * Otherwise, returns `false`.
 ///
 fn is_allowed(plan: &Arc<dyn ExecutionPlan>) -> bool {
@@ -1245,17 +1245,17 @@ fn is_allowed(plan: &Arc<dyn ExecutionPlan>) -> bool {
         || as_any.is::<SortPreservingMergeExec>()
         || as_any.is::<ProjectionExec>()
         || as_any.is::<RepartitionExec>()
-        || as_any.is::<PartitionedHashJoinExec>()
+        || as_any.is::<AggregativeHashJoinExec>()
 }
 
 /// Recursively checks the execution plan from the given node downward to determine
-/// if any unallowed executors exist before a `PartitionedHashJoinExec` node.
+/// if any unallowed executors exist before a `AggregativeHashJoinExec` node.
 ///
 /// The function traverses the tree in a depth-first manner. If it encounters an unallowed
-/// executor before it reaches a `PartitionedHashJoinExec`, it immediately stops and returns
-/// `false`. If a `PartitionedHashJoinExec` node is found before encountering any unallowed
+/// executor before it reaches an `AggregativeHashJoinExec`, it immediately stops and returns
+/// `false`. If an `AggregativeHashJoinExec` node is found before encountering any unallowed
 /// executors, the function returns `true`. If the function completes traversal without
-/// finding a `PartitionedHashJoinExec`, it still considers it as a valid path and returns
+/// finding an `AggregativeHashJoinExec`, it still considers it as a valid path and returns
 /// `true`.
 ///
 /// # Examples
@@ -1266,12 +1266,12 @@ fn is_allowed(plan: &Arc<dyn ExecutionPlan>) -> bool {
 /// [
 ///     "ProjectionExec: expr=[c_custkey@0 as c_custkey, n_nationkey@2 as n_nationkey]",
 ///     ...
-///     "    PartitionedHashJoinExec: join_type=Inner, on=[(c_nationkey@1, n_regionkey@1)], filter=n_nationkey@1 > c_custkey@0",
+///     "    AggregativeHashJoinExec: join_type=Inner, on=[(c_nationkey@1, n_regionkey@1)], filter=n_nationkey@1 > c_custkey@0",
 ///     ...
 /// ]
 /// ```
 /// This will return `true` since there's a valid path with only allowed executors before
-/// `PartitionedHashJoinExec`.
+/// `AggregativeHashJoinExec`.
 ///
 /// For the tree structure:
 ///
@@ -1289,7 +1289,7 @@ fn is_allowed(plan: &Arc<dyn ExecutionPlan>) -> bool {
 ///     "    CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/nation.csv]]}, projection=[n_nationkey, n_regionkey], output_ordering=[n_nationkey@0 ASC NULLS LAST], has_header=true",
 ///]
 /// ```
-/// This will return `true` because no `PartitionedHashJoinExec` is present.
+/// This will return `true` because no `AggregativeHashJoinExec` is present.
 ///
 /// For another tree structure:
 ///
@@ -1299,25 +1299,25 @@ fn is_allowed(plan: &Arc<dyn ExecutionPlan>) -> bool {
 ///     ...
 ///     "  HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(o_orderdate@3, l_shipdate@1)], filter=l_orderkey@1 < o_orderkey@0 - 10 AND l_orderkey@1 > o_orderkey@0 + 10",
 ///     ...
-///     "    PartitionedHashJoinExec: join_type=Inner, on=[(c_nationkey@1, n_regionkey@1)], filter=n_nationkey@1 > c_custkey@0",
+///     "    AggregativeHashJoinExec: join_type=Inner, on=[(c_nationkey@1, n_regionkey@1)], filter=n_nationkey@1 > c_custkey@0",
 ///     ...
 /// ]
 /// ```
 /// This will return `false` since there's an unallowed executor before
-/// `PartitionedHashJoinExec`.
+/// `AggregativeHashJoinExec`.
 ///
 ///
 /// ```plaintext
 /// [
-///     "PartitionedHashJoinExec: join_type=Inner, on=[(z@2, c@2)], filter=0@0 > 1@1",
+///     "AggregativeHashJoinExec: join_type=Inner, on=[(z@2, c@2)], filter=0@0 > 1@1",
 ///     "  StreamingTableExec: partition_sizes=0, projection=[x, y, z], infinite_source=true, output_ordering=[x@0 ASC]",
-///     "  PartitionedHashJoinExec: join_type=Inner, on=[(a@0, d@0)], filter=0@0 > 1@1",
+///     "  AggregativeHashJoinExec: join_type=Inner, on=[(a@0, d@0)], filter=0@0 > 1@1",
 ///     "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
 ///     "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
 /// ]
 ///
 /// ```
-/// This will return `false` since there is more than one `PartitionedHashJoinExec`.
+/// This will return `false` since there is more than one `AggregativeHashJoinExec`.
 ///
 /// # Parameters
 ///
@@ -1325,9 +1325,9 @@ fn is_allowed(plan: &Arc<dyn ExecutionPlan>) -> bool {
 ///
 /// # Returns
 ///
-/// * `true` if the tree has only allowed executors before encountering a
-/// `PartitionedHashJoinExec` or if `PartitionedHashJoinExec` is not present.
-/// * `false` if there's an unallowed executor before a `PartitionedHashJoinExec`.
+/// * `true` if the tree has only allowed executors before encountering an
+/// `AggregativeHashJoinExec` or if an `AggregativeHashJoinExec` is not present.
+/// * `false` if there's an unallowed executor before an `AggregativeHashJoinExec`.
 ///
 /// # Note
 ///
@@ -1336,18 +1336,18 @@ fn is_allowed(plan: &Arc<dyn ExecutionPlan>) -> bool {
 fn check_nodes(
     plan: Arc<dyn ExecutionPlan>,
     path: &mut Vec<Arc<dyn ExecutionPlan>>,
-    has_seen_phj: &mut bool,
+    has_seen_ahj: &mut bool,
 ) -> bool {
     path.push(plan.clone());
-    // If we've encountered a PartitionedHashJoinExec
-    if plan.as_any().is::<PartitionedHashJoinExec>() {
-        if *has_seen_phj {
-            // We've already seen a PHJ and encountered another one before an aggregation.
+    // If we've encountered an AggregativeHashJoinExec:
+    if plan.as_any().is::<AggregativeHashJoinExec>() {
+        if *has_seen_ahj {
+            // We've already seen a AHJ and encountered another one before an aggregation.
             return false;
         }
-        *has_seen_phj = true;
+        *has_seen_ahj = true;
 
-        // Check if all nodes in the path are allowed before a PHJ.
+        // Check if all nodes in the path are allowed before a AHJ.
         for node in path.iter() {
             if !is_allowed(node) {
                 return false;
@@ -1357,14 +1357,14 @@ fn check_nodes(
 
     // If we encounter an AggregateExec
     if plan.as_any().is::<AggregateExec>() {
-        // We can exit early if we see an AggregateExec after a PHJ or even without a prior PHJ.
+        // We can exit early if we see an AggregateExec after a AHJ or even without a prior AHJ.
         return true;
     }
 
     // If we have not returned by now, we recursively check children.
     let mut is_valid = true;
     for child in plan.children() {
-        is_valid &= check_nodes(child.clone(), path, has_seen_phj);
+        is_valid &= check_nodes(child.clone(), path, has_seen_ahj);
         if !is_valid {
             break;
         }
@@ -1376,13 +1376,13 @@ fn check_nodes(
 
 /// Validates if the given execution plan results in a valid aggregation by traversing the plan's nodes.
 ///
-/// The function determines the validity based on certain conditions related to `PartitionedHashJoinExec`
-/// and other allowed nodes leading up to it. If an `AggregateExec` is found without a prior `PartitionedHashJoinExec`,
+/// The function determines the validity based on certain conditions related to `AggregativeHashJoinExec`
+/// and other allowed nodes leading up to it. If an `AggregateExec` is found without a prior `AggregativeHashJoinExec`,
 /// the result is considered also valid.
 ///
 /// # Parameters
 /// * `plan`: The root execution plan node to start the validation from.
-/// * `has_seen_phj`: A mutable reference to a boolean flag that indicates whether a `PartitionedHashJoinExec`
+/// * `has_seen_ahj`: A mutable reference to a boolean flag that indicates whether an `AggregativeHashJoinExec`
 ///   node has been encountered during the traversal. This flag is updated during the process.
 ///
 /// # Returns
@@ -1391,10 +1391,10 @@ fn check_nodes(
 ///
 fn check_the_aggregation_result_is_valid(
     plan: &Arc<dyn ExecutionPlan>,
-    has_seen_phj: &mut bool,
+    has_seen_ahj: &mut bool,
 ) -> bool {
     let mut path = Vec::new();
-    check_nodes(plan.clone(), &mut path, has_seen_phj)
+    check_nodes(plan.clone(), &mut path, has_seen_ahj)
 }
 
 #[cfg(test)]
@@ -3330,7 +3330,7 @@ mod order_preserving_join_swap_tests {
     }
 
     #[tokio::test]
-    async fn test_partitioned_hash_join() -> Result<()> {
+    async fn test_aggregative_hash_join() -> Result<()> {
         let left_schema = create_test_schema()?;
         let right_schema = create_test_schema2()?;
         let left_input =
@@ -3350,7 +3350,7 @@ mod order_preserving_join_swap_tests {
             col_indices("a", &left_schema, JoinSide::Left),
         );
 
-        // Waiting swap on PartitionedHashJoin.
+        // Waiting swap on AggregativeHashJoin.
         let join = hash_join_exec(
             left_input,
             right_input,
@@ -3386,7 +3386,7 @@ mod order_preserving_join_swap_tests {
         ];
         let expected_optimized = [
             "AggregateExec: mode=Partial, gby=[d@3 as d], aggr=[LastValue(b)], ordering_mode=Sorted",
-            "  PartitionedHashJoinExec: join_type=Inner, on=[(a@0, d@0)], filter=0@0 > 1@1",
+            "  AggregativeHashJoinExec: join_type=Inner, on=[(a@0, d@0)], filter=0@0 > 1@1",
             "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
             "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
         ];
@@ -3395,8 +3395,9 @@ mod order_preserving_join_swap_tests {
         assert_enforce_sorting_join_selection!(expected_optimized, physical_plan);
         Ok(())
     }
+
     #[tokio::test]
-    async fn test_partitioned_hash_join_with_swap() -> Result<()> {
+    async fn test_aggregative_hash_join_with_swap() -> Result<()> {
         let left_schema = create_test_schema()?;
         let right_schema = create_test_schema2()?;
         let left_input =
@@ -3416,7 +3417,7 @@ mod order_preserving_join_swap_tests {
             col_indices("d", &right_schema, JoinSide::Right),
         );
 
-        // Waiting swap on PartitionedHashJoin.
+        // Waiting swap on AggregativeHashJoin.
         let join = hash_join_exec(
             left_input,
             right_input,
@@ -3453,7 +3454,7 @@ mod order_preserving_join_swap_tests {
         let expected_optimized = [
             "AggregateExec: mode=Partial, gby=[a@0 as a], aggr=[LastValue(e)], ordering_mode=Sorted",
             "  ProjectionExec: expr=[a@3 as a, b@4 as b, c@5 as c, d@0 as d, e@1 as e, c@2 as c]",
-            "    PartitionedHashJoinExec: join_type=Inner, on=[(d@0, a@0)], filter=0@0 > 1@1",
+            "    AggregativeHashJoinExec: join_type=Inner, on=[(d@0, a@0)], filter=0@0 > 1@1",
             "      StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
             "      StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
         ];
@@ -3464,7 +3465,7 @@ mod order_preserving_join_swap_tests {
     }
 
     #[tokio::test]
-    async fn test_partitioned_hash_not_change_due_to_group_by_sides() -> Result<()> {
+    async fn test_aggregative_hash_not_change_due_to_group_by_sides() -> Result<()> {
         let left_schema = create_test_schema()?;
         let right_schema = create_test_schema2()?;
         let left_input =
@@ -3484,7 +3485,7 @@ mod order_preserving_join_swap_tests {
             col_indices("a", &left_schema, JoinSide::Left),
         );
 
-        // Waiting swap on PartitionedHashJoin.
+        // Waiting swap on AggregativeHashJoin.
         let join = hash_join_exec(
             left_input,
             right_input,
@@ -3531,7 +3532,7 @@ mod order_preserving_join_swap_tests {
     }
 
     #[tokio::test]
-    async fn test_partitioned_hash_not_change_due_to_aggr_expr() -> Result<()> {
+    async fn test_aggregative_hash_not_change_due_to_aggr_expr() -> Result<()> {
         let left_schema = create_test_schema()?;
         let right_schema = create_test_schema2()?;
         let left_input =
@@ -3551,7 +3552,7 @@ mod order_preserving_join_swap_tests {
             col_indices("a", &left_schema, JoinSide::Left),
         );
 
-        // Waiting swap on PartitionedHashJoin.
+        // Waiting swap on AggregativeHashJoin.
         let join = hash_join_exec(
             left_input,
             right_input,
@@ -3598,7 +3599,7 @@ mod order_preserving_join_swap_tests {
     }
 
     #[tokio::test]
-    async fn test_prevent_multiple_partitioned_hash_join_for_single_agg() -> Result<()> {
+    async fn test_prevent_multiple_aggregative_hash_join_for_single_agg() -> Result<()> {
         let left_schema = create_test_schema()?;
         let right_schema = create_test_schema2()?;
         let left_input =
@@ -3618,7 +3619,7 @@ mod order_preserving_join_swap_tests {
             col_indices("a", &left_schema, JoinSide::Left),
         );
 
-        // Waiting swap on PartitionedHashJoin.
+        // Waiting swap on AggregativeHashJoin.
         let join = hash_join_exec(
             left_input,
             right_input,
@@ -3720,7 +3721,7 @@ mod order_preserving_join_swap_tests {
             col_indices("a", &left_schema, JoinSide::Left),
         );
 
-        // Waiting swap on PartitionedHashJoin.
+        // Waiting swap on AggregativeHashJoin.
         let join = hash_join_exec(
             left_input,
             right_input,
@@ -3803,7 +3804,7 @@ mod order_preserving_join_swap_tests {
     }
 
     #[tokio::test]
-    async fn test_unified_hash_joins_partitioned_hash_join() -> Result<()> {
+    async fn test_unified_hash_joins_aggregative_hash_join() -> Result<()> {
         let left_schema = create_test_schema()?;
         let right_schema = create_test_schema2()?;
         let left_input =
@@ -3823,7 +3824,7 @@ mod order_preserving_join_swap_tests {
             col_indices("a", &left_schema, JoinSide::Left),
         );
 
-        // Waiting swap on PartitionedHashJoin.
+        // Waiting swap on AggregativeHashJoin.
         let join = hash_join_exec(
             left_input,
             right_input,
@@ -3892,7 +3893,7 @@ mod order_preserving_join_swap_tests {
         ];
         let expected_optimized = [
             "AggregateExec: mode=Partial, gby=[d@6 as d], aggr=[LastValue(y)], ordering_mode=Sorted",
-            "  PartitionedHashJoinExec: join_type=Inner, on=[(z@2, c@2)], filter=0@0 > 1@1",
+            "  AggregativeHashJoinExec: join_type=Inner, on=[(z@2, c@2)], filter=0@0 > 1@1",
             "    StreamingTableExec: partition_sizes=0, projection=[x, y, z], infinite_source=true, output_ordering=[x@0 ASC]",
             "    ProjectionExec: expr=[a@3 as a, b@4 as b, c@5 as c, d@0 as d, e@1 as e, c@2 as c]",
             "      HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, a@0)], filter=0@0 > 1@1",
@@ -4150,7 +4151,7 @@ mod sql_fuzzy_tests {
             "ProjectionExec: expr=[o_orderkey@0 as o_orderkey, LAST_VALUE(lineitem.l_suppkey) ORDER BY [lineitem.l_orderkey ASC NULLS LAST]@1 as amount_usd]",
             "  AggregateExec: mode=Single, gby=[o_orderkey@0 as o_orderkey], aggr=[LAST_VALUE(lineitem.l_suppkey)], ordering_mode=Sorted",
             "    ProjectionExec: expr=[o_orderkey@3 as o_orderkey, l_orderkey@0 as l_orderkey, l_suppkey@1 as l_suppkey]",
-            "      PartitionedHashJoinExec: join_type=Inner, on=[(l_shipdate@2, o_orderdate@1)], filter=l_orderkey@1 < o_orderkey@0 - 10",
+            "      AggregativeHashJoinExec: join_type=Inner, on=[(l_shipdate@2, o_orderdate@1)], filter=l_orderkey@1 < o_orderkey@0 - 10",
             "        ProjectionExec: expr=[l_orderkey@0 as l_orderkey, l_suppkey@1 as l_suppkey, l_shipdate@3 as l_shipdate]",
             "          CoalesceBatchesExec: target_batch_size=8192",
             "            FilterExec: l_returnflag@2 = R",
@@ -4190,7 +4191,7 @@ mod sql_fuzzy_tests {
             "ProjectionExec: expr=[n_nationkey@0 as n_nationkey, LAST_VALUE(customer.c_custkey) ORDER BY [customer.c_custkey ASC NULLS LAST]@1 as amount_usd]",
             "  AggregateExec: mode=Single, gby=[n_nationkey@1 as n_nationkey], aggr=[LAST_VALUE(customer.c_custkey)], ordering_mode=Sorted",
             "    ProjectionExec: expr=[c_custkey@0 as c_custkey, n_nationkey@2 as n_nationkey]",
-            "      PartitionedHashJoinExec: join_type=Inner, on=[(c_nationkey@1, n_regionkey@1)], filter=n_nationkey@1 > c_custkey@0",
+            "      AggregativeHashJoinExec: join_type=Inner, on=[(c_nationkey@1, n_regionkey@1)], filter=n_nationkey@1 > c_custkey@0",
             "        ProjectionExec: expr=[c_custkey@1 as c_custkey, c_nationkey@2 as c_nationkey]",
             "          SortMergeJoin: join_type=Inner, on=[(o_orderkey@0, c_custkey@0)]",
             "            ProjectionExec: expr=[o_orderkey@2 as o_orderkey]",
@@ -4236,7 +4237,7 @@ mod sql_fuzzy_tests {
             "  ProjectionExec: expr=[n_nationkey@0 as n_nationkey, LAST_VALUE(customer.c_custkey) ORDER BY [customer.c_custkey ASC NULLS LAST]@1 as amount_usd]",
             "    AggregateExec: mode=Single, gby=[n_nationkey@1 as n_nationkey], aggr=[LAST_VALUE(customer.c_custkey)], ordering_mode=Sorted",
             "      ProjectionExec: expr=[c_custkey@0 as c_custkey, n_nationkey@2 as n_nationkey]",
-            "        PartitionedHashJoinExec: join_type=Inner, on=[(c_nationkey@1, n_regionkey@1)], filter=n_nationkey@1 > c_custkey@0",
+            "        AggregativeHashJoinExec: join_type=Inner, on=[(c_nationkey@1, n_regionkey@1)], filter=n_nationkey@1 > c_custkey@0",
             "          ProjectionExec: expr=[c_custkey@1 as c_custkey, c_nationkey@2 as c_nationkey]",
             "            SortMergeJoin: join_type=Inner, on=[(o_orderkey@0, c_custkey@0)]",
             "              ProjectionExec: expr=[o_orderkey@2 as o_orderkey]",
@@ -4268,7 +4269,7 @@ mod sql_fuzzy_tests {
             "ProjectionExec: expr=[o_orderkey@0 as o_orderkey, LAST_VALUE(lineitem.l_suppkey) ORDER BY [lineitem.l_orderkey ASC NULLS LAST]@1 as amount_usd]",
             "  AggregateExec: mode=Single, gby=[o_orderkey@0 as o_orderkey], aggr=[LAST_VALUE(lineitem.l_suppkey)], ordering_mode=Sorted",
             "    ProjectionExec: expr=[o_orderkey@3 as o_orderkey, l_orderkey@0 as l_orderkey, l_suppkey@1 as l_suppkey]",
-            "      PartitionedHashJoinExec: join_type=Inner, on=[(l_shipdate@2, o_orderdate@1)], filter=l_orderkey@1 < o_orderkey@0 - 10",
+            "      AggregativeHashJoinExec: join_type=Inner, on=[(l_shipdate@2, o_orderdate@1)], filter=l_orderkey@1 < o_orderkey@0 - 10",
             "        ProjectionExec: expr=[l_orderkey@0 as l_orderkey, l_suppkey@1 as l_suppkey, l_shipdate@3 as l_shipdate]",
             "          CoalesceBatchesExec: target_batch_size=8192",
             "            FilterExec: l_returnflag@2 = R",

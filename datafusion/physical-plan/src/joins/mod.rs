@@ -17,10 +17,11 @@
 
 //! DataFusion Join implementations
 
+pub use aggregative_hash_join::AggregativeHashJoinExec;
+pub use aggregative_nested_loop_join::AggregativeNestedLoopJoinExec;
 pub use cross_join::CrossJoinExec;
 pub use hash_join::HashJoinExec;
 pub use nested_loop_join::NestedLoopJoinExec;
-pub use partitioned_hash_join::PartitionedHashJoinExec;
 pub use sliding_hash_join::{swap_sliding_hash_join, SlidingHashJoinExec};
 pub use sliding_nested_loop_join::{
     swap_sliding_nested_loop_join, SlidingNestedLoopJoinExec,
@@ -31,10 +32,11 @@ pub use symmetric_hash_join::SymmetricHashJoinExec;
 pub mod prunability;
 pub mod utils;
 
+mod aggregative_hash_join;
+mod aggregative_nested_loop_join;
 mod cross_join;
 mod hash_join;
 mod nested_loop_join;
-mod partitioned_hash_join;
 mod sliding_hash_join;
 mod sliding_nested_loop_join;
 mod sliding_window_join_utils;

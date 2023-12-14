@@ -146,7 +146,7 @@ datafusion/physical-plan/src/joins/sliding_window_join_utils.rs
 datafusion/physical-plan/src/joins/sliding_nested_loop_join.rs
 datafusion/physical-plan/src/joins/sliding_hash_join.rs
 datafusion/physical-plan/src/joins/utils.rs
-datafusion/physical-plan/src/joins/partitioned_hash_join.rs
+datafusion/physical-plan/src/joins/aggregative_hash_join.rs
 force_push_main.sh
 generate_synnada_commits.sh
 datafusion/sqllogictest/test_files/stream.slt
@@ -155,3 +155,4 @@ datafusion/core/tests/data/sales_global.csv
 datafusion/core/tests/data/sales_us.csv
 datafusion/core/src/physical_optimizer/projection_pushdown.rs
 datafusion/physical-plan/src/joins/prunability.rs
+datafusion/physical-plan/src/joins/aggregative_nested_loop_join.rs
