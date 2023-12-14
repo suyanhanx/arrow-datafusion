@@ -318,7 +318,7 @@ SortPreservingMergeExec: [ts@0 ASC NULLS LAST,sn@1 ASC NULLS LAST]
 --------SortPreservingRepartitionExec: partitioning=Hash([sn@0, ts@1, amount@2, currency@3], 4), input_partitions=4, sort_exprs=ts@1 ASC NULLS LAST,sn@0 ASC NULLS LAST
 ----------AggregateExec: mode=Partial, gby=[sn@1 as sn, ts@0 as ts, amount@2 as amount, currency@3 as currency], aggr=[LAST_VALUE(e.rate)], ordering_mode=PartiallySorted([0, 1])
 ------------ProjectionExec: expr=[ts@3 as ts, sn@4 as sn, amount@5 as amount, currency@6 as currency, rate@2 as rate]
---------------PartitionedHashJoinExec: join_type=Inner, on=[(currency_from@1, currency@3)], filter=ts@0 >= ts@1
+--------------AggregativeHashJoinExec: join_type=Inner, on=[(currency_from@1, currency@3)], filter=ts@0 >= ts@1
 ----------------CoalesceBatchesExec: target_batch_size=8192
 ------------------SortPreservingRepartitionExec: partitioning=Hash([currency_from@1], 4), input_partitions=4, sort_exprs=ts@0 ASC NULLS LAST
 --------------------ProjectionExec: expr=[ts@0 as ts, currency_from@1 as currency_from, rate@3 as rate]
@@ -422,7 +422,7 @@ ProjectionExec: expr=[amount_usd@0 as amount_usd]
 ----------SortPreservingRepartitionExec: partitioning=Hash([sn@0], 4), input_partitions=4, sort_exprs=sn@0 ASC NULLS LAST
 ------------AggregateExec: mode=Partial, gby=[sn@0 as sn], aggr=[LAST_VALUE(e.rate)], ordering_mode=Sorted
 --------------ProjectionExec: expr=[sn@5 as sn, sn2@1 as sn2, rate@3 as rate]
-----------------PartitionedHashJoinExec: join_type=Inner, on=[(currency_from@2, currency@2)], filter=ts@0 >= ts@1
+----------------AggregativeHashJoinExec: join_type=Inner, on=[(currency_from@2, currency@2)], filter=ts@0 >= ts@1
 ------------------CoalesceBatchesExec: target_batch_size=8192
 --------------------SortPreservingRepartitionExec: partitioning=Hash([currency_from@2], 4), input_partitions=4, sort_exprs=sn2@1 ASC NULLS LAST,ts@0 ASC NULLS LAST
 ----------------------ProjectionExec: expr=[ts@0 as ts, sn2@1 as sn2, currency_from@2 as currency_from, rate@4 as rate]

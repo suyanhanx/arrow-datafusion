@@ -41,8 +41,8 @@ use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::insert::FileSinkExec;
 use datafusion::physical_plan::joins::utils::{ColumnIndex, JoinFilter};
 use datafusion::physical_plan::joins::{
-    CrossJoinExec, HashJoinExec, NestedLoopJoinExec, PartitionMode,
-    PartitionedHashJoinExec, SlidingHashJoinExec, SlidingNestedLoopJoinExec,
+    AggregativeHashJoinExec, AggregativeNestedLoopJoinExec, CrossJoinExec, HashJoinExec,
+    NestedLoopJoinExec, PartitionMode, SlidingHashJoinExec, SlidingNestedLoopJoinExec,
     SlidingWindowWorkingMode, StreamJoinPartitionMode, SymmetricHashJoinExec,
 };
 use datafusion::physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
@@ -999,20 +999,20 @@ impl AsExecutionPlan for PhysicalPlanNode {
                 )
                 .map(|e| Arc::new(e) as _)
             }
-            PhysicalPlanType::PartitionedHashJoin(partitioned_hash_join) => {
+            PhysicalPlanType::AggregativeHashJoin(aggregative_hash_join) => {
                 let left = into_physical_plan(
-                    &partitioned_hash_join.left,
+                    &aggregative_hash_join.left,
                     registry,
                     runtime,
                     extension_codec,
                 )?;
                 let right = into_physical_plan(
-                    &partitioned_hash_join.right,
+                    &aggregative_hash_join.right,
                     registry,
                     runtime,
                     extension_codec,
                 )?;
-                let on = partitioned_hash_join
+                let on = aggregative_hash_join
                     .on
                     .iter()
                     .map(|col| {
@@ -1022,14 +1022,14 @@ impl AsExecutionPlan for PhysicalPlanNode {
                     })
                     .collect::<Result<_>>()?;
                 let join_type =
-                    protobuf::JoinType::try_from(partitioned_hash_join.join_type)
+                    protobuf::JoinType::try_from(aggregative_hash_join.join_type)
                         .map_err(|_| {
                             proto_error(format!(
-                        "Received a PartitionedHashJoin message with unknown JoinType {}",
-                        partitioned_hash_join.join_type
+                        "Received a AggregativeHashJoin message with unknown JoinType {}",
+                        aggregative_hash_join.join_type
                     ))
                         })?;
-                let ok_filter: Result<_> = partitioned_hash_join
+                let ok_filter: Result<_> = aggregative_hash_join
                     .filter
                     .as_ref()
                     .map(|f| {
@@ -1050,7 +1050,7 @@ impl AsExecutionPlan for PhysicalPlanNode {
                             .map(|i| {
                                 let side = protobuf::JoinSide::try_from(i.side)
                                     .map_err(|_| proto_error(format!(
-                                        "Received a PartitionedHashJoin message with JoinSide in Filter {}",
+                                        "Received a AggregativeHashJoin message with JoinSide in Filter {}",
                                         i.side))
                                     )?;
 
@@ -1067,10 +1067,10 @@ impl AsExecutionPlan for PhysicalPlanNode {
                 let filter = ok_filter?.unwrap();
 
                 let partition_mode =
-                    protobuf::StreamPartitionMode::try_from(partitioned_hash_join.partition_mode).map_err(|_| {
+                    protobuf::StreamPartitionMode::try_from(aggregative_hash_join.partition_mode).map_err(|_| {
                         proto_error(format!(
-                            "Received a PartitionedHashJoin message with unknown PartitionMode {}",
-                            partitioned_hash_join.partition_mode
+                            "Received a AggregativeHashJoin message with unknown PartitionMode {}",
+                            aggregative_hash_join.partition_mode
                         ))
                     })?;
                 let partition_mode = match partition_mode {
@@ -1083,10 +1083,10 @@ impl AsExecutionPlan for PhysicalPlanNode {
                 };
 
                 let working_mode =
-                    protobuf::SlidingWindowWorkingMode::try_from(partitioned_hash_join.working_mode).map_err(|_| {
+                    protobuf::SlidingWindowWorkingMode::try_from(aggregative_hash_join.working_mode).map_err(|_| {
                         proto_error(format!(
-                            "Received a PartitionedHashJoin message with unknown SlidingWindowWorkingMode {}",
-                            partitioned_hash_join.working_mode
+                            "Received a AggregativeHashJoin message with unknown SlidingWindowWorkingMode {}",
+                            aggregative_hash_join.working_mode
                         ))
                     })?;
 
@@ -1099,7 +1099,7 @@ impl AsExecutionPlan for PhysicalPlanNode {
                     }
                 };
 
-                let left_sort_exprs = partitioned_hash_join
+                let left_sort_exprs = aggregative_hash_join
                     .left_sort_exprs
                     .iter()
                     .map(|expr| {
@@ -1133,7 +1133,7 @@ impl AsExecutionPlan for PhysicalPlanNode {
                     })
                     .collect::<Result<_>>()?;
 
-                let right_sort_exprs = partitioned_hash_join
+                let right_sort_exprs = aggregative_hash_join
                     .right_sort_exprs
                     .iter()
                     .map(|expr| {
@@ -1167,17 +1167,170 @@ impl AsExecutionPlan for PhysicalPlanNode {
                     })
                     .collect::<Result<_>>()?;
 
-                PartitionedHashJoinExec::try_new(
+                AggregativeHashJoinExec::try_new(
                     left,
                     right,
                     on,
                     filter,
                     &join_type.into(),
-                    partitioned_hash_join.null_equals_null,
+                    aggregative_hash_join.null_equals_null,
                     left_sort_exprs,
                     right_sort_exprs,
-                    partitioned_hash_join.fetch_per_key as usize,
+                    aggregative_hash_join.fetch_per_key as usize,
                     partition_mode,
+                    working_mode,
+                )
+                .map(|e| Arc::new(e) as _)
+            }
+            PhysicalPlanType::AggregativeNestedLoopJoin(aggregative_nested_loop_join) => {
+                let left = into_physical_plan(
+                    &aggregative_nested_loop_join.left,
+                    registry,
+                    runtime,
+                    extension_codec,
+                )?;
+                let right = into_physical_plan(
+                    &aggregative_nested_loop_join.right,
+                    registry,
+                    runtime,
+                    extension_codec,
+                )?;
+                let join_type =
+                    protobuf::JoinType::try_from(aggregative_nested_loop_join.join_type)
+                        .map_err(|_| {
+                            proto_error(format!(
+                                "Received a AggregativeNestedLoopJoinNode message with unknown JoinType {}",
+                                aggregative_nested_loop_join.join_type
+                            ))
+                        })?;
+                let ok_filter: Result<_> = aggregative_nested_loop_join
+                    .filter
+                    .as_ref()
+                    .map(|f| {
+                        let schema = f
+                            .schema
+                            .as_ref()
+                            .ok_or_else(|| proto_error("Missing JoinFilter schema"))?
+                            .try_into()?;
+
+                        let expression = parse_physical_expr(
+                            f.expression.as_ref().ok_or_else(|| {
+                                proto_error("Unexpected empty filter expression")
+                            })?,
+                            registry, &schema
+                        )?;
+                        let column_indices = f.column_indices
+                            .iter()
+                            .map(|i| {
+                                let side = protobuf::JoinSide::try_from(i.side)
+                                    .map_err(|_| proto_error(format!(
+                                        "Received a AggregativeNestedLoopJoinNode message with JoinSide in Filter {}",
+                                        i.side))
+                                    )?;
+
+                                Ok(ColumnIndex{
+                                    index: i.index as usize,
+                                    side: side.into(),
+                                })
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+
+                        Ok(JoinFilter::new(expression, column_indices, schema))
+                    }).transpose();
+
+                let filter = ok_filter?.unwrap();
+
+                let left_sort_exprs = aggregative_nested_loop_join
+                    .left_sort_exprs
+                    .iter()
+                    .map(|expr| {
+                        let expr = expr.expr_type.as_ref().ok_or_else(|| {
+                            proto_error(format!(
+                                "physical_plan::from_proto() Unexpected expr {self:?}"
+                            ))
+                        })?;
+                        if let protobuf::physical_expr_node::ExprType::Sort(sort_expr) = expr {
+                            let expr = sort_expr
+                                .expr
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    proto_error(format!(
+                                        "physical_plan::from_proto() Unexpected sort expr {self:?}"
+                                    ))
+                                })?
+                                .as_ref();
+                            Ok(PhysicalSortExpr {
+                                expr: parse_physical_expr(expr,registry, left.schema().as_ref())?,
+                                options: SortOptions {
+                                    descending: !sort_expr.asc,
+                                    nulls_first: sort_expr.nulls_first,
+                                },
+                            })
+                        } else {
+                            internal_err!(
+                                "physical_plan::from_proto() {self:?}"
+                            )
+                        }
+                    })
+                    .collect::<Result<_>>()?;
+
+                let right_sort_exprs = aggregative_nested_loop_join
+                    .right_sort_exprs
+                    .iter()
+                    .map(|expr| {
+                        let expr = expr.expr_type.as_ref().ok_or_else(|| {
+                            proto_error(format!(
+                                "physical_plan::from_proto() Unexpected expr {self:?}"
+                            ))
+                        })?;
+                        if let protobuf::physical_expr_node::ExprType::Sort(sort_expr) = expr {
+                            let expr = sort_expr
+                                .expr
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    proto_error(format!(
+                                        "physical_plan::from_proto() Unexpected sort expr {self:?}"
+                                    ))
+                                })?
+                                .as_ref();
+                            Ok(PhysicalSortExpr {
+                                expr: parse_physical_expr(expr,registry, right.schema().as_ref())?,
+                                options: SortOptions {
+                                    descending: !sort_expr.asc,
+                                    nulls_first: sort_expr.nulls_first,
+                                },
+                            })
+                        } else {
+                            internal_err!(
+                                "physical_plan::from_proto() {self:?}"
+                            )
+                        }
+                    })
+                    .collect::<Result<_>>()?;
+                let working_mode =
+                    protobuf::SlidingWindowWorkingMode::try_from(aggregative_nested_loop_join.working_mode).map_err(|_| {
+                        proto_error(format!(
+                            "Received a AggregativeNestedLoopJoinExec message with unknown SlidingWindowWorkingMode {}",
+                            aggregative_nested_loop_join.working_mode
+                        ))
+                    })?;
+
+                let working_mode = match working_mode {
+                    protobuf::SlidingWindowWorkingMode::Lazy => {
+                        SlidingWindowWorkingMode::Lazy
+                    }
+                    protobuf::SlidingWindowWorkingMode::Eager => {
+                        SlidingWindowWorkingMode::Eager
+                    }
+                };
+                AggregativeNestedLoopJoinExec::try_new(
+                    left,
+                    right,
+                    filter,
+                    &join_type.into(),
+                    left_sort_exprs,
+                    right_sort_exprs,
+                    aggregative_nested_loop_join.fetch_per_key as usize,
                     working_mode,
                 )
                 .map(|e| Arc::new(e) as _)
@@ -1788,7 +1941,7 @@ impl AsExecutionPlan for PhysicalPlanNode {
                 ))),
             });
         }
-        if let Some(exec) = plan.downcast_ref::<PartitionedHashJoinExec>() {
+        if let Some(exec) = plan.downcast_ref::<AggregativeHashJoinExec>() {
             let left = protobuf::PhysicalPlanNode::try_from_physical_plan(
                 exec.left().to_owned(),
                 extension_codec,
@@ -1884,14 +2037,102 @@ impl AsExecutionPlan for PhysicalPlanNode {
             };
 
             return Ok(protobuf::PhysicalPlanNode {
-                physical_plan_type: Some(PhysicalPlanType::PartitionedHashJoin(
-                    Box::new(protobuf::PartitionedHashJoinExecNode {
+                physical_plan_type: Some(PhysicalPlanType::AggregativeHashJoin(
+                    Box::new(protobuf::AggregativeHashJoinExecNode {
                         left: Some(Box::new(left)),
                         right: Some(Box::new(right)),
                         on,
                         join_type: join_type.into(),
                         partition_mode: partition_mode.into(),
                         null_equals_null: exec.null_equals_null(),
+                        filter: Some(filter),
+                        left_sort_exprs,
+                        right_sort_exprs,
+                        fetch_per_key: exec.fetch_per_key() as u32,
+                        working_mode: working_mode.into(),
+                    }),
+                )),
+            });
+        }
+        if let Some(exec) = plan.downcast_ref::<AggregativeNestedLoopJoinExec>() {
+            let left = protobuf::PhysicalPlanNode::try_from_physical_plan(
+                exec.left().to_owned(),
+                extension_codec,
+            )?;
+            let right = protobuf::PhysicalPlanNode::try_from_physical_plan(
+                exec.right().to_owned(),
+                extension_codec,
+            )?;
+            let join_type: protobuf::JoinType = exec.join_type().to_owned().into();
+            let f = exec.filter();
+            let expression = f.expression().to_owned().try_into()?;
+            let column_indices = f
+                .column_indices()
+                .iter()
+                .map(|i| {
+                    let side: protobuf::JoinSide = i.side.to_owned().into();
+                    protobuf::ColumnIndex {
+                        index: i.index as u32,
+                        side: side.into(),
+                    }
+                })
+                .collect();
+            let filter_schema = f.schema().try_into()?;
+            let filter = protobuf::JoinFilter {
+                expression: Some(expression),
+                column_indices,
+                schema: Some(filter_schema),
+            };
+
+            let left_sort_exprs = exec
+                .left_sort_exprs()
+                .iter()
+                .map(|expr| {
+                    let sort_expr = Box::new(protobuf::PhysicalSortExprNode {
+                        expr: Some(Box::new(expr.expr.to_owned().try_into()?)),
+                        asc: !expr.options.descending,
+                        nulls_first: expr.options.nulls_first,
+                    });
+                    Ok(protobuf::PhysicalExprNode {
+                        expr_type: Some(protobuf::physical_expr_node::ExprType::Sort(
+                            sort_expr,
+                        )),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            let right_sort_exprs = exec
+                .right_sort_exprs()
+                .iter()
+                .map(|expr| {
+                    let sort_expr = Box::new(protobuf::PhysicalSortExprNode {
+                        expr: Some(Box::new(expr.expr.to_owned().try_into()?)),
+                        asc: !expr.options.descending,
+                        nulls_first: expr.options.nulls_first,
+                    });
+                    Ok(protobuf::PhysicalExprNode {
+                        expr_type: Some(protobuf::physical_expr_node::ExprType::Sort(
+                            sort_expr,
+                        )),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            let working_mode = match exec.working_mode() {
+                SlidingWindowWorkingMode::Eager => {
+                    protobuf::SlidingWindowWorkingMode::Eager
+                }
+                SlidingWindowWorkingMode::Lazy => {
+                    protobuf::SlidingWindowWorkingMode::Lazy
+                }
+            };
+
+            return Ok(protobuf::PhysicalPlanNode {
+                physical_plan_type: Some(PhysicalPlanType::AggregativeNestedLoopJoin(
+                    Box::new(protobuf::AggregativeNestedLoopJoinExecNode {
+                        left: Some(Box::new(left)),
+                        right: Some(Box::new(right)),
+                        join_type: join_type.into(),
                         filter: Some(filter),
                         left_sort_exprs,
                         right_sort_exprs,

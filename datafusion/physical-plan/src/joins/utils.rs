@@ -225,6 +225,27 @@ fn check_join_set_is_valid(
     Ok(())
 }
 
+/// Calculate the OutputPartitioning for Partitioned Join
+pub fn partitioned_join_output_partitioning(
+    join_type: JoinType,
+    left_partitioning: Partitioning,
+    right_partitioning: Partitioning,
+    left_columns_len: usize,
+) -> Partitioning {
+    match join_type {
+        JoinType::Inner | JoinType::Left | JoinType::LeftSemi | JoinType::LeftAnti => {
+            left_partitioning
+        }
+        JoinType::RightSemi | JoinType::RightAnti => right_partitioning,
+        JoinType::Right => {
+            adjust_right_output_partitioning(right_partitioning, left_columns_len)
+        }
+        JoinType::Full => {
+            Partitioning::UnknownPartitioning(right_partitioning.partition_count())
+        }
+    }
+}
+
 /// Adjust the right out partitioning to new Column Index
 pub fn adjust_right_output_partitioning(
     right_partitioning: Partitioning,

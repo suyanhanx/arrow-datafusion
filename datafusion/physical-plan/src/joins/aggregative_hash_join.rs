@@ -7,12 +7,11 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::{fmt, mem};
 
-use crate::common::SharedMemoryReservation;
 use crate::joins::hash_join::equal_rows_arr;
 use crate::joins::sliding_window_join_utils::{
     calculate_the_necessary_build_side_range_helper, joinable_probe_batch_helper,
-    partitioned_join_output_partitioning, EagerWindowJoinOperations, LazyJoinStream,
-    LazyJoinStreamState, ProbeBuffer,
+    CommonJoinData, EagerWindowJoinOperations, LazyJoinStream, LazyJoinStreamState,
+    ProbeBuffer,
 };
 use crate::joins::stream_join_utils::{
     get_filter_representation_of_join_side, prepare_sorted_exprs, EagerJoinStream,
@@ -21,7 +20,8 @@ use crate::joins::stream_join_utils::{
 use crate::joins::symmetric_hash_join::StreamJoinMetrics;
 use crate::joins::utils::{
     apply_join_filter_to_indices, build_batch_from_indices, build_join_schema,
-    calculate_join_output_ordering, check_join_is_valid, ColumnIndex, JoinFilter, JoinOn,
+    calculate_join_output_ordering, check_join_is_valid,
+    partitioned_join_output_partitioning, ColumnIndex, JoinFilter, JoinOn,
 };
 use crate::joins::{SlidingWindowWorkingMode, StreamJoinPartitionMode};
 use crate::metrics::{ExecutionPlanMetricsSet, MetricsSet};
@@ -39,14 +39,14 @@ use datafusion_common::utils::{
     get_record_batch_at_indices, get_row_at_idx, linear_search,
 };
 use datafusion_common::{
-    internal_err, DataFusionError, JoinSide, JoinType, Result, ScalarValue,
+    internal_err, not_impl_err, plan_err, DataFusionError, JoinSide, JoinType, Result,
+    ScalarValue,
 };
 use datafusion_execution::memory_pool::MemoryConsumer;
 use datafusion_execution::TaskContext;
 use datafusion_expr::interval_arithmetic::Interval;
 use datafusion_physical_expr::equivalence::join_equivalence_properties;
 use datafusion_physical_expr::expressions::Column;
-use datafusion_physical_expr::intervals::cp_solver::ExprIntervalGraph;
 use datafusion_physical_expr::window::PartitionKey;
 use datafusion_physical_expr::{
     EquivalenceProperties, PhysicalExpr, PhysicalSortExpr, PhysicalSortRequirement,
@@ -58,23 +58,25 @@ use futures::Stream;
 use hashbrown::raw::RawTable;
 use parking_lot::Mutex;
 
-/// Represents a partitioned hash join execution plan.
+/// Represents an aggregative hash join execution plan.
 ///
-/// The `PartitionedHashJoinExec` struct facilitates the execution of hash join operations in
-/// parallel across multiple partitions of data. It takes two input streams (`left` and `right`),
-/// a set of common columns to join on (`on`), and applies a join filter to find matching rows.
-/// The type of the join (e.g., inner, left, right) is determined by `join_type`.
+/// The `AggregativeHashJoinExec` struct facilitates the execution of hash join
+/// operations in parallel across multiple partitions of data. It takes two input
+/// streams (`left` and `right`), a set of common columns to join on (`on`), and
+/// applies a join filter to find matching rows. The type of the join (e.g. inner,
+/// left, right) is determined by `join_type`.
 ///
-/// A hash join operation builds a hash table on the "build" side (the left side in this implementation)
-/// using a `BuildBuffer` to segment and hash rows. The hash table is then probed with rows from the "probe" side
-/// (the right side) to find matches based on the common columns and join filter.
+/// A hash join operation builds a hash table on the "build" side (the left side
+/// in this implementation) using a `BuildBuffer` to segment and hash rows. The
+/// hash table is then probed with rows from the "probe" side (the right side) to
+/// find matches based on the common columns and join filter.
 ///
 /// The resulting schema after the join is represented by `schema`.
 ///
-/// The struct also maintains several other properties and metrics for efficient execution and monitoring
-/// of the join operation.
+/// The struct also maintains several other properties and metrics for efficient
+/// execution and monitoring of the join operation.
 #[derive(Debug)]
-pub struct PartitionedHashJoinExec {
+pub struct AggregativeHashJoinExec {
     /// Left side stream
     pub(crate) left: Arc<dyn ExecutionPlan>,
     /// Right side stream
@@ -109,17 +111,17 @@ pub struct PartitionedHashJoinExec {
     pub(crate) working_mode: SlidingWindowWorkingMode,
 }
 
-/// State for each unique partition determined according to key column(s)
+/// State for each unique partition determined according to key column(s).
 #[derive(Debug)]
 pub struct PartitionBatchState {
-    /// The record_batch belonging to current partition
+    /// The record batch belonging to current partition.
     pub record_batch: RecordBatch,
-    /// Matched indices count
+    /// Matched indices count.
     pub matched_indices: usize,
 }
 
-impl PartitionedHashJoinExec {
-    /// Attempts to create a new `PartitionedHashJoinExec` instance.
+impl AggregativeHashJoinExec {
+    /// Attempts to create a new `AggregativeHashJoinExec` instance.
     ///
     /// * `left`: Left side stream.
     /// * `right`: Right side stream.
@@ -133,7 +135,7 @@ impl PartitionedHashJoinExec {
     /// * `partition_mode`: Partition mode.
     /// * `working_mode`: Working mode.
     ///
-    /// Returns a result containing the created `PartitionedHashJoinExec` instance or an error.
+    /// Returns a result containing the new `AggregativeHashJoinExec` instance.
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         left: Arc<dyn ExecutionPlan>,
@@ -148,55 +150,10 @@ impl PartitionedHashJoinExec {
         partition_mode: StreamJoinPartitionMode,
         working_mode: SlidingWindowWorkingMode,
     ) -> Result<Self> {
-        let left_fields: Result<Vec<Field>> = left
-            .schema()
-            .fields()
-            .iter()
-            .map(|field| {
-                let mut metadata = field.metadata().clone();
-                let mut new_field = Field::new(
-                    field.name(),
-                    field.data_type().clone(),
-                    field.is_nullable(),
-                );
-                metadata
-                    .insert("PartitionedHashJoinExec".into(), "JoinSide::Left".into());
-                new_field.set_metadata(metadata);
-                Ok(new_field)
-            })
-            .collect();
-        let left_schema = Arc::new(Schema::new_with_metadata(
-            left_fields?,
-            left.schema().metadata().clone(),
-        ));
-
-        let right_fields: Result<Vec<Field>> = right
-            .schema()
-            .fields()
-            .iter()
-            .map(|field| {
-                let mut metadata = field.metadata().clone();
-                let mut new_field = Field::new(
-                    field.name(),
-                    field.data_type().clone(),
-                    field.is_nullable(),
-                );
-                metadata
-                    .insert("PartitionedHashJoinExec".into(), "JoinSide::Right".into());
-                new_field.set_metadata(metadata);
-                Ok(new_field)
-            })
-            .collect();
-        let right_schema = Arc::new(Schema::new_with_metadata(
-            right_fields?,
-            right.schema().metadata().clone(),
-        ));
-
         if on.is_empty() {
-            return Err(DataFusionError::Plan(
-                "On constraints in PartitionedHashJoinExec should be non-empty"
-                    .to_string(),
-            ));
+            return plan_err!(
+                "On constraints in AggregativeHashJoinExec should be non-empty"
+            );
         }
 
         if matches!(
@@ -208,11 +165,55 @@ impl PartitionedHashJoinExec {
                 | JoinType::RightSemi
                 | JoinType::RightAnti
         ) {
-            return Err(DataFusionError::NotImplemented(format!(
-                "PartitionedHashJoinExec does not support {}",
+            return not_impl_err!(
+                "AggregativeHashJoinExec does not support {}",
                 join_type
-            )));
+            );
         }
+
+        let left_fields = left
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| {
+                let mut metadata = field.metadata().clone();
+                let mut new_field = Field::new(
+                    field.name(),
+                    field.data_type().clone(),
+                    field.is_nullable(),
+                );
+                metadata
+                    .insert("AggregativeHashJoinExec".into(), "JoinSide::Left".into());
+                new_field.set_metadata(metadata);
+                Ok(new_field)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let left_schema = Arc::new(Schema::new_with_metadata(
+            left_fields,
+            left.schema().metadata().clone(),
+        ));
+
+        let right_fields = right
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| {
+                let mut metadata = field.metadata().clone();
+                let mut new_field = Field::new(
+                    field.name(),
+                    field.data_type().clone(),
+                    field.is_nullable(),
+                );
+                metadata
+                    .insert("AggregativeHashJoinExec".into(), "JoinSide::Right".into());
+                new_field.set_metadata(metadata);
+                Ok(new_field)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let right_schema = Arc::new(Schema::new_with_metadata(
+            right_fields,
+            right.schema().metadata().clone(),
+        ));
 
         check_join_is_valid(&left_schema, &right_schema, &on)?;
 
@@ -333,21 +334,25 @@ fn dyn_eq_with_null_support(
         _ => false,
     }
 }
-/// Represents a buffer used in the "build" phase of a partitioned hash join operation.
+
+/// Represents a buffer used in the "build" phase of an aggregative hash join
+/// operation.
 ///
-/// During the execution of a hash join, the `BuildBuffer` is responsible for segmenting and hashing rows from
-/// the "build" side (the left side in the context of a partitioned hash join). It uses hash maps
-/// to store unique partitions of the data based on common columns (used for joining), which facilitates
-/// efficient lookups during the "probe" phase.
+/// During the execution of a hash join, the `BuildBuffer` is responsible for
+/// segmenting and hashing rows from the "build" side (the left side in the
+/// context of an aggregative hash join). It uses hash maps to store unique
+/// partitions of the data based on common columns (used for joining), which
+/// facilitates efficient lookups during the "probe" phase.
 ///
 /// The buffer maintains two primary hash maps:
-/// - `row_map_batch` maps a hash value of a row to a unique partition ID. This map is used to quickly find
-///   which partition a row belongs to based on its hash value.
-/// - `join_hash_map` stores the actual data of the partitions, where each entry contains a key, its hash value,
-///   and a batch of data corresponding to that key.
+/// - `row_map_batch` maps a hash value of a row to a unique partition ID. This
+///   map is used to quickly find which partition a row belongs to based on its
+///   hash value.
+/// - `join_hash_map` stores the actual data of the partitions, where each entry
+///   contains a key, its hash value, and a batch of data corresponding to that key.
 ///
-/// The `BuildBuffer` also includes several utility methods to evaluate and prune partitions based on various
-/// criteria, such as filters and join conditions.
+/// The `BuildBuffer` also includes several utility methods to evaluate and prune
+/// partitions based on various criteria, such as filters and join conditions.
 struct BuildBuffer {
     /// We use this [`RawTable`] to calculate unique partitions for each new
     /// RecordBatch. First entry in the tuple is the hash value, the second
@@ -383,11 +388,12 @@ impl BuildBuffer {
 
     /// Determines per-partition indices based on the given columns and record batch.
     ///
-    /// This function first computes hash values for each row in the batch based on the given columns.
-    /// It then maps these hash values to partition keys and groups row indices by partition.
-    /// This helps in grouping rows that belong to the same partition.
+    /// This function first computes hash values for each row in the batch based
+    /// on the given columns. It then maps these hash values to partition keys
+    /// and groups row indices by partition. This helps in grouping rows that
+    /// belong to the same partition.
     ///
-    /// # Arguments
+    /// # Parameters
     /// * `random_state`: State to maintain reproducible randomization for hashing.
     /// * `columns`: Arrays representing the columns that define partitions.
     /// * `batch`: Record batch containing the rows to be partitioned.
@@ -407,7 +413,8 @@ impl BuildBuffer {
         create_hashes(columns, random_state, &mut batch_hashes)?;
         // reset row_map for new calculation
         self.row_map_batch.clear();
-        // res stores PartitionKey and row indices (indices where these partition occurs in the `batch`) for each partition.
+        // res stores PartitionKey and row indices (indices where these partition
+        // occurs in the `batch`) for each partition.
         let mut result: Vec<(PartitionKey, u64, Vec<u32>)> = vec![];
         for (hash, row_idx) in batch_hashes.into_iter().zip(0u32..) {
             let entry = self.row_map_batch.get_mut(hash, |(_, group_idx)| {
@@ -424,8 +431,8 @@ impl BuildBuffer {
                     .insert(hash, (hash, result.len()), |(hash, _)| *hash);
                 let row = get_row_at_idx(columns, row_idx as usize)?;
                 // If null_equals_null is true, we do not stop adding the rows.
-                // If null_equals_null is false, we ensure that row does not contains a null value
-                // since it is not joinable to anything.
+                // If null_equals_null is false, we ensure that row does not
+                // contains a null value since it is not joinable to anything.
                 if null_equals_null || row.iter().all(|s| !s.is_null()) {
                     // This is a new partition its only index is row_idx for now.
                     result.push((row, hash, vec![row_idx]));
@@ -437,11 +444,11 @@ impl BuildBuffer {
 
     /// Evaluates partitions within a build batch.
     ///
-    /// This function calculates the partitioned indices for the build batch rows and
-    /// constructs new record batches using these indices. These new record batches represent
-    /// partitioned subsets of the original build batch.
+    /// This function calculates the partitioned indices for the build batch rows
+    /// and constructs new record batches using these indices. These new record
+    /// batches represent partitioned subsets of the original build batch.
     ///
-    /// # Arguments
+    /// # Parameters
     /// * `build_batch`: The probe record batch to be partitioned.
     /// * `random_state`: State to maintain reproducible randomization for hashing.
     /// * `null_equals_null`: Determines whether null values should be treated as equal.
@@ -482,12 +489,14 @@ impl BuildBuffer {
         .collect()
     }
 
-    /// Updates the latest batch and associated partition buffers with a new build record batch.
+    /// Updates the latest batch and associated partition buffers with a new build
+    /// record batch.
     ///
-    /// If the new record batch contains rows, it evaluates the partition batches for
-    /// these rows and updates the `join_hash_map` with the resulting partitioned record batches.
+    /// If the new record batch contains rows, it evaluates the partition batches
+    /// for these rows and updates the `join_hash_map` with the resulting partitioned
+    /// record batches.
     ///
-    /// # Arguments
+    /// # Parameters
     /// * `record_batch`: New record batch to update the current state.
     /// * `random_state`: State to maintain reproducible randomization for hashing.
     /// * `null_equals_null`: Determines whether null values should be treated as equal.
@@ -536,11 +545,12 @@ impl BuildBuffer {
         Ok(())
     }
 
-    /// Prunes the record batches within the join hash map based on the specified filter and build expressions.
+    /// Prunes record batches within the join hash map based on specified filter
+    /// and build expressions.
     ///
-    /// This function leverages a pruning strategy, which aims to reduce the number of rows processed by the join
-    /// by filtering out rows that are determined to be irrelevant based on the given `JoinFilter` and
-    /// `build_shrunk_exprs`.
+    /// This function implements a pruning strategy that aims to reduce the number
+    /// of rows processed by safely filtering out rows that are determined to be
+    /// irrelevant based on the given `JoinFilter` and `build_shrunk_exprs`.
     ///
     /// ```plaintext
     ///
@@ -560,15 +570,12 @@ impl BuildBuffer {
     ///  |          |
     ///  |          |
     ///  +----------+
-    ///
     /// ```
-    /// We make sure pruning is made from the safe area.
     ///
-    ///
-    /// # Arguments
+    /// # Parameters
     /// * `filter` - The join filter which helps determine the rows to prune.
-    /// * `build_shrunk_exprs` - A vector of expressions paired with their respective intervals,
-    ///   which are used to evaluate the filter on the build side.
+    /// * `build_shrunk_exprs` - A vector of expressions paired with their respective
+    ///   intervals, which are used to evaluate the filter on the build side.
     /// * `fetch_size` - The number of rows to fetch from the join hash map.
     ///
     /// # Returns
@@ -640,7 +647,7 @@ impl BuildBuffer {
     }
 }
 
-impl DisplayAs for PartitionedHashJoinExec {
+impl DisplayAs for AggregativeHashJoinExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
@@ -653,7 +660,7 @@ impl DisplayAs for PartitionedHashJoinExec {
                     .join(", ");
                 write!(
                     f,
-                    "PartitionedHashJoinExec: join_type={:?}, on=[{}]{}",
+                    "AggregativeHashJoinExec: join_type={:?}, on=[{}]{}",
                     self.join_type, on, display_filter
                 )
             }
@@ -661,7 +668,7 @@ impl DisplayAs for PartitionedHashJoinExec {
     }
 }
 
-impl ExecutionPlan for PartitionedHashJoinExec {
+impl ExecutionPlan for AggregativeHashJoinExec {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -747,7 +754,7 @@ impl ExecutionPlan for PartitionedHashJoinExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         match &children[..] {
-            [left, right] => Ok(Arc::new(PartitionedHashJoinExec::try_new(
+            [left, right] => Ok(Arc::new(AggregativeHashJoinExec::try_new(
                 left.clone(),
                 right.clone(),
                 self.on.clone(),
@@ -760,9 +767,7 @@ impl ExecutionPlan for PartitionedHashJoinExec {
                 self.partition_mode,
                 self.working_mode,
             )?)),
-            _ => Err(DataFusionError::Internal(
-                "PartitionedHashJoinExec wrong number of children".to_string(),
-            )),
+            _ => internal_err!("AggregativeHashJoinExec wrong number of children"),
         }
     }
 
@@ -775,7 +780,7 @@ impl ExecutionPlan for PartitionedHashJoinExec {
         let right_partitions = self.right.output_partitioning().partition_count();
         if left_partitions != right_partitions {
             return internal_err!(
-                "Invalid PartitionedHashJoinExec, partition count mismatch {left_partitions}!={right_partitions},\
+                "Invalid AggregativeHashJoinExec, partition count mismatch {left_partitions}!={right_partitions},\
                  consider using RepartitionExec"
             );
         }
@@ -794,7 +799,7 @@ impl ExecutionPlan for PartitionedHashJoinExec {
             )? {
             (left_sorted_filter_expr, right_sorted_filter_expr, graph)
         } else {
-            return internal_err!("PartitionedHashJoinExec can not operate unless both sides are pruning tables.");
+            return internal_err!("AggregativeHashJoinExec can not operate unless both sides are pruning tables.");
         };
 
         let (on_left, on_right) = self.on.iter().cloned().unzip();
@@ -806,32 +811,34 @@ impl ExecutionPlan for PartitionedHashJoinExec {
         let metrics = StreamJoinMetrics::new(partition, &self.metrics);
         let reservation = Arc::new(Mutex::new(
             MemoryConsumer::new(if self.working_mode == SlidingWindowWorkingMode::Lazy {
-                format!("LazyPartitionedHashJoinStream[{partition}]")
+                format!("LazyAggregativeHashJoinStream[{partition}]")
             } else {
-                format!("EagerPartitionedHashJoinStream[{partition}]")
+                format!("EagerAggregativeHashJoinStream[{partition}]")
             })
             .register(context.memory_pool()),
         ));
         reservation.lock().try_grow(graph.size())?;
-        let join_data = CommonJoinData {
-            probe_buffer: ProbeBuffer::new(self.right.schema(), on_right),
+        let join_data = AggregativeHashJoinData {
+            common_data: CommonJoinData {
+                probe_buffer: ProbeBuffer::new(self.right.schema(), on_right),
+                schema: self.schema(),
+                filter: self.filter.clone(),
+                join_type: self.join_type,
+                column_indices: self.column_indices.clone(),
+                graph,
+                left_sorted_filter_expr,
+                right_sorted_filter_expr,
+                reservation,
+                metrics,
+            },
             build_buffer: BuildBuffer::new(self.left.schema(), on_left),
-            schema: self.schema(),
-            filter: self.filter.clone(),
-            join_type: self.join_type,
             random_state: self.random_state.clone(),
-            column_indices: self.column_indices.clone(),
-            graph,
-            left_sorted_filter_expr,
-            right_sorted_filter_expr,
             null_equals_null: self.null_equals_null,
-            reservation,
             fetch_per_key: self.fetch_per_key,
-            metrics,
         };
 
         let stream = if self.working_mode == SlidingWindowWorkingMode::Lazy {
-            Box::pin(LazyPartitionedHashJoinStream {
+            Box::pin(LazyAggregativeHashJoinStream {
                 left_stream,
                 right_stream,
                 join_data,
@@ -845,7 +852,7 @@ impl ExecutionPlan for PartitionedHashJoinExec {
                 .probe_size_batch_size_ratio_for_eager_execution_on_sliding_joins;
             let batch_size = context.session_config().options().execution.batch_size;
             let minimum_probe_row_count = (batch_size as f64 * ratio) as usize;
-            Box::pin(EagerPartitionedHashJoinStream {
+            Box::pin(EagerAggregativeHashJoinStream {
                 left_stream,
                 right_stream,
                 join_data,
@@ -862,111 +869,99 @@ impl ExecutionPlan for PartitionedHashJoinExec {
     }
 }
 
-struct CommonJoinData {
-    /// Left globally sorted filter expression.
-    /// This expression is used to range calculations from the left stream.
-    left_sorted_filter_expr: Vec<SortedFilterExpr>,
-    /// Right globally sorted filter expression.
-    /// This expression is used to range calculations from the right stream.
-    right_sorted_filter_expr: Vec<SortedFilterExpr>,
-    /// Hash joiner for the right side. It is responsible for creating a hash map
+struct AggregativeHashJoinData {
+    /// Common data for join operations
+    common_data: CommonJoinData,
+    /// Hash joiner for the left side. It is responsible for creating a hash map
     /// from the right side data, which can be used to quickly look up matches when
     /// joining with left side data.
     build_buffer: BuildBuffer,
-    /// Buffer for the left side data. It keeps track of the current batch of data
-    /// from the left stream that we're working with.
-    probe_buffer: ProbeBuffer,
-    /// Schema of the input data. This defines the structure of the data in both
-    /// the left and right streams.
-    schema: Arc<Schema>,
-    /// The join filter expression. This is a boolean expression that determines
-    /// whether a pair of rows, one from the left side and one from the right side,
-    /// should be included in the output of the join.
-    filter: JoinFilter,
-    /// The type of the join operation. This can be one of: inner, left, right, full,
-    /// semi, or anti join.
-    join_type: JoinType,
-    /// Information about the index and placement of columns. This is used when
-    /// constructing the output record batch, to know where to get data for each column.
-    column_indices: Vec<ColumnIndex>,
-    /// Expression graph for range pruning. This graph describes the dependencies
-    /// between different columns in terms of range bounds, which can be used for
-    /// advanced optimizations, such as range calculations and pruning.
-    graph: ExprIntervalGraph,
     /// Random state used for initializing the hash function in the hash joiner.
     random_state: RandomState,
     /// If true, null values are considered equal to other null values. If false,
     /// null values are considered distinct from everything, including other null values.
     null_equals_null: bool,
-    /// Memory reservation for this join operation.
-    reservation: SharedMemoryReservation,
     /// We limit the build side per key to achieve bounded memory for unbounded inputs
     fetch_per_key: usize,
-    /// Metrics
-    metrics: StreamJoinMetrics,
 }
 
-impl CommonJoinData {
+impl AggregativeHashJoinData {
     fn size(&self) -> usize {
         let mut size = 0;
-        size += mem::size_of_val(&self.schema);
-        size += mem::size_of_val(&self.filter);
-        size += mem::size_of_val(&self.join_type);
+        size += mem::size_of_val(&self.common_data.schema);
+        size += mem::size_of_val(&self.common_data.filter);
+        size += mem::size_of_val(&self.common_data.join_type);
         size += self.build_buffer.size();
-        size += self.probe_buffer.size();
-        size += mem::size_of_val(&self.column_indices);
-        size += self.graph.size();
-        size += mem::size_of_val(&self.left_sorted_filter_expr);
-        size += mem::size_of_val(&self.right_sorted_filter_expr);
-        size += mem::size_of_val(&self.metrics);
+        size += self.common_data.probe_buffer.size();
+        size += mem::size_of_val(&self.common_data.column_indices);
+        size += self.common_data.graph.size();
+        size += mem::size_of_val(&self.common_data.left_sorted_filter_expr);
+        size += mem::size_of_val(&self.common_data.right_sorted_filter_expr);
+        size += mem::size_of_val(&self.common_data.metrics);
         size
     }
     fn join_probe_side_helper(
         &mut self,
         joinable_probe_batch: &RecordBatch,
     ) -> Result<Option<RecordBatch>> {
+        // Extract references from the data for clarity and less verbosity later
+        let (
+            probe_side_buffer,
+            build_side_joiner,
+            left_sorted_filter_expr,
+            right_sorted_filter_expr,
+            graph,
+            metrics,
+        ) = (
+            &self.common_data.probe_buffer,
+            &mut self.build_buffer,
+            &mut self.common_data.left_sorted_filter_expr,
+            &mut self.common_data.right_sorted_filter_expr,
+            &mut self.common_data.graph,
+            &self.common_data.metrics,
+        );
         // Calculate the equality results
         let result_batches = build_equal_condition_join_indices(
             joinable_probe_batch,
-            &self.probe_buffer.on,
+            &probe_side_buffer.on,
             &self.random_state,
-            &self.filter,
-            &mut self.build_buffer,
-            &self.schema,
-            self.join_type,
-            &self.column_indices,
+            &self.common_data.filter,
+            build_side_joiner,
+            &self.common_data.schema,
+            self.common_data.join_type,
+            &self.common_data.column_indices,
             self.null_equals_null,
         )?;
 
         let calculated_necessary_build_side_intervals =
             calculate_the_necessary_build_side_range_helper(
-                &self.filter,
-                &mut self.graph,
-                &mut self.left_sorted_filter_expr,
-                &mut self.right_sorted_filter_expr,
+                &self.common_data.filter,
+                graph,
+                left_sorted_filter_expr,
+                right_sorted_filter_expr,
                 joinable_probe_batch,
             )?;
 
         // Prune the buffers to drain until 'fetch' number of hashable rows remain.
-        self.build_buffer.prune(
-            &self.filter,
+        build_side_joiner.prune(
+            &self.common_data.filter,
             calculated_necessary_build_side_intervals,
             self.fetch_per_key,
         )?;
 
         // Combine join result into a single batch.
-        let result = concat_batches(&self.schema, &result_batches)?;
+        let result = concat_batches(&self.common_data.schema, &result_batches)?;
         //
         // Calculate the current memory usage of the stream.
         let capacity = self.size();
-        self.metrics.stream_memory_usage.set(capacity);
+        metrics.stream_memory_usage.set(capacity);
 
         // Update memory pool
-        self.reservation.lock().try_resize(capacity)?;
+        self.common_data.reservation.lock().try_resize(capacity)?;
 
         if result.num_rows() > 0 {
-            self.metrics.output_batches.add(1);
-            self.metrics.output_rows.add(result.num_rows());
+            metrics.output_batches.add(1);
+            metrics.output_rows.add(result.num_rows());
             return Ok(Some(result));
         }
         Ok(None)
@@ -1126,17 +1121,21 @@ fn build_equal_condition_join_indices(
     Ok(result)
 }
 
-/// A specialized stream designed to handle the output batches resulting from the execution of a `PartitionedHashJoinExec`.
+/// A specialized stream designed to handle the output batches resulting from the
+/// execution of an `AggregativeHashJoinExec`.
 ///
-/// The `LazyPartitionedHashJoinStream` manages the flow of record batches from both left and right input streams
-/// during the hash join operation. For each batch of records from the right ("probe") side, it checks for matching rows
+/// The `LazyAggregativeHashJoinStream` manages the flow of record batches from
+/// both left and right input streams during the hash join operation. For each
+/// batch of records from the right ("probe") side, it checks for matching rows
 /// in the hash table constructed from the left ("build") side.
 ///
-/// The stream leverages sorted filter expressions for both left and right inputs to optimize range calculations
-/// and potentially prune unnecessary data. It maintains buffers for currently processed batches and uses a given
-/// schema, join filter, and join type to construct the resultant batches of the join operation.
-struct LazyPartitionedHashJoinStream {
-    join_data: CommonJoinData,
+/// The stream leverages sorted filter expressions for both left and right inputs
+/// to optimize range calculations and potentially prune unnecessary data. It
+/// maintains buffers for currently processed batches and uses a given schema,
+/// join filter, and join type to construct the resultant batches of the join
+/// operation.
+struct LazyAggregativeHashJoinStream {
+    join_data: AggregativeHashJoinData,
     /// Left stream
     left_stream: SendableRecordBatchStream,
     /// Right stream
@@ -1147,13 +1146,13 @@ struct LazyPartitionedHashJoinStream {
     state: LazyJoinStreamState,
 }
 
-impl RecordBatchStream for LazyPartitionedHashJoinStream {
+impl RecordBatchStream for LazyAggregativeHashJoinStream {
     fn schema(&self) -> SchemaRef {
-        self.join_data.schema.clone()
+        self.join_data.common_data.schema.clone()
     }
 }
 
-impl Stream for LazyPartitionedHashJoinStream {
+impl Stream for LazyAggregativeHashJoinStream {
     type Item = Result<RecordBatch>;
 
     fn poll_next(
@@ -1165,12 +1164,17 @@ impl Stream for LazyPartitionedHashJoinStream {
 }
 
 #[async_trait]
-impl LazyJoinStream for LazyPartitionedHashJoinStream {
+impl LazyJoinStream for LazyAggregativeHashJoinStream {
     fn process_join_operation(
         &mut self,
     ) -> Result<StreamJoinStateResult<Option<RecordBatch>>> {
         // Create a tuple of references to various objects for convenience:
-        let joinable_record_batch = self.join_data.probe_buffer.current_batch.clone();
+        let joinable_record_batch = self
+            .join_data
+            .common_data
+            .probe_buffer
+            .current_batch
+            .clone();
         if let Some(batch) = self
             .join_data
             .join_probe_side_helper(&joinable_record_batch)?
@@ -1185,16 +1189,20 @@ impl LazyJoinStream for LazyPartitionedHashJoinStream {
         &mut self,
         _left_batch: &RecordBatch,
     ) -> Result<StreamJoinStateResult<Option<RecordBatch>>> {
-        // The PartitionedHashJoin algorithm is designed to support Inner and Right joins.
-        // In the context of these join types, once we have processed a chunk of data from the probe side,
-        // we have also identified all the corresponding rows from the build side that match our join criteria.
-        // This is because Inner and Right joins only require us to find matches for rows on the probe side,
-        // and any unmatched rows on the build side can be disregarded.
+        // The AggregativeNestedLoopJoin algorithm is designed to support `Inner`
+        // and `Right` joins. In the context of these join types, once we have
+        // processed a chunk of data from the probe side, we have also identified
+        // all the corresponding rows from the build side that match our join
+        // criteria. This is because Inner and Right joins only require us to
+        // find matches for rows on the probe side, and any unmatched rows on
+        // the build side can be disregarded.
         //
-        // Therefore, once we have processed a batch of rows from the probe side, and materialized the
-        // corresponding build data needed for these rows, there is no need to fetch or process additional
-        // data from the build side for the current probe buffer. We have all the information we need to
-        // complete the join for this chunk of data, ensuring efficiency in our processing and memory usage.
+        // Therefore, once we have processed a batch of rows from the probe side
+        // and materialized the corresponding build data needed for these rows,
+        // there is no need to fetch or process additional data from the build side
+        // for the current probe buffer. We have all the information we need to
+        // complete the join for this chunk of data, ensuring efficiency in our
+        // processing and memory usage.
         Ok(StreamJoinStateResult::Ready(None))
     }
 
@@ -1213,31 +1221,31 @@ impl LazyJoinStream for LazyPartitionedHashJoinStream {
     }
 
     fn metrics(&mut self) -> &mut StreamJoinMetrics {
-        &mut self.join_data.metrics
+        &mut self.join_data.common_data.metrics
     }
 
     fn filter(&self) -> &JoinFilter {
-        &self.join_data.filter
+        &self.join_data.common_data.filter
     }
 
     fn mut_build_sorted_filter_expr(&mut self) -> &mut [SortedFilterExpr] {
-        &mut self.join_data.left_sorted_filter_expr
+        &mut self.join_data.common_data.left_sorted_filter_expr
     }
 
     fn mut_probe_sorted_filter_expr(&mut self) -> &mut [SortedFilterExpr] {
-        &mut self.join_data.right_sorted_filter_expr
+        &mut self.join_data.common_data.right_sorted_filter_expr
     }
 
     fn build_sorted_filter_expr(&self) -> &[SortedFilterExpr] {
-        &self.join_data.left_sorted_filter_expr
+        &self.join_data.common_data.left_sorted_filter_expr
     }
 
     fn probe_sorted_filter_expr(&self) -> &[SortedFilterExpr] {
-        &self.join_data.right_sorted_filter_expr
+        &self.join_data.common_data.right_sorted_filter_expr
     }
 
     fn probe_buffer(&mut self) -> &mut ProbeBuffer {
-        &mut self.join_data.probe_buffer
+        &mut self.join_data.common_data.probe_buffer
     }
 
     fn set_state(&mut self, state: LazyJoinStreamState) {
@@ -1262,18 +1270,19 @@ impl LazyJoinStream for LazyPartitionedHashJoinStream {
     fn calculate_the_necessary_build_side_range(
         &mut self,
     ) -> Result<Vec<(PhysicalSortExpr, Interval)>> {
+        let common_join_data = &mut self.join_data.common_data;
         calculate_the_necessary_build_side_range_helper(
-            &self.join_data.filter,
-            &mut self.join_data.graph,
-            &mut self.join_data.left_sorted_filter_expr,
-            &mut self.join_data.right_sorted_filter_expr,
-            &self.join_data.probe_buffer.current_batch,
+            &common_join_data.filter,
+            &mut common_join_data.graph,
+            &mut common_join_data.left_sorted_filter_expr,
+            &mut common_join_data.right_sorted_filter_expr,
+            &common_join_data.probe_buffer.current_batch,
         )
     }
 }
 
-struct EagerPartitionedHashJoinStream {
-    join_data: CommonJoinData,
+struct EagerAggregativeHashJoinStream {
+    join_data: AggregativeHashJoinData,
     /// Left stream
     left_stream: SendableRecordBatchStream,
     /// Right stream
@@ -1285,13 +1294,13 @@ struct EagerPartitionedHashJoinStream {
     minimum_probe_row_count: usize,
 }
 
-impl RecordBatchStream for EagerPartitionedHashJoinStream {
+impl RecordBatchStream for EagerAggregativeHashJoinStream {
     fn schema(&self) -> SchemaRef {
-        self.join_data.schema.clone()
+        self.join_data.common_data.schema.clone()
     }
 }
 
-impl Stream for EagerPartitionedHashJoinStream {
+impl Stream for EagerAggregativeHashJoinStream {
     type Item = Result<RecordBatch>;
 
     fn poll_next(
@@ -1302,7 +1311,7 @@ impl Stream for EagerPartitionedHashJoinStream {
     }
 }
 
-impl EagerWindowJoinOperations for EagerPartitionedHashJoinStream {
+impl EagerWindowJoinOperations for EagerAggregativeHashJoinStream {
     fn update_build_buffer_with_batch(&mut self, batch: RecordBatch) -> Result<()> {
         self.join_data.build_buffer.update_partition_batch(
             &batch,
@@ -1320,19 +1329,20 @@ impl EagerWindowJoinOperations for EagerPartitionedHashJoinStream {
 
     fn identify_joinable_probe_batch(&mut self) -> Result<Option<RecordBatch>> {
         let minimum_probe_row_count = self.minimum_probe_row_count();
+        let common_join_data = &mut self.join_data.common_data;
         joinable_probe_batch_helper(
             &self.join_data.build_buffer.latest_batch,
-            &mut self.join_data.probe_buffer,
-            &self.join_data.filter,
-            &mut self.join_data.graph,
-            &mut self.join_data.left_sorted_filter_expr,
-            &mut self.join_data.right_sorted_filter_expr,
+            &mut common_join_data.probe_buffer,
+            &common_join_data.filter,
+            &mut common_join_data.graph,
+            &mut common_join_data.left_sorted_filter_expr,
+            &mut common_join_data.right_sorted_filter_expr,
             minimum_probe_row_count,
         )
     }
 
     fn get_mutable_probe_buffer(&mut self) -> &mut ProbeBuffer {
-        &mut self.join_data.probe_buffer
+        &mut self.join_data.common_data.probe_buffer
     }
 
     fn minimum_probe_row_count(&self) -> usize {
@@ -1340,7 +1350,7 @@ impl EagerWindowJoinOperations for EagerPartitionedHashJoinStream {
     }
 }
 
-impl EagerJoinStream for EagerPartitionedHashJoinStream {
+impl EagerJoinStream for EagerAggregativeHashJoinStream {
     fn process_batch_from_right(
         &mut self,
         batch: RecordBatch,
@@ -1372,20 +1382,22 @@ impl EagerJoinStream for EagerPartitionedHashJoinStream {
     fn process_batches_before_finalization(
         &mut self,
     ) -> Result<StreamJoinStateResult<Option<RecordBatch>>> {
-        let join_data = &mut self.join_data;
-        let (probe_side_buffer, build_side_joiner) =
-            (&mut join_data.probe_buffer, &mut join_data.build_buffer);
+        let join_data = &mut self.join_data.common_data;
+        let (probe_side_buffer, build_side_joiner) = (
+            &mut join_data.probe_buffer,
+            &mut self.join_data.build_buffer,
+        );
         // Calculate the equality results
         let result_batches = build_equal_condition_join_indices(
             &probe_side_buffer.current_batch,
             &probe_side_buffer.on,
-            &join_data.random_state,
+            &self.join_data.random_state,
             &join_data.filter,
             build_side_joiner,
             &join_data.schema,
             join_data.join_type,
             &join_data.column_indices,
-            join_data.null_equals_null,
+            self.join_data.null_equals_null,
         )?;
 
         let result = concat_batches(&join_data.schema, &result_batches)?;
@@ -1423,12 +1435,12 @@ mod fuzzy_tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-
     use crate::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
     use crate::common;
     use crate::joins::test_utils::{
         build_sides_record_batches, compare_batches, create_memory_table,
-        split_record_batches,
+        gen_conjunctive_numerical_expr_single_side_prunable,
+        gen_conjunctive_temporal_expr_single_side, split_record_batches,
     };
     use crate::joins::{HashJoinExec, PartitionMode};
     use crate::repartition::RepartitionExec;
@@ -1436,14 +1448,15 @@ mod fuzzy_tests {
 
     use arrow::datatypes::{DataType, Field};
     use arrow_schema::{SortOptions, TimeUnit};
+    use datafusion_common::{internal_datafusion_err, DataFusionError};
     use datafusion_execution::config::SessionConfig;
     use datafusion_expr::Operator;
-    use datafusion_physical_expr::expressions::{binary, col, BinaryExpr, Literal};
+    use datafusion_physical_expr::equivalence::add_offset_to_expr;
+    use datafusion_physical_expr::expressions::col;
     use datafusion_physical_expr::{
         expressions, AggregateExpr, LexOrdering, LexOrderingRef,
     };
 
-    use datafusion_physical_expr::equivalence::add_offset_to_expr;
     use once_cell::sync::Lazy;
     use rstest::*;
 
@@ -1501,56 +1514,7 @@ mod fuzzy_tests {
             .collect()
     }
 
-    /// This test function generates a conjunctive statement with two numeric
-    /// terms with the following form:
-    /// left_col (op_1) a  >/>= right_col (op_2)
-    fn gen_conjunctive_numerical_expr_single_side_prunable(
-        left_col: Arc<dyn PhysicalExpr>,
-        right_col: Arc<dyn PhysicalExpr>,
-        op: (Operator, Operator),
-        a: ScalarValue,
-        b: ScalarValue,
-        comparison_op: Operator,
-    ) -> Arc<dyn PhysicalExpr> {
-        let (op_1, op_2) = op;
-        let left_and_1 = Arc::new(BinaryExpr::new(
-            left_col.clone(),
-            op_1,
-            Arc::new(Literal::new(a)),
-        ));
-        let left_and_2 = Arc::new(BinaryExpr::new(
-            right_col.clone(),
-            op_2,
-            Arc::new(Literal::new(b)),
-        ));
-        Arc::new(BinaryExpr::new(left_and_1, comparison_op, left_and_2))
-    }
-    /// This test function generates a conjunctive statement with
-    /// two scalar values with the following form:
-    /// left_col (op_1) a  > right_col (op_2)
-    #[allow(clippy::too_many_arguments)]
-    fn gen_conjunctive_temporal_expr_single_side(
-        left_col: Arc<dyn PhysicalExpr>,
-        right_col: Arc<dyn PhysicalExpr>,
-        op_1: Operator,
-        op_2: Operator,
-        a: ScalarValue,
-        b: ScalarValue,
-        schema: &Schema,
-        comparison_op: Operator,
-    ) -> Result<Arc<dyn PhysicalExpr>, DataFusionError> {
-        let left_and_1 =
-            binary(left_col.clone(), op_1, Arc::new(Literal::new(a)), schema)?;
-        let left_and_2 =
-            binary(right_col.clone(), op_2, Arc::new(Literal::new(b)), schema)?;
-        Ok(Arc::new(BinaryExpr::new(
-            left_and_1,
-            comparison_op,
-            left_and_2,
-        )))
-    }
-
-    async fn partitioned_hash_join_with_filter_and_group_by(
+    async fn aggregative_hash_join_with_filter_and_group_by(
         left: Arc<dyn ExecutionPlan>,
         right: Arc<dyn ExecutionPlan>,
         on: JoinOn,
@@ -1568,7 +1532,7 @@ mod fuzzy_tests {
         let right_sort_expr = right
             .output_ordering()
             .map(|order| order.to_vec())
-            .ok_or(DataFusionError::Internal("Test fail.".to_owned()))
+            .ok_or(internal_datafusion_err!("Test fail."))
             .unwrap();
 
         let adjusted_right_order =
@@ -1649,22 +1613,22 @@ mod fuzzy_tests {
         let left_sort_expr = left
             .output_ordering()
             .map(|order| order.to_vec())
-            .ok_or(DataFusionError::Internal(
-                "PartitionedHashJoinExec needs left and right side ordered.".to_owned(),
+            .ok_or(internal_datafusion_err!(
+                "AggregativeHashJoinExec needs left and right side ordered."
             ))
             .unwrap();
         let right_sort_expr = right
             .output_ordering()
             .map(|order| order.to_vec())
-            .ok_or(DataFusionError::Internal(
-                "PartitionedHashJoinExec needs left and right side ordered.".to_owned(),
+            .ok_or(internal_datafusion_err!(
+                "AggregativeHashJoinExec needs left and right side ordered."
             ))
             .unwrap();
 
         let adjusted_right_order =
             add_offset_to_lex_ordering(&right_sort_expr, left.schema().fields().len());
 
-        let join = Arc::new(PartitionedHashJoinExec::try_new(
+        let join = Arc::new(AggregativeHashJoinExec::try_new(
             Arc::new(RepartitionExec::try_new(
                 left,
                 Partitioning::Hash(left_expr, partition_count),
@@ -1746,7 +1710,7 @@ mod fuzzy_tests {
             working_mode,
         )
         .await?;
-        let second_batches = partitioned_hash_join_with_filter_and_group_by(
+        let second_batches = aggregative_hash_join_with_filter_and_group_by(
             left.clone(),
             right.clone(),
             on.clone(),

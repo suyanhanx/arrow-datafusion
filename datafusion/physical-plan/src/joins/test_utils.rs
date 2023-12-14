@@ -40,7 +40,9 @@ use arrow_schema::{DataType, Schema};
 use datafusion_common::{DataFusionError, Result, ScalarValue};
 use datafusion_execution::TaskContext;
 use datafusion_expr::{JoinType, Operator};
-use datafusion_physical_expr::expressions::{binary, cast, col, lit, Column};
+use datafusion_physical_expr::expressions::{
+    binary, cast, col, lit, BinaryExpr, Column, Literal,
+};
 use datafusion_physical_expr::intervals::test_utils::{
     gen_conjunctive_numerical_expr, gen_conjunctive_temporal_expr,
 };
@@ -122,7 +124,7 @@ pub async fn partitioned_sym_join_with_filter(
     Ok(batches)
 }
 
-pub async fn partitioned_hash_join_with_filter(
+pub async fn aggregative_hash_join_with_filter(
     left: Arc<dyn ExecutionPlan>,
     right: Arc<dyn ExecutionPlan>,
     on: JoinOn,
@@ -854,4 +856,52 @@ pub(crate) fn complicated_4_column_exprs(
         }
         _ => unimplemented!(),
     }
+}
+
+/// This test function generates a conjunctive statement with
+/// two scalar values with the following form:
+/// left_col (op_1) a  > right_col (op_2)
+#[allow(clippy::too_many_arguments)]
+pub fn gen_conjunctive_temporal_expr_single_side(
+    left_col: Arc<dyn PhysicalExpr>,
+    right_col: Arc<dyn PhysicalExpr>,
+    op_1: Operator,
+    op_2: Operator,
+    a: ScalarValue,
+    b: ScalarValue,
+    schema: &Schema,
+    comparison_op: Operator,
+) -> Result<Arc<dyn PhysicalExpr>, DataFusionError> {
+    let left_and_1 = binary(left_col.clone(), op_1, Arc::new(Literal::new(a)), schema)?;
+    let left_and_2 = binary(right_col.clone(), op_2, Arc::new(Literal::new(b)), schema)?;
+    Ok(Arc::new(BinaryExpr::new(
+        left_and_1,
+        comparison_op,
+        left_and_2,
+    )))
+}
+
+/// This test function generates a conjunctive statement with two numeric
+/// terms with the following form:
+/// left_col (op_1) a  >/>= right_col (op_2)
+pub fn gen_conjunctive_numerical_expr_single_side_prunable(
+    left_col: Arc<dyn PhysicalExpr>,
+    right_col: Arc<dyn PhysicalExpr>,
+    op: (Operator, Operator),
+    a: ScalarValue,
+    b: ScalarValue,
+    comparison_op: Operator,
+) -> Arc<dyn PhysicalExpr> {
+    let (op_1, op_2) = op;
+    let left_and_1 = Arc::new(BinaryExpr::new(
+        left_col.clone(),
+        op_1,
+        Arc::new(Literal::new(a)),
+    ));
+    let left_and_2 = Arc::new(BinaryExpr::new(
+        right_col.clone(),
+        op_2,
+        Arc::new(Literal::new(b)),
+    ));
+    Arc::new(BinaryExpr::new(left_and_1, comparison_op, left_and_2))
 }

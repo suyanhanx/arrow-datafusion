@@ -1165,7 +1165,8 @@ message PhysicalPlanNode {
     PlaceholderRowExecNode placeholder_row = 27;
     SlidingHashJoinExecNode sliding_hash_join = 2400;
     SlidingNestedLoopJoinExecNode sliding_nested_loop_join = 2500;
-    PartitionedHashJoinExecNode partitioned_hash_join = 2700;
+    AggregativeHashJoinExecNode aggregative_hash_join = 2700;
+    AggregativeNestedLoopJoinExecNode aggregative_nested_loop_join = 2800;
   }
 }
 
@@ -1481,7 +1482,7 @@ message SlidingHashJoinExecNode {
   SlidingWindowWorkingMode working_mode = 11;
 }
 
-message PartitionedHashJoinExecNode {
+message AggregativeHashJoinExecNode {
   PhysicalPlanNode left = 1;
   PhysicalPlanNode right = 2;
   repeated JoinOn on = 3;
@@ -1493,6 +1494,17 @@ message PartitionedHashJoinExecNode {
   repeated PhysicalExprNode right_sort_exprs = 10;
   uint32 fetch_per_key = 12;
   SlidingWindowWorkingMode working_mode = 11;
+}
+
+message AggregativeNestedLoopJoinExecNode {
+  PhysicalPlanNode left = 1;
+  PhysicalPlanNode right = 2;
+  JoinType join_type = 3;
+  JoinFilter filter = 4;
+  repeated PhysicalExprNode left_sort_exprs = 5;
+  repeated PhysicalExprNode right_sort_exprs = 6;
+  uint32 fetch_per_key = 7;
+  SlidingWindowWorkingMode working_mode = 8;
 }
 
 message SlidingNestedLoopJoinExecNode {

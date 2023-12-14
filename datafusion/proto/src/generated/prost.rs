@@ -1521,7 +1521,7 @@ pub mod owned_table_reference {
 pub struct PhysicalPlanNode {
     #[prost(
         oneof = "physical_plan_node::PhysicalPlanType",
-        tags = "1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 2400, 2500, 2700"
+        tags = "1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 2400, 2500, 2700, 2800"
     )]
     pub physical_plan_type: ::core::option::Option<physical_plan_node::PhysicalPlanType>,
 }
@@ -1587,8 +1587,12 @@ pub mod physical_plan_node {
             ::prost::alloc::boxed::Box<super::SlidingNestedLoopJoinExecNode>,
         ),
         #[prost(message, tag = "2700")]
-        PartitionedHashJoin(
-            ::prost::alloc::boxed::Box<super::PartitionedHashJoinExecNode>,
+        AggregativeHashJoin(
+            ::prost::alloc::boxed::Box<super::AggregativeHashJoinExecNode>,
+        ),
+        #[prost(message, tag = "2800")]
+        AggregativeNestedLoopJoin(
+            ::prost::alloc::boxed::Box<super::AggregativeNestedLoopJoinExecNode>,
         ),
     }
 }
@@ -2072,7 +2076,7 @@ pub struct SlidingHashJoinExecNode {
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PartitionedHashJoinExecNode {
+pub struct AggregativeHashJoinExecNode {
     #[prost(message, optional, boxed, tag = "1")]
     pub left: ::core::option::Option<::prost::alloc::boxed::Box<PhysicalPlanNode>>,
     #[prost(message, optional, boxed, tag = "2")]
@@ -2094,6 +2098,26 @@ pub struct PartitionedHashJoinExecNode {
     #[prost(uint32, tag = "12")]
     pub fetch_per_key: u32,
     #[prost(enumeration = "SlidingWindowWorkingMode", tag = "11")]
+    pub working_mode: i32,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AggregativeNestedLoopJoinExecNode {
+    #[prost(message, optional, boxed, tag = "1")]
+    pub left: ::core::option::Option<::prost::alloc::boxed::Box<PhysicalPlanNode>>,
+    #[prost(message, optional, boxed, tag = "2")]
+    pub right: ::core::option::Option<::prost::alloc::boxed::Box<PhysicalPlanNode>>,
+    #[prost(enumeration = "JoinType", tag = "3")]
+    pub join_type: i32,
+    #[prost(message, optional, tag = "4")]
+    pub filter: ::core::option::Option<JoinFilter>,
+    #[prost(message, repeated, tag = "5")]
+    pub left_sort_exprs: ::prost::alloc::vec::Vec<PhysicalExprNode>,
+    #[prost(message, repeated, tag = "6")]
+    pub right_sort_exprs: ::prost::alloc::vec::Vec<PhysicalExprNode>,
+    #[prost(uint32, tag = "7")]
+    pub fetch_per_key: u32,
+    #[prost(enumeration = "SlidingWindowWorkingMode", tag = "8")]
     pub working_mode: i32,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]

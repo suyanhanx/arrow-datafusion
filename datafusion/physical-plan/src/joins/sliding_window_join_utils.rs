@@ -2,7 +2,9 @@
 // This file does not contain any Apache Software Foundation copyrighted code.
 
 use std::task::Poll;
+use std::{mem, usize};
 
+use crate::common::SharedMemoryReservation;
 use crate::joins::{
     stream_join_utils::{
         calculate_side_prune_length_helper, get_build_side_pruned_exprs,
@@ -11,7 +13,9 @@ use crate::joins::{
         get_pruning_semi_indices, SortedFilterExpr, StreamJoinStateResult,
     },
     symmetric_hash_join::StreamJoinMetrics,
-    utils::{self, append_right_indices, get_anti_indices, get_semi_indices, JoinFilter},
+    utils::{
+        append_right_indices, get_anti_indices, get_semi_indices, ColumnIndex, JoinFilter,
+    },
 };
 use crate::{handle_async_state, handle_state};
 
@@ -28,12 +32,44 @@ use datafusion_execution::SendableRecordBatchStream;
 use datafusion_expr::interval_arithmetic::Interval;
 use datafusion_physical_expr::expressions::{Column, PhysicalSortExpr};
 use datafusion_physical_expr::intervals::cp_solver::ExprIntervalGraph;
-use datafusion_physical_expr::Partitioning;
 
 use async_trait::async_trait;
 use futures::{ready, FutureExt, StreamExt};
 use hashbrown::HashSet;
-use std::{mem, usize};
+
+/// Common data used in sliding and aggregative joins.
+pub struct CommonJoinData {
+    /// Left globally sorted filter expression.
+    /// This expression is used to range calculations from the left stream.
+    pub left_sorted_filter_expr: Vec<SortedFilterExpr>,
+    /// Right globally sorted filter expression.
+    /// This expression is used to range calculations from the right stream.
+    pub right_sorted_filter_expr: Vec<SortedFilterExpr>,
+    /// Buffer for the left side data. It keeps track of the current batch of data
+    /// from the left stream that we're working with.
+    pub probe_buffer: ProbeBuffer,
+    /// Schema of the input data. This defines the structure of the data in both
+    /// the left and right streams.
+    pub schema: SchemaRef,
+    /// The join filter expression. This is a boolean expression that determines
+    /// whether a pair of rows, one from the left side and one from the right side,
+    /// should be included in the output of the join.
+    pub filter: JoinFilter,
+    /// The type of the join operation. This can be one of: inner, left, right, full,
+    /// semi, or anti join.
+    pub join_type: JoinType,
+    /// Information about the index and placement of columns. This is used when
+    /// constructing the output record batch, to know where to get data for each column.
+    pub column_indices: Vec<ColumnIndex>,
+    /// Expression graph for range pruning. This graph describes the dependencies
+    /// between different columns in terms of range bounds, which can be used for
+    /// advanced optimizations, such as range calculations and pruning.
+    pub graph: ExprIntervalGraph,
+    /// Metrics for monitoring the performance of the join operation.
+    pub metrics: StreamJoinMetrics,
+    /// Memory reservation for this join operation.
+    pub reservation: SharedMemoryReservation,
+}
 
 /// We use this buffer to keep track of the probe side pulling.
 pub struct ProbeBuffer {
@@ -1389,26 +1425,5 @@ mod tests {
 
         assert_eq!(new_left_indices, expected_left_indices);
         assert_eq!(new_right_indices, expected_right_indices);
-    }
-}
-
-/// Calculate the OutputPartitioning for Partitioned Join
-pub fn partitioned_join_output_partitioning(
-    join_type: JoinType,
-    left_partitioning: Partitioning,
-    right_partitioning: Partitioning,
-    left_columns_len: usize,
-) -> Partitioning {
-    match join_type {
-        JoinType::Inner | JoinType::Left | JoinType::LeftSemi | JoinType::LeftAnti => {
-            left_partitioning
-        }
-        JoinType::RightSemi | JoinType::RightAnti => right_partitioning,
-        JoinType::Right => {
-            utils::adjust_right_output_partitioning(right_partitioning, left_columns_len)
-        }
-        JoinType::Full => {
-            Partitioning::UnknownPartitioning(right_partitioning.partition_count())
-        }
     }
 }

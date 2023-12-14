@@ -918,7 +918,6 @@ pub trait EagerJoinStream {
                 if batch.num_rows() == 0 {
                     return Ok(StatefulStreamResult::Continue);
                 }
-
                 self.set_state(EagerJoinStreamState::PullLeft);
                 self.process_batch_from_right(batch)
             }
