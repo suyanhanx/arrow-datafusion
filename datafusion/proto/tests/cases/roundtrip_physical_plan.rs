@@ -805,8 +805,8 @@ fn roundtrip_sliding_hash_join() -> Result<()> {
                 SlidingWindowWorkingMode::Eager,
             ] {
                 roundtrip_test(Arc::new(SlidingHashJoinExec::try_new(
-                    Arc::new(EmptyExec::new(false, schema_left.clone())),
-                    Arc::new(EmptyExec::new(false, schema_right.clone())),
+                    Arc::new(EmptyExec::new(schema_left.clone())),
+                    Arc::new(EmptyExec::new(schema_right.clone())),
                     on.clone(),
                     filter.clone(),
                     join_type,
@@ -865,8 +865,8 @@ fn roundtrip_aggregative_hash_join() -> Result<()> {
             ] {
                 for fetch_per_key in [1, 10, 100] {
                     roundtrip_test(Arc::new(AggregativeHashJoinExec::try_new(
-                        Arc::new(EmptyExec::new(false, schema_left.clone())),
-                        Arc::new(EmptyExec::new(false, schema_right.clone())),
+                        Arc::new(EmptyExec::new(schema_left.clone())),
+                        Arc::new(EmptyExec::new(schema_right.clone())),
                         on.clone(),
                         filter.clone(),
                         join_type,
@@ -927,8 +927,8 @@ fn roundtrip_sliding_nested_loop_join() -> Result<()> {
             SlidingWindowWorkingMode::Eager,
         ] {
             roundtrip_test(Arc::new(SlidingNestedLoopJoinExec::try_new(
-                Arc::new(EmptyExec::new(false, schema_left.clone())),
-                Arc::new(EmptyExec::new(false, schema_right.clone())),
+                Arc::new(EmptyExec::new(schema_left.clone())),
+                Arc::new(EmptyExec::new(schema_right.clone())),
                 filter.clone(),
                 join_type,
                 vec![PhysicalSortExpr {
@@ -972,21 +972,21 @@ fn roundtrip_sym_hash_join() -> Result<()> {
             StreamJoinPartitionMode::Partitioned,
             StreamJoinPartitionMode::SinglePartition,
         ] {
-            roundtrip_test(Arc::new(
-                datafusion::physical_plan::joins::SymmetricHashJoinExec::try_new(
-                    Arc::new(EmptyExec::new(schema_left.clone())),
-                    Arc::new(EmptyExec::new(schema_right.clone())),
-                    on.clone(),
-                    None,
-                    join_type,
-                    false,
-                    *partition_mode,
-                )?,
-            ))?;
+            roundtrip_test(Arc::new(SymmetricHashJoinExec::try_new(
+                Arc::new(EmptyExec::new(schema_left.clone())),
+                Arc::new(EmptyExec::new(schema_right.clone())),
+                on.clone(),
+                None,
+                join_type,
+                false,
+                *partition_mode,
+            )?))?;
         }
     }
+    Ok(())
 }
 
+#[test]
 fn roundtrip_aggregative_nested_loop_join() -> Result<()> {
     let field_a = Field::new("col", DataType::Int64, false);
     let schema_left = Schema::new(vec![field_a.clone()]);
@@ -1015,8 +1015,8 @@ fn roundtrip_aggregative_nested_loop_join() -> Result<()> {
         ] {
             for fetch_per_key in [1, 10, 100] {
                 roundtrip_test(Arc::new(AggregativeNestedLoopJoinExec::try_new(
-                    Arc::new(EmptyExec::new(false, schema_left.clone())),
-                    Arc::new(EmptyExec::new(false, schema_right.clone())),
+                    Arc::new(EmptyExec::new(schema_left.clone())),
+                    Arc::new(EmptyExec::new(schema_right.clone())),
                     filter.clone(),
                     join_type,
                     vec![PhysicalSortExpr {

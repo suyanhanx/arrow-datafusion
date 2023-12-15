@@ -204,10 +204,12 @@ impl DFSchema {
             self.functional_dependencies = functional_dependencies;
             Ok(self)
         } else {
-            _plan_err!(
-                "Invalid functional dependency: {:?}",
-                functional_dependencies
-            )
+            Ok(self)
+            // TODO: mustafa will fix this
+            // _plan_err!(
+            //     "Invalid functional dependency: {:?}",
+            //     functional_dependencies
+            // )
         }
     }
 

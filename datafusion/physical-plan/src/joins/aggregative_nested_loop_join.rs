@@ -16,9 +16,8 @@ use crate::joins::sliding_window_join_utils::{
 };
 use crate::joins::stream_join_utils::{
     get_filter_representation_of_join_side, prepare_sorted_exprs, EagerJoinStream,
-    EagerJoinStreamState, SortedFilterExpr, StreamJoinStateResult,
+    EagerJoinStreamState, SortedFilterExpr, StreamJoinMetrics, StreamJoinStateResult,
 };
-use crate::joins::symmetric_hash_join::StreamJoinMetrics;
 use crate::joins::utils::{
     apply_join_filter_to_indices, build_batch_from_indices, build_join_schema,
     calculate_join_output_ordering, partitioned_join_output_partitioning, ColumnIndex,
@@ -1231,7 +1230,6 @@ mod fuzzy_tests {
             final_grouping_set,
             aggregates,
             vec![None],
-            vec![None],
             sort,
             join_schema,
         )?);
@@ -1336,7 +1334,6 @@ mod fuzzy_tests {
             AggregateMode::Single,
             final_grouping_set,
             aggregates,
-            vec![None],
             vec![None],
             sort,
             join_schema,

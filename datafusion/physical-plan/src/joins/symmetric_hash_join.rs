@@ -49,7 +49,7 @@ use crate::{
             partitioned_join_output_partitioning, ColumnIndex, JoinFilter, JoinOn,
         },
     },
-    metrics::{self, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet},
+    metrics::{ExecutionPlanMetricsSet, MetricsSet},
     DisplayAs, DisplayFormatType, Distribution, EquivalenceProperties, ExecutionPlan,
     Partitioning, RecordBatchStream, SendableRecordBatchStream, Statistics,
 };
@@ -66,6 +66,7 @@ use datafusion_execution::TaskContext;
 use datafusion_physical_expr::equivalence::join_equivalence_properties;
 use datafusion_physical_expr::intervals::cp_solver::ExprIntervalGraph;
 
+use crate::joins::stream_join_utils::StreamJoinMetrics;
 use ahash::RandomState;
 use futures::Stream;
 use hashbrown::HashSet;

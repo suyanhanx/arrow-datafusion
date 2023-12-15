@@ -34,9 +34,10 @@ use crate::joins::{
     },
     stream_join_utils::{
         combine_two_batches, prepare_sorted_exprs, record_visited_indices,
-        EagerJoinStream, EagerJoinStreamState, SortedFilterExpr, StreamJoinStateResult,
+        EagerJoinStream, EagerJoinStreamState, SortedFilterExpr, StreamJoinMetrics,
+        StreamJoinStateResult,
     },
-    symmetric_hash_join::{OneSideHashJoiner, StreamJoinMetrics},
+    symmetric_hash_join::OneSideHashJoiner,
     utils::{
         build_batch_from_indices, build_join_schema, calculate_join_output_ordering,
         check_join_is_valid, partitioned_join_output_partitioning, swap_filter,
