@@ -204,12 +204,10 @@ impl DFSchema {
             self.functional_dependencies = functional_dependencies;
             Ok(self)
         } else {
-            Ok(self)
-            // TODO: mustafa will fix this
-            // _plan_err!(
-            //     "Invalid functional dependency: {:?}",
-            //     functional_dependencies
-            // )
+            _plan_err!(
+                "Invalid functional dependency: {:?}",
+                functional_dependencies
+            )
         }
     }
 
@@ -346,6 +344,21 @@ impl DFSchema {
         self.fields
             .iter()
             .filter(|field| field.qualifier().map(|q| q.eq(qualifier)).unwrap_or(false))
+            .collect()
+    }
+
+    /// Find all fields indices having the given qualifier
+    pub fn fields_indices_with_qualified(
+        &self,
+        qualifier: &TableReference,
+    ) -> Vec<usize> {
+        self.fields
+            .iter()
+            .enumerate()
+            .filter(|(_idx, field)| {
+                field.qualifier().map(|q| q.eq(qualifier)).unwrap_or(false)
+            })
+            .map(|(idx, _)| idx)
             .collect()
     }
 
