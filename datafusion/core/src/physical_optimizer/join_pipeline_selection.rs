@@ -1,6 +1,7 @@
 // Copyright (C) Synnada, Inc. - All Rights Reserved.
 // This file does not contain any Apache Software Foundation copyrighted code.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::datasource::physical_plan::is_plan_streaming;
@@ -8,10 +9,11 @@ use crate::physical_optimizer::join_selection::{
     statistical_join_selection_cross_join, statistical_join_selection_hash_join,
     swap_join_according_to_unboundedness, swap_join_type, swap_reverting_projection,
 };
+use crate::physical_optimizer::projection_pushdown::update_expr;
 use crate::physical_optimizer::utils::{
     is_aggregate, is_cross_join, is_hash_join, is_nested_loop_join, is_sort, is_window,
 };
-use crate::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
+use crate::physical_plan::aggregates::{AggregateExec, PhysicalGroupBy};
 use crate::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use crate::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use crate::physical_plan::joins::utils::{swap_filter, JoinFilter};
@@ -26,16 +28,18 @@ use crate::physical_plan::sorts::sort::SortExec;
 use crate::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use crate::physical_plan::{with_new_children_if_necessary, ExecutionPlan};
 
-use arrow_schema::SortOptions;
+use arrow_schema::{DataType, SortOptions};
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::{Transformed, TreeNode, VisitRecursion};
-use datafusion_common::{internal_err, plan_err, DataFusionError, JoinType, Result};
-use datafusion_physical_expr::expressions::{Column, LastValue};
+use datafusion_common::{plan_err, DataFusionError, JoinSide, JoinType, Result};
+use datafusion_physical_expr::equivalence::sub_offset_from_expr;
+use datafusion_physical_expr::expressions::{Column, FirstValue, LastValue};
 use datafusion_physical_expr::utils::{
     collect_columns, get_indices_of_matching_sort_exprs_with_order_eq,
 };
 use datafusion_physical_expr::{
-    AggregateExpr, PhysicalSortExpr, PhysicalSortRequirement,
+    reverse_order_bys, AggregateExpr, PhysicalExpr, PhysicalSortExpr,
+    PhysicalSortRequirement,
 };
 use datafusion_physical_plan::joins::prunability::{
     is_filter_expr_prunable, separate_columns_of_filter_expression,
@@ -48,7 +52,7 @@ use datafusion_physical_plan::windows::{
     get_best_fitting_window, get_window_mode, BoundedWindowAggExec, WindowAggExec,
 };
 
-use itertools::{iproduct, Itertools};
+use itertools::{iproduct, izip, Itertools};
 
 #[derive(Debug, Clone)]
 pub struct PlanMetadata {
@@ -370,19 +374,22 @@ fn handle_aggregate_exec(
     {
         // Extract the input plan for the aggregation:
         let input_plan = aggregation_exec.input();
-        // Find the closest join that can be changed:
-        let possible_children_plans =
-            find_closest_join_and_change(aggregation_exec, input_plan, config_options)?;
-        // Extract the GROUP BY and aggregate expressions:
         let group_by = aggregation_exec.group_by();
-        let aggr_expr = aggregation_exec.aggr_expr();
+        if !group_by.is_single() && !aggregation_exec.mode().is_first_stage() {
+            return Ok(vec![plan_metadata]);
+        }
+        let group_by_exprs = aggregation_exec.group_by().input_exprs();
+        // Find the closest join that can be changed:
+        let possible_children_plans = find_closest_join_and_change(
+            aggregation_exec.aggr_expr(),
+            &group_by_exprs,
+            input_plan,
+            config_options,
+        )?;
         // Select the best aggregate streaming plan based on possible children
         // plans and expressions:
-        let children_plans = select_best_aggregate_streaming_plan(
-            possible_children_plans,
-            group_by,
-            aggr_expr,
-        )?;
+        let children_plans =
+            select_best_aggregate_streaming_plan(possible_children_plans, group_by)?;
         // If there are no optimized children plans, return the original plan.
         // Otherwise, modify the plan with the new children plans and return:
         if children_plans.is_empty() {
@@ -442,7 +449,6 @@ fn convert_to_plan_metadata(
 /// suitable for streamable aggregation based on several criteria:
 /// - Whether a plan has seen an `AggregativeHashJoinExec`, and if so:
 ///     - Whether the plan's aggregation result is valid.
-///     - Whether all GROUP BY and aggregate expressions are valid.
 /// - Whether the plan supports streamable aggregates.
 /// - Whether the child plan can be executed without errors.
 ///
@@ -450,7 +456,6 @@ fn convert_to_plan_metadata(
 ///
 /// - `possible_plans`: A list of potential execution plans to evaluate.
 /// - `group_by`: The physical GROUP BY expression to consider.
-/// - `aggr_expr`: A list of aggregate expressions to evaluate.
 ///
 /// # Returns
 ///
@@ -459,103 +464,525 @@ fn convert_to_plan_metadata(
 fn select_best_aggregate_streaming_plan(
     possible_plans: Vec<Arc<dyn ExecutionPlan>>,
     group_by: &PhysicalGroupBy,
-    aggr_expr: &[Arc<dyn AggregateExpr>],
 ) -> Result<Vec<Arc<dyn ExecutionPlan>>> {
     possible_plans
         .into_iter()
         .filter_map(|plan| {
-            // Flag to track if we find an `AggregativeHashJoinExec` (AHJ):
-            let mut has_seen_ahj = false;
-            // Ensure that the plan results in a valid aggregation result:
-            if !check_the_aggregation_result_is_valid(&plan, &mut has_seen_ahj) {
-                return Some(internal_err!("AggregativeHashJoinExec cannot be interrupted by an incompatible operator."));
-            }
-            // If we find a AHJ, check expressions' validity:
-            let agg_valid_results = !has_seen_ahj || {
-                let schema = plan.schema();
-                // All GROUP BY expressions should probe the right side of a AHJ:
-                let group_valid = group_by.expr().iter().all(|(expr, _)| {
-                    collect_columns(expr).iter().all(|col| {
-                        schema.field(col.index())
-                            .metadata()
-                            .get("AggregativeHashJoinExec")
-                            .map_or(false, |v| v.eq("JoinSide::Right"))
-                    })
-                });
-                // All aggregate expressions should belong to the left side of a AHJ:
-                let aggr_valid = aggr_expr.iter().all(|expr| {
-                    expr.expressions().iter().all(|expr| {
-                        collect_columns(expr).iter().all(|col| {
-                            schema.field(col.index())
-                                .metadata()
-                                .get("AggregativeHashJoinExec")
-                                .map_or(false, |v| v.eq("JoinSide::Left"))
-                        })
-                    })
-                });
-                group_valid && aggr_valid
-            };
             // Plan should support streamable aggregates and be streamable itself:
-            let viable = agg_valid_results
-                && get_window_mode(&group_by.input_exprs(), &[], &plan).is_some();
+            let viable = get_window_mode(&group_by.input_exprs(), &[], &plan).is_some();
             viable.then(|| Ok(plan))
         })
         .collect()
 }
 
-/// Attempts to locate the nearest `SymmetricHashJoinExec` within the given
-/// `plan` and then modifies it according to the given aggregate plan (`agg_plan`).
+/// Auxiliary type that denotes a collection of aggregate expressions.
+type AggregateExprs = Vec<Arc<dyn AggregateExpr>>;
+/// Auxiliary type that denotes a collection of physical expressions.
+type PhysicalExprs = Vec<Arc<dyn PhysicalExpr>>;
+
+/// Re-writes the given sort expressions such that they are valid at input of the
+/// given projection.
 ///
 /// # Parameters
 ///
-/// * `agg_plan`: Reference to an `AggregateExec` plan, which provides context
-///   for the optimization.
-/// * `plan`: Reference to the current node in the execution plan tree under
-///   consideration.
-/// * `config_options`: Configuration options that may influence the optimization
+/// * `sort_exprs` - Ordering requirements to rewrite.
+/// * `projected_exprs` - A slice of tuples containing projected expressions and
+///   their aliases.
+///
+/// # Returns
+///
+/// Returns a `Result<Option<Vec<PhysicalSortExpr>>>`. If the update is successful,
+/// the return value contains a new `Vec<PhysicalSortExpr>`. Returns `Ok(None)`
+/// if the sort expressions cannot be updated.
+fn update_sort_expr(
+    sort_exprs: &[PhysicalSortExpr],
+    projected_exprs: &[(Arc<dyn PhysicalExpr>, String)],
+) -> Result<Option<Vec<PhysicalSortExpr>>> {
+    sort_exprs
+        .iter()
+        .map(|PhysicalSortExpr { expr, options }| {
+            let result = update_expr(expr, projected_exprs, true)?;
+            Ok(result.map(|expr| PhysicalSortExpr {
+                expr,
+                options: *options,
+            }))
+        })
+        .collect()
+}
+
+/// Auxiliary type that stores all parameters for the `FirstValue`/`LastValue`
+/// aggregates.
+type FirstLastParams = (
+    Arc<dyn PhysicalExpr>,
+    String,
+    DataType,
+    Vec<PhysicalSortExpr>,
+    Vec<DataType>,
+);
+
+/// Receives all parameters for `FirstValue` and `LastValue` aggregate functions.
+/// Returned parameters are standardized; i.e. `FirstValue` is converted to the `LastValue`.
+/// `None` means aggregate expression is not `FirstValue` or `LastValue`.
+fn get_last_value_params(aggr_expr: &Arc<dyn AggregateExpr>) -> Option<FirstLastParams> {
+    return if let Some(last_value) = aggr_expr.as_any().downcast_ref::<LastValue>() {
+        Some((
+            last_value.expr().clone(),
+            last_value.name().to_string(),
+            last_value.input_data_type().clone(),
+            last_value.ordering_req().clone(),
+            last_value.order_by_data_types().to_vec(),
+        ))
+    } else if let Some(first_value) = aggr_expr.as_any().downcast_ref::<FirstValue>() {
+        let (expr, name, input_data_type, req, order_by_datatypes) = (
+            first_value.expr(),
+            first_value.name(),
+            first_value.input_data_type(),
+            first_value.ordering_req(),
+            first_value.order_by_data_types(),
+        );
+        // Reverse requirement for first value to standardize:
+        let reverse_req = reverse_order_bys(req);
+        Some((
+            expr.clone(),
+            name.to_string(),
+            input_data_type.clone(),
+            reverse_req.clone(),
+            order_by_datatypes.to_vec(),
+        ))
+    } else {
+        // Cannot rewrite in terms of the `LastValue` aggregate.
+        None
+    };
+}
+
+/// Re-writes the given aggregate expression (either a `FirstValue` or a
+/// `LastValue`) by rewriting its inner expression and ordering requirements
+/// such that it is valid at input of the projection.
+///
+/// # Parameters
+///
+/// * `aggr_expr` - A reference to the original aggregate expression.
+/// * `projected_exprs` - A slice of tuples containing projected expressions
+///   and their aliases.
+///
+/// # Returns
+///
+/// Returns a `Result<Option<Arc<dyn AggregateExpr>>>`. If the update is successful,
+/// the return value contains a new `Arc<dyn AggregateExpr>`. Returns `Ok(None)`
+/// if the inner expression or requirements cannot be updated.
+fn update_aggr_expr(
+    aggr_expr: &Arc<dyn AggregateExpr>,
+    projected_exprs: &[(Arc<dyn PhysicalExpr>, String)],
+) -> Result<Option<Arc<dyn AggregateExpr>>> {
+    let Some((expr, name, input_data_type, req, order_by_datatypes)) =
+        get_last_value_params(aggr_expr)
+    else {
+        return Ok(None);
+    };
+    let Some(expr) = update_expr(&expr, projected_exprs, true)? else {
+        return Ok(None);
+    };
+    let Some(new_req) = update_sort_expr(&req, projected_exprs)? else {
+        return Ok(None);
+    };
+    // Both expr and requirement can be re-written successfully.
+    let last_value =
+        LastValue::new(expr, name, input_data_type, new_req, order_by_datatypes);
+    Ok(Some(Arc::new(last_value) as _))
+}
+
+/// Determines the join side given columns come from. Returns `None` if columns
+/// are mixed (i.e. there are columns from both sides).
+fn columns_side(cols: &HashSet<Column>, left_len: usize) -> Option<JoinSide> {
+    if cols.iter().all(|col| col.index() < left_len) {
+        // Aggregate expression is left side:
+        Some(JoinSide::Left)
+    } else if cols.iter().all(|col| col.index() >= left_len) {
+        // Aggregate expression is right side:
+        Some(JoinSide::Right)
+    } else {
+        None
+    }
+}
+
+/// Determines the join side given expression comes from. Returns `None` if the
+/// expression refers to both sides.
+fn expr_side(expr: &Arc<dyn PhysicalExpr>, left_len: usize) -> Option<JoinSide> {
+    let cols = collect_columns(expr);
+    columns_side(&cols, left_len)
+}
+
+/// Determines the join side (left or right) of the aggregate expression among
+/// join children based on the left side length.
+///
+/// This function is designed for specific aggregate expressions `LastValue`
+/// and `FirstValue`. It extracts the underlying expression and ordering
+/// requirements to identify the join side.
+///
+/// # Arguments
+///
+/// * `aggr_expr` - A reference to the aggregate expression to analyze.
+/// * `left_len` - The length of the left side of the join.
+///
+/// # Returns
+///
+/// Returns an `Option<JoinSide>` indicating the side (left or right) of the
+/// join to which the aggregate expression belongs. Returns `None` if the given
+/// aggregate expression is not supported.
+fn aggregate_expr_side(
+    aggr_expr: &Arc<dyn AggregateExpr>,
+    left_len: usize,
+) -> Option<JoinSide> {
+    let (expr, req) = if let Some(last_value) =
+        aggr_expr.as_any().downcast_ref::<LastValue>()
+    {
+        // Get expression and requirement for last value:
+        (last_value.expr(), last_value.ordering_req())
+    } else if let Some(first_value) = aggr_expr.as_any().downcast_ref::<FirstValue>() {
+        // Get expression and requirement for first value:
+        (first_value.expr(), first_value.ordering_req())
+    } else {
+        return None;
+    };
+    let exprs = std::iter::once(expr).chain(req.iter().map(|sort_expr| &sort_expr.expr));
+    let cols = exprs.flat_map(collect_columns).collect::<HashSet<Column>>();
+    columns_side(&cols, left_len)
+}
+
+/// De-offsets the given aggregate expression by adjusting the parameters based
+/// on the given offset. This function is specifically designed for `FirstValue`
+/// and `LastValue` aggregate expressions and involves updating the inner
+/// expression and sorting requirements to match the adjusted position.
+///
+/// # Parameters
+///
+/// * `aggr_expr` - A reference to the original aggregate expression.
+/// * `offset` - The offset value used to adjust the position of the expression.
+///
+/// # Returns
+///
+/// Returns an `Option` containing a new `Arc<dyn AggregateExpr>` with updated
+/// parameters if the de-offset operation is successful. Returns `None` if the
+/// aggregate expr is not supported.
+fn de_offset_aggregate_expr(
+    aggr_expr: &Arc<dyn AggregateExpr>,
+    offset: usize,
+) -> Option<Arc<dyn AggregateExpr>> {
+    let (expr, name, input_data_type, req, order_by_datatypes) =
+        get_last_value_params(aggr_expr)?;
+    let new_expr = sub_offset_from_expr(expr.clone(), offset);
+    let new_req = req
+        .into_iter()
+        .map(|PhysicalSortExpr { expr, options }| PhysicalSortExpr {
+            expr: sub_offset_from_expr(expr.clone(), offset),
+            options,
+        })
+        .collect::<Vec<_>>();
+    let last_value = Arc::new(LastValue::new(
+        new_expr,
+        name,
+        input_data_type,
+        new_req,
+        order_by_datatypes,
+    )) as _;
+    Some(last_value)
+}
+
+/// Splits aggregate and GROUP BY expressions based on join parameters and join
+/// type, producing vectors of expressions for the left and right sides of the
+/// join. For example, if join left side is: `[a@0, b@1, c@2]` and right side is
+/// `[x@0, y@1, z@2]`, the join schema will be `[a@0, b@1, c@2, x@3, y@4, z@5]`.
+/// Then, the aggregate expression `LAST_VALUE(x@3, ORDER BY y@4 DESC)` will be
+/// routed to the right side and transformed to `LAST_VALUE(x@0, ORDER BY y@1 DESC)`
+/// so that it is valid in terms of right child schema.
+///
+/// # Parameters
+///
+/// * `aggregate_exprs` - A slice of aggregate expressions to split.
+/// * `group_by_exprs` - A slice of group-by expressions to split.
+/// * `join_type` - A reference to the type of join.
+/// * `left_len` - The length of the left side of the join.
+///
+/// # Returns
+///
+/// Returns a vector of optional tuples, each containing the split aggregate
+/// and GROUP BY expressions for the left and right sides of the join.
+/// Non-splittable expressions result in `None` entries.
+fn split_aggregate_params_to_join_children(
+    aggregate_exprs: &[Arc<dyn AggregateExpr>],
+    group_by_exprs: &[Arc<dyn PhysicalExpr>],
+    join_type: &JoinType,
+    left_len: usize,
+) -> Vec<(Option<AggregateExprs>, Option<PhysicalExprs>)> {
+    match join_type {
+        JoinType::Inner | JoinType::Left | JoinType::Full | JoinType::Right => {
+            // Split aggregate expression to left and right side:
+            let mut left_aggrs = vec![];
+            let mut right_aggrs = vec![];
+            for expr in aggregate_exprs {
+                // Calculate side of the expression at the input of the join,
+                // and the corresponding expression at the input:
+                let (side, new_expr) = match aggregate_expr_side(expr, left_len) {
+                    Some(JoinSide::Left) => (JoinSide::Left, None),
+                    Some(JoinSide::Right) => {
+                        (JoinSide::Right, de_offset_aggregate_expr(expr, left_len))
+                    }
+                    None => return vec![(None, None), (None, None)],
+                };
+
+                // Push new expression to the corresponding side:
+                match (side, new_expr) {
+                    (JoinSide::Left, _) => left_aggrs.push(expr.clone()),
+                    (JoinSide::Right, Some(new_expr)) => right_aggrs.push(new_expr),
+                    _ => return vec![(None, None), (None, None)],
+                }
+            }
+
+            // Split group by expressions to the left and right side
+            let mut left_groupbys = vec![];
+            let mut right_groupbys = vec![];
+            for expr in group_by_exprs {
+                // Calculate side of the expression at the input of the join,
+                // and the corresponding expression at the input:
+                let (side, new_expr) = match expr_side(expr, left_len) {
+                    Some(JoinSide::Left) => (JoinSide::Left, expr.clone()),
+                    Some(JoinSide::Right) => (
+                        JoinSide::Right,
+                        sub_offset_from_expr(expr.clone(), left_len),
+                    ),
+                    None => return vec![(None, None), (None, None)],
+                };
+
+                // Push new expression to the corresponding side.
+                match side {
+                    JoinSide::Left => left_groupbys.push(new_expr),
+                    JoinSide::Right => right_groupbys.push(new_expr),
+                }
+            }
+            // GROUP BY expressions shouldn't be split between left and right sides.
+            // They all should be in single side, so at least one of the sides should
+            // be empty:
+            if !(left_groupbys.is_empty() || right_groupbys.is_empty()) {
+                return vec![(None, None), (None, None)];
+            }
+
+            vec![
+                (Some(left_aggrs), Some(left_groupbys)),
+                (Some(right_aggrs), Some(right_groupbys)),
+            ]
+        }
+        // We can direct aggregate expressions as is to corresponding children:
+        JoinType::LeftSemi | JoinType::LeftAnti => {
+            // Direct to left children:
+            vec![
+                (
+                    Some(aggregate_exprs.to_vec()),
+                    Some(group_by_exprs.to_vec()),
+                ),
+                (Some(vec![]), Some(vec![])),
+            ]
+        }
+        JoinType::RightSemi | JoinType::RightAnti => {
+            // Direct to right children:
+            vec![
+                (Some(vec![]), Some(vec![])),
+                (
+                    Some(aggregate_exprs.to_vec()),
+                    Some(group_by_exprs.to_vec()),
+                ),
+            ]
+        }
+    }
+}
+
+/// Extracts join parameters from the given execution plan, returning a tuple
+/// containing the join type and the length of the left side of the join.
+///
+/// # Parameters
+///
+/// * `plan` - A reference to the execution plan.
+///
+/// # Returns
+///
+/// Returns `Some((JoinType, usize))` if the execution plan corresponds to a
+/// join operation, containing the join type and the length of the left side.
+/// Returns `None` for non-join plans or unsupported join types.
+fn get_join_params(plan: &Arc<dyn ExecutionPlan>) -> Option<(JoinType, usize)> {
+    let (join_type, left_length) =
+        if let Some(hj) = plan.as_any().downcast_ref::<HashJoinExec>() {
+            (*hj.join_type(), hj.left.schema().fields.len())
+        } else if let Some(shj) = plan.as_any().downcast_ref::<SymmetricHashJoinExec>() {
+            (*shj.join_type(), shj.left().schema().fields.len())
+        } else if let Some(nlj) = plan.as_any().downcast_ref::<NestedLoopJoinExec>() {
+            (*nlj.join_type(), nlj.left().schema().fields.len())
+        } else {
+            // TODO: Add support for other join types
+            return None;
+        };
+    Some((join_type, left_length))
+}
+
+/// Checks if the given execution plan is considered trivial or simple. An
+/// operation is trivial when the following are true:
+/// - It doesn't change cardinality of its input.
+/// - It has single child.
+/// - It doesn't change the schema of its child.
+///
+/// # Parameters
+///
+/// * `plan` - A reference to the execution plan.
+///
+/// # Returns
+///
+/// Returns `true` if the execution plan is trivial; otherwise, returns `false`.
+fn is_executor_trivial(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    plan.as_any().is::<CoalesceBatchesExec>()
+        || plan.as_any().is::<SortExec>()
+        || plan.as_any().is::<CoalescePartitionsExec>()
+        || plan.as_any().is::<SortPreservingMergeExec>()
+        || plan.as_any().is::<RepartitionExec>()
+}
+
+/// Transforms then re-routes aggregate and GROUP BY expressions to the children
+/// of the plan. This is used to transform aggregate parameters between
+/// non-immediate executors safely.
+///
+/// # Parameters
+///
+/// * `plan` - A reference to the execution plan.
+/// * `aggregate_exprs` - A slice of aggregate expressions to propagate.
+/// * `groupby_exprs` - A slice of group-by expressions to propagate.
+///
+/// # Returns
+///
+/// A `Result` containing a vector of tuples. Each tuple represents the
+/// transformed aggregate and GROUP BY expressions for a child. If expressions
+/// cannot be propagated to a child, the tuple contains `None` for that child.
+fn direct_aggregate_parameters_to_children(
+    plan: &Arc<dyn ExecutionPlan>,
+    aggregate_exprs: &[Arc<dyn AggregateExpr>],
+    groupby_exprs: &[Arc<dyn PhysicalExpr>],
+) -> Result<Vec<(Option<AggregateExprs>, Option<PhysicalExprs>)>> {
+    if let Some(proj_exec) = plan.as_any().downcast_ref::<ProjectionExec>() {
+        // Rewrite aggregate expressions in terms of input of the projection:
+        let aggr_exprs = aggregate_exprs
+            .iter()
+            .map(|aggr_expr| update_aggr_expr(aggr_expr, proj_exec.expr()))
+            .collect::<Result<_>>()?;
+        // Rewrite GROUP BY expressions in terms of input of the projection:
+        let groupby_exprs = groupby_exprs
+            .iter()
+            .map(|expr| update_expr(expr, proj_exec.expr(), true))
+            .collect::<Result<_>>()?;
+        Ok(vec![(aggr_exprs, groupby_exprs)])
+    } else if is_executor_trivial(plan) {
+        // Operators that do not change the schema and have a single child can
+        // propagate directly:
+        Ok(vec![(
+            Some(aggregate_exprs.to_vec()),
+            Some(groupby_exprs.to_vec()),
+        )])
+    } else if let Some((join_type, left_len)) = get_join_params(plan) {
+        Ok(split_aggregate_params_to_join_children(
+            aggregate_exprs,
+            groupby_exprs,
+            &join_type,
+            left_len,
+        ))
+    } else {
+        // For other cases, cannot propagate expressions to the child:
+        Ok(plan.children().iter().map(|_| (None, None)).collect())
+    }
+}
+
+/// Attempts to locate the nearest `SymmetricHashJoinExec` within the given
+/// `plan` and then modifies it based on the provided aggregate expressions..
+///
+/// # Parameters
+///
+/// * `aggregate_exprs`: A slice of aggregate expressions used for optimization.
+/// * `plan`: Reference to the current node in the execution plan tree.
+/// * `config_options`: Configuration options that may influence optimization
 ///   decisions.
 ///
 /// # Returns
 ///
 /// * A `Result` containing a vector of possible alternate execution plans
-///   (`Arc<dyn ExecutionPlan>`). The function may generate multiple plans
-///   based on possible children configurations.
+///   (`Arc<dyn ExecutionPlan>`). Multiple plans may be generated based on
+///   possible children configurations or optimization paths.
 ///
-/// The function will return a single vector containing the original plan if:
-/// 1. The plan node isn't a `SymmetricHashJoinExec`.
-/// 2. Modifying the `SymmetricHashJoinExec` according to the `agg_plan` isn't
-///    feasible.
+/// The function returns a vector with the original plan if:
+/// 1. The current plan node isn't a `SymmetricHashJoinExec`.
+/// 2. Modifying the `SymmetricHashJoinExec` is not feasible or does not lead
+///    to optimization.
 ///
-/// In case of any error during the optimization process, returns the error as is.
+/// In the event of an error during the optimization process, the error is
+/// returned directly.
 ///
 /// # Example
 ///
-/// If the `plan` contains a `SymmetricHashJoinExec` that can be influenced by
-/// `agg_plan`, this function will generate optimized versions of the plan and
-/// return them. Otherwise, it will go deeper into the tree, recursively trying
-/// to find a suitable `SymmetricHashJoinExec` and do the necessary modifications.
+/// If the `plan` contains a `SymmetricHashJoinExec` that can be optimized based
+/// on `aggregate_exprs`, this function
+/// will generate optimized versions of the plan. If not, it recursively searches
+/// for a suitable `SymmetricHashJoinExec` and applies necessary modifications.
 fn find_closest_join_and_change(
-    agg_plan: &AggregateExec,
+    aggregate_exprs: &[Arc<dyn AggregateExpr>],
+    group_by_exprs: &[Arc<dyn PhysicalExpr>],
     plan: &Arc<dyn ExecutionPlan>,
     config_options: &ConfigOptions,
 ) -> Result<Vec<Arc<dyn ExecutionPlan>>> {
-    // Attempt to cast the current node to a `SymmetricHashJoinExec` (SHJ):
-    if let Some(shj) = plan.as_any().downcast_ref::<SymmetricHashJoinExec>() {
-        // If the current node is a SHJ, try to modify it based on `agg_plan`:
-        return replace_shj_with_ahj(agg_plan, shj, config_options)
-            .map(|opt| vec![opt.unwrap_or_else(|| plan.clone())]);
-    }
-    // If the current plan node inhibit modification, return the original plan:
-    if !is_allowed(plan) {
-        return Ok(vec![plan.clone()]);
-    }
     // For each child of the current plan, recursively attempt to locate and
     // modify a SHJ:
-    let calculated_children_possibilities = plan
-        .children()
-        .iter()
-        .map(|child| find_closest_join_and_change(agg_plan, child, config_options))
-        .collect::<Result<Vec<_>>>()?;
+    let aggregate_parameters =
+        direct_aggregate_parameters_to_children(plan, aggregate_exprs, group_by_exprs)?;
+    // Attempt to cast the current node to a `SymmetricHashJoinExec` (SHJ):
+    if let Some(symmetric_hash_join) =
+        plan.as_any().downcast_ref::<SymmetricHashJoinExec>()
+    {
+        let (
+            left_child_aggregate_exprs,
+            left_child_groupbys,
+            right_child_aggregate_exprs,
+            right_child_groupbys,
+        ) = match aggregate_parameters.as_slice() {
+            [(Some(left_aggrs), Some(left_groupbys)), (Some(right_aggrs), Some(right_groupbys))] => {
+                (left_aggrs, left_groupbys, right_aggrs, right_groupbys)
+            }
+            _ => {
+                // Cannot propagate to the child, early exit possible.
+                return Ok(vec![]);
+            }
+        };
+
+        // If the current node is a SHJ, try to modify it based on the aggregation:
+        return replace_shj_with_ahj(
+            symmetric_hash_join,
+            left_child_aggregate_exprs,
+            left_child_groupbys,
+            right_child_aggregate_exprs,
+            right_child_groupbys,
+            config_options,
+        )
+        .map(|opt| vec![opt.unwrap_or_else(|| plan.clone())]);
+    }
+
+    let calculated_children_possibilities =
+        izip!(plan.children(), aggregate_parameters.into_iter(),)
+            .map(|(child, (aggr_exprs, group_by_exprs))| {
+                match (aggr_exprs, group_by_exprs) {
+                    (Some(aggr_exprs), Some(group_by_exprs)) => {
+                        // Can successfully propagate:
+                        find_closest_join_and_change(
+                            &aggr_exprs,
+                            &group_by_exprs,
+                            &child,
+                            config_options,
+                        )
+                    }
+                    _ => Ok(vec![]),
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
     // Generate all possible combinations of children based on modified child
     // plans. This is used to create alternative versions of the current plan
     // with different child configurations.
@@ -678,17 +1105,22 @@ fn handle_sort_exec(plan_metadata: PlanMetadata) -> Result<Vec<PlanMetadata>> {
 /// This function may return an error if it encounters any issue as it tries to
 /// create alternate plans.
 fn replace_shj_with_ahj(
-    parent_plan: &AggregateExec,
-    shj: &SymmetricHashJoinExec,
+    symmetric_hash_join: &SymmetricHashJoinExec,
+    left_child_aggregate_exprs: &[Arc<dyn AggregateExpr>],
+    left_child_groupbys: &[Arc<dyn PhysicalExpr>],
+    right_child_aggregate_exprs: &[Arc<dyn AggregateExpr>],
+    right_child_groupbys: &[Arc<dyn PhysicalExpr>],
     config_options: &ConfigOptions,
 ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-    let left_child = shj.left();
-    let right_child = shj.right();
+    let left_child = symmetric_hash_join.left();
+    let right_child = symmetric_hash_join.right();
     let left_order = left_child.output_ordering();
     let right_order = right_child.output_ordering();
+    let left_eq_properties = left_child.equivalence_properties();
+    let right_eq_properties = right_child.equivalence_properties();
     // To perform the prunability analysis correctly, columns from the left table
     // and columns from the right table must be on the different sides of the join.
-    let filter = shj
+    let filter = symmetric_hash_join
         .filter()
         .cloned()
         .map(separate_columns_of_filter_expression);
@@ -704,16 +1136,38 @@ fn replace_shj_with_ahj(
                 &right_child.equivalence_properties(),
             )?;
 
-            let group_by = parent_plan.group_by();
-            let mode = parent_plan.mode();
-            let aggr_expr = parent_plan.aggr_expr();
-            // TODO: Implement FIRST_VALUE/LAST_VALUE conversion.
-            let fetch_per_key =
-                if aggr_expr.iter().all(|expr| expr.as_any().is::<LastValue>()) {
-                    1
-                } else {
-                    return Ok(None);
-                };
+            let (eq_properties, relevant_aggr_exprs, groupby_exprs) = if probe_prunable {
+                (
+                    &left_eq_properties,
+                    left_child_aggregate_exprs,
+                    left_child_groupbys,
+                )
+            } else if build_prunable {
+                (
+                    &right_eq_properties,
+                    right_child_aggregate_exprs,
+                    right_child_groupbys,
+                )
+            } else {
+                return Ok(None);
+            };
+            if !groupby_exprs.is_empty() {
+                // GROUP BY expression should be empty for the given side. Otherwise,
+                // aggregative join algorithms can not work.
+                return Ok(None);
+            }
+
+            // TODO: Once Partitioned Hash join with buffer first is available consider its analysis also.
+            let fetch_per_key = if relevant_aggr_exprs.iter().all(|expr| {
+                let req = expr.order_bys().unwrap_or_default();
+                (expr.as_any().is::<LastValue>() && eq_properties.ordering_satisfy(req))
+                    || (expr.as_any().is::<FirstValue>()
+                        && eq_properties.ordering_satisfy(&reverse_order_bys(req)))
+            }) {
+                1
+            } else {
+                return Ok(None);
+            };
             let working_mode = if config_options
                 .execution
                 .prefer_eager_execution_on_sliding_joins
@@ -729,18 +1183,19 @@ fn replace_shj_with_ahj(
             };
             // If probe side is prunable, apply specific optimization for that case:
             if probe_prunable
-                && matches!(mode, AggregateMode::Partial)
-                && matches!(shj.join_type(), JoinType::Inner | JoinType::Right)
-                && group_by.null_expr().is_empty()
+                && matches!(
+                    symmetric_hash_join.join_type(),
+                    JoinType::Inner | JoinType::Right
+                )
             {
                 // Create a new aggregative hash join plan:
                 AggregativeHashJoinExec::try_new(
                     left_child.clone(),
                     right_child.clone(),
-                    shj.on().to_vec(),
+                    symmetric_hash_join.on().to_vec(),
                     filter,
-                    shj.join_type(),
-                    shj.null_equals_null(),
+                    symmetric_hash_join.join_type(),
+                    symmetric_hash_join.null_equals_null(),
                     left_order.to_vec(),
                     right_order.to_vec(),
                     fetch_per_key,
@@ -750,18 +1205,19 @@ fn replace_shj_with_ahj(
                 .map(|e| Some(Arc::new(e) as _))
                 // If build side is prunable, apply specific optimization for that case:
             } else if build_prunable
-                && matches!(mode, AggregateMode::Partial)
-                && matches!(shj.join_type(), JoinType::Inner | JoinType::Left)
-                && group_by.null_expr().is_empty()
+                && matches!(
+                    symmetric_hash_join.join_type(),
+                    JoinType::Inner | JoinType::Left
+                )
             {
                 // Create a new join plan with swapped sides:
                 let new_join = AggregativeHashJoinExec::try_new(
                     right_child.clone(),
                     left_child.clone(),
-                    swap_join_on(shj.on()),
+                    swap_join_on(symmetric_hash_join.on()),
                     swap_filter(&filter),
-                    &swap_join_type(*shj.join_type()),
-                    shj.null_equals_null(),
+                    &swap_join_type(*symmetric_hash_join.join_type()),
+                    symmetric_hash_join.null_equals_null(),
                     right_order.to_vec(),
                     left_order.to_vec(),
                     fetch_per_key,
@@ -1220,188 +1676,12 @@ fn handle_nested_loop_join(
     }
 }
 
-/// Determines if the given execution plan node type is allowed before encountering
-/// an `AggregativeHashJoinExec` node in the plan tree.
-///
-/// # Parameters
-/// * `plan`: The execution plan node to check.
-///
-/// # Returns
-/// * Returns `true` if the node is one of the following types:
-///   * `CoalesceBatchesExec`
-///   * `SortExec`
-///   * `CoalescePartitionsExec`
-///   * `SortPreservingMergeExec`
-///   * `ProjectionExec`
-///   * `RepartitionExec`
-///   * `AggregativeHashJoinExec`
-/// * Otherwise, returns `false`.
-///
-fn is_allowed(plan: &Arc<dyn ExecutionPlan>) -> bool {
-    let as_any = plan.as_any();
-    as_any.is::<CoalesceBatchesExec>()
-        || as_any.is::<SortExec>()
-        || as_any.is::<CoalescePartitionsExec>()
-        || as_any.is::<SortPreservingMergeExec>()
-        || as_any.is::<ProjectionExec>()
-        || as_any.is::<RepartitionExec>()
-        || as_any.is::<AggregativeHashJoinExec>()
-}
-
-/// Recursively checks the execution plan from the given node downward to determine
-/// if any unallowed executors exist before a `AggregativeHashJoinExec` node.
-///
-/// The function traverses the tree in a depth-first manner. If it encounters an unallowed
-/// executor before it reaches an `AggregativeHashJoinExec`, it immediately stops and returns
-/// `false`. If an `AggregativeHashJoinExec` node is found before encountering any unallowed
-/// executors, the function returns `true`. If the function completes traversal without
-/// finding an `AggregativeHashJoinExec`, it still considers it as a valid path and returns
-/// `true`.
-///
-/// # Examples
-///
-/// Considering the tree structure:
-///
-/// ```plaintext
-/// [
-///     "ProjectionExec: expr=[c_custkey@0 as c_custkey, n_nationkey@2 as n_nationkey]",
-///     ...
-///     "    AggregativeHashJoinExec: join_type=Inner, on=[(c_nationkey@1, n_regionkey@1)], filter=n_nationkey@1 > c_custkey@0",
-///     ...
-/// ]
-/// ```
-/// This will return `true` since there's a valid path with only allowed executors before
-/// `AggregativeHashJoinExec`.
-///
-/// For the tree structure:
-///
-/// ```plaintext
-///[
-///     "ProjectionExec: expr=[c_custkey@0 as c_custkey, n_nationkey@2 as n_nationkey]",
-///     "  HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(c_nationkey@1, n_regionkey@1)], filter=n_nationkey@1 > c_custkey@0",
-///     "    ProjectionExec: expr=[c_custkey@1 as c_custkey, c_nationkey@2 as c_nationkey]",
-///     "      HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(o_orderkey@0, c_custkey@0)]",
-///     "        ProjectionExec: expr=[o_orderkey@0 as o_orderkey]",
-///     "          HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(o_orderdate@1, l_shipdate@1)], filter=l_orderkey@1 < o_orderkey@0 - 10 AND l_orderkey@1 > o_orderkey@0 + 10",
-///     "            CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/orders.csv]]}, projection=[o_orderkey, o_orderdate], output_ordering=[o_orderkey@0 ASC NULLS LAST], has_header=true",
-///     "            CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/lineitem.csv]]}, projection=[l_orderkey, l_shipdate], output_ordering=[l_orderkey@0 ASC NULLS LAST], has_header=true",
-///     "        CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/customer.csv]]}, projection=[c_custkey, c_nationkey], output_ordering=[c_custkey@0 ASC NULLS LAST], has_header=true",
-///     "    CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/nation.csv]]}, projection=[n_nationkey, n_regionkey], output_ordering=[n_nationkey@0 ASC NULLS LAST], has_header=true",
-///]
-/// ```
-/// This will return `true` because no `AggregativeHashJoinExec` is present.
-///
-/// For another tree structure:
-///
-/// ```plaintext
-/// [
-///     "ProjectionExec: expr=[c_custkey@0 as c_custkey, n_nationkey@1 as n_nationkey]",
-///     ...
-///     "  HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(o_orderdate@3, l_shipdate@1)], filter=l_orderkey@1 < o_orderkey@0 - 10 AND l_orderkey@1 > o_orderkey@0 + 10",
-///     ...
-///     "    AggregativeHashJoinExec: join_type=Inner, on=[(c_nationkey@1, n_regionkey@1)], filter=n_nationkey@1 > c_custkey@0",
-///     ...
-/// ]
-/// ```
-/// This will return `false` since there's an unallowed executor before
-/// `AggregativeHashJoinExec`.
-///
-///
-/// ```plaintext
-/// [
-///     "AggregativeHashJoinExec: join_type=Inner, on=[(z@2, c@2)], filter=0@0 > 1@1",
-///     "  StreamingTableExec: partition_sizes=0, projection=[x, y, z], infinite_source=true, output_ordering=[x@0 ASC]",
-///     "  AggregativeHashJoinExec: join_type=Inner, on=[(a@0, d@0)], filter=0@0 > 1@1",
-///     "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
-///     "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
-/// ]
-///
-/// ```
-/// This will return `false` since there is more than one `AggregativeHashJoinExec`.
-///
-/// # Parameters
-///
-/// * `plan`: The node to start checking from.
-///
-/// # Returns
-///
-/// * `true` if the tree has only allowed executors before encountering an
-/// `AggregativeHashJoinExec` or if an `AggregativeHashJoinExec` is not present.
-/// * `false` if there's an unallowed executor before an `AggregativeHashJoinExec`.
-///
-/// # Note
-///
-/// This function uses the helper function `is_allowed` to check if a node type is allowed or not.
-///
-fn check_nodes(
-    plan: Arc<dyn ExecutionPlan>,
-    path: &mut Vec<Arc<dyn ExecutionPlan>>,
-    has_seen_ahj: &mut bool,
-) -> bool {
-    path.push(plan.clone());
-    // If we've encountered an AggregativeHashJoinExec:
-    if plan.as_any().is::<AggregativeHashJoinExec>() {
-        if *has_seen_ahj {
-            // We've already seen a AHJ and encountered another one before an aggregation.
-            return false;
-        }
-        *has_seen_ahj = true;
-
-        // Check if all nodes in the path are allowed before a AHJ.
-        for node in path.iter() {
-            if !is_allowed(node) {
-                return false;
-            }
-        }
-    }
-
-    // If we encounter an AggregateExec
-    if plan.as_any().is::<AggregateExec>() {
-        // We can exit early if we see an AggregateExec after a AHJ or even without a prior AHJ.
-        return true;
-    }
-
-    // If we have not returned by now, we recursively check children.
-    let mut is_valid = true;
-    for child in plan.children() {
-        is_valid &= check_nodes(child.clone(), path, has_seen_ahj);
-        if !is_valid {
-            break;
-        }
-    }
-
-    path.pop();
-    is_valid
-}
-
-/// Validates if the given execution plan results in a valid aggregation by traversing the plan's nodes.
-///
-/// The function determines the validity based on certain conditions related to `AggregativeHashJoinExec`
-/// and other allowed nodes leading up to it. If an `AggregateExec` is found without a prior `AggregativeHashJoinExec`,
-/// the result is considered also valid.
-///
-/// # Parameters
-/// * `plan`: The root execution plan node to start the validation from.
-/// * `has_seen_ahj`: A mutable reference to a boolean flag that indicates whether an `AggregativeHashJoinExec`
-///   node has been encountered during the traversal. This flag is updated during the process.
-///
-/// # Returns
-/// * Returns `true` if the aggregation result from the given execution plan is considered valid.
-/// * Returns `false` otherwise.
-///
-fn check_the_aggregation_result_is_valid(
-    plan: &Arc<dyn ExecutionPlan>,
-    has_seen_ahj: &mut bool,
-) -> bool {
-    let mut path = Vec::new();
-    check_nodes(plan.clone(), &mut path, has_seen_ahj)
-}
-
 #[cfg(test)]
 mod order_preserving_join_swap_tests {
     use std::sync::Arc;
 
     use crate::physical_optimizer::enforce_sorting::EnforceSorting;
+    use crate::physical_optimizer::join_pipeline_selection::direct_aggregate_parameters_to_children;
     use crate::physical_optimizer::join_selection::JoinSelection;
     use crate::physical_optimizer::output_requirements::OutputRequirements;
     use crate::physical_optimizer::test_utils::{
@@ -1428,10 +1708,12 @@ mod order_preserving_join_swap_tests {
     use arrow_schema::{DataType, Field, Schema, SchemaRef, SortOptions};
     use datafusion_common::{JoinSide, Result};
     use datafusion_expr::{BuiltInWindowFunction, JoinType, WindowFrame, WindowFunction};
+    use datafusion_physical_expr::equivalence::add_offset_to_expr;
     use datafusion_physical_expr::expressions::{
         col, Column, FirstValue, LastValue, NotExpr,
     };
     use datafusion_physical_expr::{AggregateExpr, PhysicalExpr, PhysicalSortExpr};
+    use datafusion_physical_plan::joins::{HashJoinExec, PartitionMode};
 
     // Util function to get string representation of a physical plan
     fn get_plan_string(plan: &Arc<dyn ExecutionPlan>) -> Vec<String> {
@@ -3561,14 +3843,18 @@ mod order_preserving_join_swap_tests {
             &JoinType::Inner,
         )?;
         let join_schema = join.schema();
+        let option_asc = SortOptions {
+            descending: false,
+            nulls_first: true,
+        };
         // aggregation from build side, not expecting swaping.
         let aggr_expr = vec![Arc::new(FirstValue::new(
             col("b", &join_schema)?,
-            "FirstValue(b)".to_string(),
+            "FirstValue(b ORDER BY a ASC)".to_string(),
             DataType::Int32,
             vec![PhysicalSortExpr {
                 expr: col("a", &join_schema)?,
-                options: SortOptions::default(),
+                options: option_asc,
             }],
             vec![DataType::Int32],
         )) as _];
@@ -3581,14 +3867,85 @@ mod order_preserving_join_swap_tests {
         let physical_plan = partial_aggregate_exec(join, partial_group_by, aggr_expr);
 
         let expected_input = [
-            "AggregateExec: mode=Partial, gby=[d@3 as d], aggr=[FirstValue(b)], ordering_mode=Sorted",
+            "AggregateExec: mode=Partial, gby=[d@3 as d], aggr=[FirstValue(b ORDER BY a ASC)], ordering_mode=Sorted",
             "  HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, d@0)], filter=0@0 > 1@1",
             "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
             "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
         ];
         let expected_optimized = [
-            "AggregateExec: mode=Partial, gby=[d@3 as d], aggr=[FirstValue(b)], ordering_mode=Sorted",
+            "AggregateExec: mode=Partial, gby=[d@3 as d], aggr=[FirstValue(b ORDER BY a ASC)], ordering_mode=Sorted",
             "  HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, d@0)], filter=0@0 > 1@1",
+            "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+        ];
+        assert_original_plan!(expected_input, physical_plan.clone());
+        assert_join_selection_enforce_sorting!(expected_optimized, physical_plan.clone());
+        assert_enforce_sorting_join_selection!(expected_optimized, physical_plan);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_partitioned_hash_change_first_aggr_expr() -> Result<()> {
+        let left_schema = create_test_schema()?;
+        let right_schema = create_test_schema2()?;
+        let left_input =
+            streaming_table_exec(&left_schema, Some(vec![sort_expr("a", &left_schema)]));
+        let right_input = streaming_table_exec(
+            &right_schema,
+            Some(vec![sort_expr("d", &right_schema)]),
+        );
+        let on = vec![(
+            Column::new_with_schema("a", &left_schema)?,
+            Column::new_with_schema("d", &right_schema)?,
+        )];
+
+        // Right side is prunable.
+        let partial_prunable_filter = partial_prunable_filter(
+            col_indices("d", &right_schema, JoinSide::Right),
+            col_indices("a", &left_schema, JoinSide::Left),
+        );
+
+        // Waiting swap on AggregativeHashJoinExec.
+        let join = hash_join_exec(
+            left_input,
+            right_input,
+            on,
+            Some(partial_prunable_filter),
+            &JoinType::Inner,
+        )?;
+        let join_schema = join.schema();
+        let option_desc = SortOptions {
+            descending: true,
+            nulls_first: false,
+        };
+        // aggregation from build side, not expecting swaping.
+        let aggr_expr = vec![Arc::new(FirstValue::new(
+            col("b", &join_schema)?,
+            "FirstValue(b) ORDER BY a DESC".to_string(),
+            DataType::Int32,
+            vec![PhysicalSortExpr {
+                expr: col("a", &join_schema)?,
+                options: option_desc,
+            }],
+            vec![DataType::Int32],
+        )) as _];
+
+        let groups: Vec<(Arc<dyn PhysicalExpr>, String)> =
+            vec![(col("d", &join_schema)?, "d".to_string())];
+
+        let partial_group_by = PhysicalGroupBy::new_single(groups);
+
+        let physical_plan = partial_aggregate_exec(join, partial_group_by, aggr_expr);
+
+        let expected_input = [
+            "AggregateExec: mode=Partial, gby=[d@3 as d], aggr=[FirstValue(b) ORDER BY a DESC], ordering_mode=Sorted",
+            "  HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, d@0)], filter=0@0 > 1@1",
+            "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+        ];
+        let expected_optimized = [
+            "AggregateExec: mode=Partial, gby=[d@3 as d], aggr=[FirstValue(b) ORDER BY a DESC], ordering_mode=Sorted",
+            "  AggregativeHashJoinExec: join_type=Inner, on=[(a@0, d@0)], filter=0@0 > 1@1",
             "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
             "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
         ];
@@ -3903,6 +4260,83 @@ mod order_preserving_join_swap_tests {
         assert_original_plan!(expected_input, physical_plan.clone());
         assert_join_selection_enforce_sorting!(expected_optimized, physical_plan.clone());
         assert_enforce_sorting_join_selection!(expected_optimized, physical_plan);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_direct_aggregate_exprs_to_children() -> Result<()> {
+        let left_schema = create_test_schema()?;
+        let col_a_expr = &col("a", &left_schema)?;
+        let col_b_expr = &col("b", &left_schema)?;
+        let left_len = left_schema.fields.len();
+        let col_a_right_expr = &add_offset_to_expr(col_a_expr.clone(), left_len);
+        let col_b_right_expr = &add_offset_to_expr(col_b_expr.clone(), left_len);
+
+        let col_a = col_a_expr.as_any().downcast_ref::<Column>().unwrap();
+        let left =
+            streaming_table_exec(&left_schema, Some(vec![sort_expr("a", &left_schema)]));
+        let right = left.clone();
+        let partitioned_hash_join = Arc::new(HashJoinExec::try_new(
+            left,
+            right,
+            vec![(col_a.clone(), col_a.clone())],
+            None,
+            &JoinType::Inner,
+            PartitionMode::Partitioned,
+            false,
+        )?) as Arc<dyn ExecutionPlan>;
+
+        let option_desc = SortOptions {
+            descending: true,
+            nulls_first: true,
+        };
+        let aggregate_exprs = vec![
+            Arc::new(LastValue::new(
+                col_b_expr.clone(),
+                "LastValue(b) ORDER BY a DESC".to_string(),
+                DataType::Int32,
+                vec![PhysicalSortExpr {
+                    expr: col_a_expr.clone(),
+                    options: option_desc,
+                }],
+                vec![DataType::Int32],
+            )) as _,
+            Arc::new(LastValue::new(
+                col_b_right_expr.clone(),
+                "LastValue(b) ORDER BY a DESC".to_string(),
+                DataType::Int32,
+                vec![PhysicalSortExpr {
+                    expr: col_a_right_expr.clone(),
+                    options: option_desc,
+                }],
+                vec![DataType::Int32],
+            )) as _,
+        ];
+
+        // empty group by
+        let groupby_exprs = vec![];
+
+        let res = direct_aggregate_parameters_to_children(
+            &partitioned_hash_join,
+            &aggregate_exprs,
+            &groupby_exprs,
+        )?;
+        let left = res[0].0.clone().unwrap();
+        let right = res[1].0.clone().unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(right.len(), 1);
+        assert!(
+            left[0].eq(&aggregate_exprs[0]),
+            "{:?}, {:?}",
+            left[0],
+            &aggregate_exprs[0]
+        );
+        assert!(
+            right[0].eq(&aggregate_exprs[0]),
+            "{:?}, {:?}",
+            right[0],
+            &aggregate_exprs[0]
+        );
         Ok(())
     }
 }
@@ -4377,7 +4811,6 @@ mod sql_fuzzy_tests {
             AND l_orderkey > o_orderkey + 10
             AND l_returnflag = 'R'";
 
-        // TODO; Which one to use? SymmetricHashJoin or SlidingHashJoin?
         let expected_plan = [
             "ProjectionExec: expr=[o_orderkey@0 as o_orderkey, l_suppkey@3 as l_suppkey]",
             "  SlidingHashJoinExec: join_type=Left, on=[(o_orderdate@1, l_shipdate@2)], filter=l_orderkey@1 < o_orderkey@0 - 10 AND l_orderkey@1 > o_orderkey@0 + 10",

@@ -15,8 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// This file contains both Apache Software Foundation copyrighted code as well
+// as Synnada, Inc. extensions. Changes that constitute Synnada, Inc. extensions
+// are available in the SYNNADA-CONTRIBUTIONS.txt file.
+// Synnada, Inc. claims copyright only for Synnada, Inc. extensions.
+
+use std::hash::Hash;
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use crate::expressions::{Column, Literal};
@@ -756,6 +761,24 @@ pub fn add_offset_to_expr(
         Some(col) => Ok(Transformed::Yes(Arc::new(Column::new(
             col.name(),
             offset + col.index(),
+        )))),
+        None => Ok(Transformed::No(e)),
+    })
+    .unwrap()
+    // Note that we can safely unwrap here since our transform always returns
+    // an `Ok` value.
+}
+
+/// Subtracts the `offset` value from `Column` indices inside `expr`. This function is
+/// generally used during the update of the right table schema in join operations.
+pub fn sub_offset_from_expr(
+    expr: Arc<dyn PhysicalExpr>,
+    offset: usize,
+) -> Arc<dyn PhysicalExpr> {
+    expr.transform_down(&|e| match e.as_any().downcast_ref::<Column>() {
+        Some(col) => Ok(Transformed::Yes(Arc::new(Column::new(
+            col.name(),
+            col.index() - offset,
         )))),
         None => Ok(Transformed::No(e)),
     })

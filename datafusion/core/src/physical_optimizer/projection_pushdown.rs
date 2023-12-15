@@ -15,8 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// Copyright (C) Synnada, Inc. - All Rights Reserved.
-// This file does not contain any Apache Software Foundation copyrighted code.
+// This file contains both Apache Software Foundation copyrighted code as well
+// as Synnada, Inc. extensions. Changes that constitute Synnada, Inc. extensions
+// are available in the SYNNADA-CONTRIBUTIONS.txt file.
+// Synnada, Inc. claims copyright only for Synnada, Inc. extensions.
 
 //! This file implements the `ProjectionPushdown` physical optimization rule.
 //! The function [`remove_unnecessary_projections`] tries to push down all
@@ -946,7 +948,7 @@ fn new_projections_for_columns(
 ///    given the expressions `c@0`, `a@1` and `b@2`, and the [`ProjectionExec`] with
 ///    an output schema of `a, c_new`, then `c@0` becomes `c_new@1`, `a@1` becomes
 ///    `a@0`, but `b@2` results in `None` since the projection does not include `b`.
-fn update_expr(
+pub fn update_expr(
     expr: &Arc<dyn PhysicalExpr>,
     projected_exprs: &[(Arc<dyn PhysicalExpr>, String)],
     sync_with_child: bool,
