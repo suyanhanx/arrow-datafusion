@@ -780,7 +780,32 @@ impl LogicalPlan {
             LogicalPlan::CrossJoin(_) => {
                 let left = inputs[0].clone();
                 let right = inputs[1].clone();
-                LogicalPlanBuilder::from(left).cross_join(right)?.build()
+                if expr.is_empty() {
+                    // If expr is empty, construct cross join from children
+                    LogicalPlanBuilder::from(left).cross_join(right)?.build()
+                } else if expr.len() == 1 {
+                    // given expr is predicate, convert cross join to the join with
+                    // condition
+                    let filter = Some(expr[0].clone());
+                    let join_schema = build_join_schema(
+                        left.schema(),
+                        right.schema(),
+                        &JoinType::Inner,
+                    )?;
+                    // predicate is given
+                    Ok(LogicalPlan::Join(Join {
+                        left: Arc::new(left),
+                        right: Arc::new(right),
+                        join_type: JoinType::Inner,
+                        join_constraint: JoinConstraint::On,
+                        on: vec![],
+                        filter,
+                        schema: DFSchemaRef::new(join_schema),
+                        null_equals_null: true,
+                    }))
+                } else {
+                    unreachable!();
+                }
             }
             LogicalPlan::Subquery(Subquery {
                 outer_ref_columns, ..

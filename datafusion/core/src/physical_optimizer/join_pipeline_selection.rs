@@ -1587,6 +1587,12 @@ fn handle_cross_join(plan_metadata: PlanMetadata) -> Result<Vec<PlanMetadata>> {
     Ok(vec![plan_metadata])
 }
 
+fn print_plan(plan: &Arc<dyn ExecutionPlan>) {
+    let formatted = datafusion_physical_plan::displayable(plan.as_ref()).indent(true).to_string();
+    let actual: Vec<&str> = formatted.trim().lines().collect();
+    println!("{:#?}", actual);
+}
+
 /// Checks if a nested loop join is convertible, and if so, converts it.
 ///
 /// # Arguments
@@ -1606,6 +1612,7 @@ fn handle_nested_loop_join(
         .as_any()
         .downcast_ref::<NestedLoopJoinExec>()
     {
+        print_plan(&plan_metadata.plan);
         // To perform the prunability analysis correctly, the columns from the left table
         // and the columns from the right table must be on the different sides of the join.
         let filter = nested_loop_join
@@ -1613,6 +1620,8 @@ fn handle_nested_loop_join(
             .map(|filter| separate_columns_of_filter_expression(filter.clone()));
         let left_order = nested_loop_join.left().output_ordering();
         let right_order = nested_loop_join.right().output_ordering();
+        println!("left_order {:?}", left_order);
+        println!("right_order {:?}", right_order);
         let is_left_streaming = plan_metadata.children_unboundedness[0];
         let is_right_streaming = plan_metadata.children_unboundedness[1];
         match (
@@ -1623,6 +1632,10 @@ fn handle_nested_loop_join(
             right_order,
         ) {
             (true, true, Some(filter), Some(left_order), Some(right_order)) => {
+                println!("nested_loop_join.left().schema() {}", nested_loop_join.left().schema());
+                println!("nested_loop_join.right().schema() {}", nested_loop_join.right().schema());
+                println!("filter.col_idx {:?}", filter.column_indices());
+                println!("filter.expression {}", filter.expression());
                 let (left_prunable, right_prunable) = is_filter_expr_prunable(
                     &filter,
                     Some(left_order[0].clone()),
@@ -4363,7 +4376,7 @@ mod sql_fuzzy_tests {
     use datafusion_execution::config::SessionConfig;
     use datafusion_expr::expr::Sort;
     use datafusion_expr::{col, Expr};
-    use itertools::izip;
+    use itertools::{Itertools, izip};
     use std::path::PathBuf;
     use std::sync::{Arc, OnceLock};
 
@@ -4523,6 +4536,7 @@ mod sql_fuzzy_tests {
         let ctx = setup_context(true).await?;
         let dataframe = ctx.sql(sql).await?;
         let physical_plan = dataframe.create_physical_plan().await?;
+        print_plan(&physical_plan);
         assert_original_plan(physical_plan.clone(), expected_input);
         let batches = collect(physical_plan, ctx.task_ctx()).await?;
         Ok(batches)
@@ -4531,9 +4545,16 @@ mod sql_fuzzy_tests {
     async fn bounded_execution(sql: &str) -> Result<Vec<RecordBatch>> {
         let ctx = setup_context(false).await?;
         let dataframe = ctx.sql(sql).await?;
+
         let physical_plan = dataframe.create_physical_plan().await?;
+        print_plan(&physical_plan);
         let batches = collect(physical_plan, ctx.task_ctx()).await?;
         Ok(batches)
+    }
+    fn print_plan(plan: &Arc<dyn ExecutionPlan>) {
+        let formatted = displayable(plan.as_ref()).indent(true).to_string();
+        let actual: Vec<&str> = formatted.trim().lines().collect();
+        println!("{:#?}", actual);
     }
 
     async fn experiment(expected_unbounded_plan: &[&str], sql: &str) -> Result<()> {
@@ -4834,4 +4855,347 @@ mod sql_fuzzy_tests {
         experiment(&expected_plan, sql).await?;
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_unbounded_hash_selection_4() -> Result<()> {
+        let sql = "SELECT
+            n_nationkey
+        FROM
+            orders,
+            lineitem,
+            customer,
+            nation
+        WHERE
+            c_custkey = o_orderkey
+            AND n_regionkey = c_nationkey
+            AND n_nationkey > c_custkey
+            AND n_nationkey < c_custkey + 10
+            AND l_orderkey < o_orderkey - 10
+            AND l_orderkey > o_orderkey + 10
+            AND o_orderdate = l_shipdate
+        GROUP BY n_nationkey";
+
+        let expected_plan = [
+            "AggregateExec: mode=Single, gby=[n_nationkey@0 as n_nationkey], aggr=[], ordering_mode=Sorted",
+            "  ProjectionExec: expr=[n_nationkey@2 as n_nationkey]",
+            "    SlidingHashJoinExec: join_type=Inner, on=[(c_nationkey@1, n_regionkey@1)], filter=n_nationkey@1 > c_custkey@0 AND n_nationkey@1 < c_custkey@0 + 10",
+            "      ProjectionExec: expr=[c_custkey@1 as c_custkey, c_nationkey@2 as c_nationkey]",
+            "        SortMergeJoin: join_type=Inner, on=[(o_orderkey@0, c_custkey@0)]",
+            "          ProjectionExec: expr=[o_orderkey@2 as o_orderkey]",
+            "            SlidingHashJoinExec: join_type=Inner, on=[(l_shipdate@1, o_orderdate@1)], filter=l_orderkey@1 < o_orderkey@0 - 10 AND l_orderkey@1 > o_orderkey@0 + 10",
+            "              CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/lineitem.csv]]}, projection=[l_orderkey, l_shipdate], infinite_source=true, output_ordering=[l_orderkey@0 ASC NULLS LAST], has_header=true",
+            "              CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/orders.csv]]}, projection=[o_orderkey, o_orderdate], infinite_source=true, output_ordering=[o_orderkey@0 ASC NULLS LAST], has_header=true",
+            "          CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/customer.csv]]}, projection=[c_custkey, c_nationkey], infinite_source=true, output_ordering=[c_custkey@0 ASC NULLS LAST], has_header=true",
+            "      CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/nation.csv]]}, projection=[n_nationkey, n_regionkey], infinite_source=true, output_ordering=[n_nationkey@0 ASC NULLS LAST], has_header=true",
+        ];
+
+        experiment(&expected_plan, sql).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_unbounded_hash_selection_5() -> Result<()> {
+        let sql = "SELECT
+            n_nationkey
+        FROM
+            orders,
+            customer,
+            lineitem,
+            nation
+        WHERE
+            c_custkey = o_orderkey
+            AND n_nationkey > c_custkey
+            AND n_nationkey < c_custkey + 10
+            AND l_orderkey < o_orderkey - 10
+            AND l_orderkey > o_orderkey + 10
+        GROUP BY n_nationkey";
+
+        let expected_plan = [
+            "AggregateExec: mode=Single, gby=[n_nationkey@0 as n_nationkey], aggr=[], ordering_mode=Sorted",
+            "  ProjectionExec: expr=[n_nationkey@1 as n_nationkey]",
+            "    SlidingNestedLoopJoinExec: join_type=Inner, filter=n_nationkey@1 > c_custkey@0 AND n_nationkey@1 < c_custkey@0 + 10",
+            "      ProjectionExec: expr=[c_custkey@2 as c_custkey]",
+            "        SlidingNestedLoopJoinExec: join_type=Inner, filter=l_orderkey@1 < o_orderkey@0 - 10 AND l_orderkey@1 > o_orderkey@0 + 10",
+            "          CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/lineitem.csv]]}, projection=[l_orderkey], infinite_source=true, output_ordering=[l_orderkey@0 ASC NULLS LAST], has_header=true",
+            "          SortMergeJoin: join_type=Inner, on=[(o_orderkey@0, c_custkey@0)]",
+            "            CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/orders.csv]]}, projection=[o_orderkey], infinite_source=true, output_ordering=[o_orderkey@0 ASC NULLS LAST], has_header=true",
+            "            CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/customer.csv]]}, projection=[c_custkey], infinite_source=true, output_ordering=[c_custkey@0 ASC NULLS LAST], has_header=true",
+            "      CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/nation.csv]]}, projection=[n_nationkey], infinite_source=true, output_ordering=[n_nationkey@0 ASC NULLS LAST], has_header=true",
+        ];
+
+        experiment(&expected_plan, sql).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_unbounded_hash_selection_6() -> Result<()> {
+        let sql = "SELECT
+            n_nationkey
+        FROM
+            nation,
+            orders,
+            lineitem,
+            customer
+        WHERE
+            c_custkey = o_orderkey
+            AND n_nationkey > c_custkey
+            AND n_nationkey < c_custkey + 10
+            AND l_orderkey < o_orderkey - 10
+            AND l_orderkey > o_orderkey + 10
+        GROUP BY n_nationkey";
+
+        let expected_plan = [
+            "AggregateExec: mode=Single, gby=[n_nationkey@0 as n_nationkey], aggr=[], ordering_mode=Sorted",
+            "  ProjectionExec: expr=[n_nationkey@1 as n_nationkey]",
+            "    SlidingNestedLoopJoinExec: join_type=Inner, filter=n_nationkey@1 > c_custkey@0 AND n_nationkey@1 < c_custkey@0 + 10",
+            "      ProjectionExec: expr=[c_custkey@1 as c_custkey]",
+            "        SortMergeJoin: join_type=Inner, on=[(o_orderkey@0, c_custkey@0)]",
+            "          ProjectionExec: expr=[o_orderkey@1 as o_orderkey]",
+            "            SlidingNestedLoopJoinExec: join_type=Inner, filter=l_orderkey@0 < o_orderkey@1 - 10 AND l_orderkey@0 > o_orderkey@1 + 10",
+            "              CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/lineitem.csv]]}, projection=[l_orderkey], infinite_source=true, output_ordering=[l_orderkey@0 ASC NULLS LAST], has_header=true",
+            "              CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/orders.csv]]}, projection=[o_orderkey], infinite_source=true, output_ordering=[o_orderkey@0 ASC NULLS LAST], has_header=true",
+            "          CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/customer.csv]]}, projection=[c_custkey], infinite_source=true, output_ordering=[c_custkey@0 ASC NULLS LAST], has_header=true",
+            "      CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/nation.csv]]}, projection=[n_nationkey], infinite_source=true, output_ordering=[n_nationkey@0 ASC NULLS LAST], has_header=true",
+        ];
+
+        experiment(&expected_plan, sql).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_unbounded_hash_selection_7_multiple_logical_plan_try() -> Result<()> {
+        let sql = "SELECT
+            n_nationkey
+        FROM
+            nation,
+            orders,
+            lineitem,
+            customer
+        WHERE
+            c_custkey > o_orderkey
+            AND c_custkey < o_orderkey + 10
+            AND n_nationkey > c_custkey
+            AND n_nationkey < c_custkey + 10
+            AND l_orderkey < o_orderkey - 10
+            AND l_orderkey > o_orderkey + 10
+        GROUP BY n_nationkey";
+
+        let expected_plan = [
+            "AggregateExec: mode=Single, gby=[n_nationkey@0 as n_nationkey], aggr=[], ordering_mode=Sorted",
+            "  ProjectionExec: expr=[n_nationkey@1 as n_nationkey]",
+            "    SlidingNestedLoopJoinExec: join_type=Inner, filter=n_nationkey@1 > c_custkey@0 AND n_nationkey@1 < c_custkey@0 + 10",
+            "      ProjectionExec: expr=[c_custkey@1 as c_custkey]",
+            "        SlidingNestedLoopJoinExec: join_type=Inner, filter=c_custkey@1 > o_orderkey@0 AND c_custkey@1 < o_orderkey@0 + 10",
+            "          ProjectionExec: expr=[o_orderkey@1 as o_orderkey]",
+            "            SlidingNestedLoopJoinExec: join_type=Inner, filter=l_orderkey@0 < o_orderkey@1 - 10 AND l_orderkey@0 > o_orderkey@1 + 10",
+            "              CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/lineitem.csv]]}, projection=[l_orderkey], infinite_source=true, output_ordering=[l_orderkey@0 ASC NULLS LAST], has_header=true",
+            "              CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/orders.csv]]}, projection=[o_orderkey], infinite_source=true, output_ordering=[o_orderkey@0 ASC NULLS LAST], has_header=true",
+            "          CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/customer.csv]]}, projection=[c_custkey], infinite_source=true, output_ordering=[c_custkey@0 ASC NULLS LAST], has_header=true",
+            "      CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/nation.csv]]}, projection=[n_nationkey], infinite_source=true, output_ordering=[n_nationkey@0 ASC NULLS LAST], has_header=true",
+        ];
+
+        experiment(&expected_plan, sql).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_unbounded_hash_selection_8() -> Result<()> {
+        let sql = "SELECT
+            n_nationkey
+        FROM
+            nation,
+            customer,
+            orders,
+            lineitem
+        WHERE
+            c_custkey > o_orderkey
+            AND c_custkey < o_orderkey + 10
+            AND n_nationkey > c_custkey
+            AND n_nationkey < c_custkey + 10
+            AND l_orderkey < o_orderkey - 10
+            AND l_orderkey > o_orderkey + 10
+        GROUP BY n_nationkey";
+
+        // Initial
+        // Aggregate: groupBy=[[nation.n_nationkey]], aggr=[[]]
+        //   Projection: nation.n_nationkey
+        //     Inner Join:  Filter: lineitem.l_orderkey < orders.o_orderkey - Int64(10) AND lineitem.l_orderkey > orders.o_orderkey + Int64(10) AS orders.o_orderkey + Int64(10)
+        //       Projection: nation.n_nationkey, orders.o_orderkey
+        //         Inner Join:  Filter: customer.c_custkey > orders.o_orderkey AND customer.c_custkey < orders.o_orderkey + Int64(10) AS orders.o_orderkey + Int64(10)
+        //           Inner Join:  Filter: nation.n_nationkey > customer.c_custkey AND nation.n_nationkey < customer.c_custkey + Int64(10)
+        //             TableScan: nation projection=[n_nationkey]
+        //             TableScan: customer projection=[c_custkey]
+        //           TableScan: orders projection=[o_orderkey]
+        //       TableScan: lineitem projection=[l_orderkey]
+        // Next try.
+        // Projection: nation.n_nationkey
+        //   Aggregate: groupBy=[[nation.n_nationkey]], aggr=[[]]
+        //     Filter: customer.c_custkey > orders.o_orderkey AND customer.c_custkey < orders.o_orderkey + Int64(10) AND nation.n_nationkey > customer.c_custkey AND nation.n_nationkey < customer.c_custkey + Int64(10) AND lineitem.l_orderkey < orders.o_orderkey - Int64(10) AND lineitem.l_orderkey > orders.o_orderkey + Int64(10)
+        //       CrossJoin:
+        //         CrossJoin:
+        //           CrossJoin:
+        //             TableScan: lineitem
+        //             TableScan: orders
+        //           TableScan: customer
+        //         TableScan: nation
+
+        let expected_plan = [
+            "AggregateExec: mode=Single, gby=[n_nationkey@0 as n_nationkey], aggr=[], ordering_mode=Sorted",
+            "  ProjectionExec: expr=[n_nationkey@1 as n_nationkey]",
+            "    SlidingNestedLoopJoinExec: join_type=Inner, filter=n_nationkey@1 > c_custkey@0 AND n_nationkey@1 < c_custkey@0 + 10",
+            "      ProjectionExec: expr=[c_custkey@1 as c_custkey]",
+            "        SlidingNestedLoopJoinExec: join_type=Inner, filter=c_custkey@1 > o_orderkey@0 AND c_custkey@1 < o_orderkey@0 + 10",
+            "          ProjectionExec: expr=[o_orderkey@1 as o_orderkey]",
+            "            SlidingNestedLoopJoinExec: join_type=Inner, filter=l_orderkey@0 < o_orderkey@1 - 10 AND l_orderkey@0 > o_orderkey@1 + 10",
+            "              CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/lineitem.csv]]}, projection=[l_orderkey], infinite_source=true, output_ordering=[l_orderkey@0 ASC NULLS LAST], has_header=true",
+            "              CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/orders.csv]]}, projection=[o_orderkey], infinite_source=true, output_ordering=[o_orderkey@0 ASC NULLS LAST], has_header=true",
+            "          CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/customer.csv]]}, projection=[c_custkey], infinite_source=true, output_ordering=[c_custkey@0 ASC NULLS LAST], has_header=true",
+            "      CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/nation.csv]]}, projection=[n_nationkey], infinite_source=true, output_ordering=[n_nationkey@0 ASC NULLS LAST], has_header=true",
+        ];
+
+        experiment(&expected_plan, sql).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_unbounded_hash_selection_9_preserving_true_order() -> Result<()> {
+        let sql = "SELECT
+            n_nationkey
+        FROM
+            lineitem,
+            orders,
+            customer,
+            nation
+        WHERE
+            c_custkey > o_orderkey
+            AND c_custkey < o_orderkey + 10
+            AND n_nationkey > c_custkey
+            AND n_nationkey < c_custkey + 10
+            AND l_orderkey < o_orderkey - 10
+            AND l_orderkey > o_orderkey + 10
+        GROUP BY n_nationkey";
+
+        let expected_plan = [
+            "AggregateExec: mode=Single, gby=[n_nationkey@0 as n_nationkey], aggr=[], ordering_mode=Sorted",
+            "  ProjectionExec: expr=[n_nationkey@1 as n_nationkey]",
+            "    SlidingNestedLoopJoinExec: join_type=Inner, filter=n_nationkey@1 > c_custkey@0 AND n_nationkey@1 < c_custkey@0 + 10",
+            "      ProjectionExec: expr=[c_custkey@1 as c_custkey]",
+            "        SlidingNestedLoopJoinExec: join_type=Inner, filter=c_custkey@1 > o_orderkey@0 AND c_custkey@1 < o_orderkey@0 + 10",
+            "          ProjectionExec: expr=[o_orderkey@1 as o_orderkey]",
+            "            SlidingNestedLoopJoinExec: join_type=Inner, filter=l_orderkey@0 < o_orderkey@1 - 10 AND l_orderkey@0 > o_orderkey@1 + 10",
+            "              CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/lineitem.csv]]}, projection=[l_orderkey], infinite_source=true, output_ordering=[l_orderkey@0 ASC NULLS LAST], has_header=true",
+            "              CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/orders.csv]]}, projection=[o_orderkey], infinite_source=true, output_ordering=[o_orderkey@0 ASC NULLS LAST], has_header=true",
+            "          CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/customer.csv]]}, projection=[c_custkey], infinite_source=true, output_ordering=[c_custkey@0 ASC NULLS LAST], has_header=true",
+            "      CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/nation.csv]]}, projection=[n_nationkey], infinite_source=true, output_ordering=[n_nationkey@0 ASC NULLS LAST], has_header=true",
+        ];
+
+        experiment(&expected_plan, sql).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_unbounded_hash_selection_10_preserving_true_order() -> Result<()> {
+        let sql = "SELECT
+            n_nationkey
+        FROM
+            lineitem,
+            orders,
+            customer,
+            nation
+        WHERE
+            c_custkey > o_orderkey
+            AND c_custkey < o_orderkey + 10
+            AND n_nationkey > c_custkey
+            AND n_nationkey < c_custkey + 10
+            AND l_orderkey < o_orderkey - 10
+            AND l_orderkey > o_orderkey + 10
+            AND n_nationkey > l_orderkey
+            AND n_nationkey < l_orderkey + 10
+        GROUP BY n_nationkey";
+
+        let expected_plan = [
+            "AggregateExec: mode=Single, gby=[n_nationkey@0 as n_nationkey], aggr=[], ordering_mode=Sorted",
+            "  ProjectionExec: expr=[n_nationkey@2 as n_nationkey]",
+            "    SlidingNestedLoopJoinExec: join_type=Inner, filter=n_nationkey@2 > c_custkey@1 AND n_nationkey@2 < c_custkey@1 + 10 AND n_nationkey@2 > l_orderkey@0 AND n_nationkey@2 < l_orderkey@0 + 10",
+            "      ProjectionExec: expr=[l_orderkey@0 as l_orderkey, c_custkey@2 as c_custkey]",
+            "        SlidingNestedLoopJoinExec: join_type=Inner, filter=c_custkey@1 > o_orderkey@0 AND c_custkey@1 < o_orderkey@0 + 10",
+            "          SlidingNestedLoopJoinExec: join_type=Inner, filter=l_orderkey@0 < o_orderkey@1 - 10 AND l_orderkey@0 > o_orderkey@1 + 10",
+            "            CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/lineitem.csv]]}, projection=[l_orderkey], infinite_source=true, output_ordering=[l_orderkey@0 ASC NULLS LAST], has_header=true",
+            "            CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/orders.csv]]}, projection=[o_orderkey], infinite_source=true, output_ordering=[o_orderkey@0 ASC NULLS LAST], has_header=true",
+            "          CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/customer.csv]]}, projection=[c_custkey], infinite_source=true, output_ordering=[c_custkey@0 ASC NULLS LAST], has_header=true",
+            "      CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/nation.csv]]}, projection=[n_nationkey], infinite_source=true, output_ordering=[n_nationkey@0 ASC NULLS LAST], has_header=true",
+        ];
+
+        experiment(&expected_plan, sql).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_unbounded_hash_selection_disjoint_filter() -> Result<()> {
+        let sql = "SELECT
+            n_nationkey
+        FROM
+            nation,
+            orders,
+            lineitem,
+            customer
+        WHERE
+            n_nationkey > c_custkey
+            AND n_nationkey < c_custkey + 10
+            AND l_orderkey < o_orderkey - 10
+            AND l_orderkey > o_orderkey + 10
+        GROUP BY n_nationkey";
+
+        let expected_plan = [
+            "AggregateExec: mode=Single, gby=[n_nationkey@0 as n_nationkey], aggr=[], ordering_mode=Sorted",
+            "  ProjectionExec: expr=[n_nationkey@1 as n_nationkey]",
+            "    SlidingNestedLoopJoinExec: join_type=Inner, filter=n_nationkey@1 > c_custkey@0 AND n_nationkey@1 < c_custkey@0 + 10",
+            "      ProjectionExec: expr=[c_custkey@1 as c_custkey]",
+            "        SortMergeJoin: join_type=Inner, on=[(o_orderkey@0, c_custkey@0)]",
+            "          ProjectionExec: expr=[o_orderkey@1 as o_orderkey]",
+            "            SlidingNestedLoopJoinExec: join_type=Inner, filter=l_orderkey@0 < o_orderkey@1 - 10 AND l_orderkey@0 > o_orderkey@1 + 10",
+            "              CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/lineitem.csv]]}, projection=[l_orderkey], infinite_source=true, output_ordering=[l_orderkey@0 ASC NULLS LAST], has_header=true",
+            "              CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/orders.csv]]}, projection=[o_orderkey], infinite_source=true, output_ordering=[o_orderkey@0 ASC NULLS LAST], has_header=true",
+            "          CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/customer.csv]]}, projection=[c_custkey], infinite_source=true, output_ordering=[c_custkey@0 ASC NULLS LAST], has_header=true",
+            "      CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/nation.csv]]}, projection=[n_nationkey], infinite_source=true, output_ordering=[n_nationkey@0 ASC NULLS LAST], has_header=true",
+        ];
+
+        experiment(&expected_plan, sql).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_unbounded_hash_selection_disjoint_filter() -> Result<()> {
+        let sql = "SELECT
+            n_nationkey
+        FROM
+            nation,
+            orders,
+            lineitem,
+            customer
+        WHERE
+            n_nationkey > c_custkey
+            AND n_nationkey < c_custkey + 10
+            AND l_orderkey < o_orderkey - 10
+            AND l_orderkey > o_orderkey + 10
+        GROUP BY n_nationkey";
+
+        let expected_plan = [
+            "AggregateExec: mode=Single, gby=[n_nationkey@0 as n_nationkey], aggr=[], ordering_mode=Sorted",
+            "  ProjectionExec: expr=[n_nationkey@1 as n_nationkey]",
+            "    SlidingNestedLoopJoinExec: join_type=Inner, filter=n_nationkey@1 > c_custkey@0 AND n_nationkey@1 < c_custkey@0 + 10",
+            "      ProjectionExec: expr=[c_custkey@1 as c_custkey]",
+            "        SortMergeJoin: join_type=Inner, on=[(o_orderkey@0, c_custkey@0)]",
+            "          ProjectionExec: expr=[o_orderkey@1 as o_orderkey]",
+            "            SlidingNestedLoopJoinExec: join_type=Inner, filter=l_orderkey@0 < o_orderkey@1 - 10 AND l_orderkey@0 > o_orderkey@1 + 10",
+            "              CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/lineitem.csv]]}, projection=[l_orderkey], infinite_source=true, output_ordering=[l_orderkey@0 ASC NULLS LAST], has_header=true",
+            "              CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/orders.csv]]}, projection=[o_orderkey], infinite_source=true, output_ordering=[o_orderkey@0 ASC NULLS LAST], has_header=true",
+            "          CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/customer.csv]]}, projection=[c_custkey], infinite_source=true, output_ordering=[c_custkey@0 ASC NULLS LAST], has_header=true",
+            "      CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/nation.csv]]}, projection=[n_nationkey], infinite_source=true, output_ordering=[n_nationkey@0 ASC NULLS LAST], has_header=true",
+        ];
+
+        experiment(&expected_plan, sql).await?;
+        Ok(())
+    }
+
 }

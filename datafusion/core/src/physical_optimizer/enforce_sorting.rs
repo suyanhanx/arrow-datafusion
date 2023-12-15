@@ -2280,3 +2280,159 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tmp_tests {
+    use crate::assert_batches_eq;
+    use crate::physical_plan::{collect, displayable, ExecutionPlan};
+    use crate::prelude::SessionContext;
+    use arrow::util::pretty::print_batches;
+    use datafusion_common::Result;
+    use datafusion_execution::config::SessionConfig;
+    use datafusion_physical_plan::get_plan_string;
+    use std::sync::Arc;
+
+    fn print_plan(plan: &Arc<dyn ExecutionPlan>) -> Result<()> {
+        let formatted = displayable(plan.as_ref()).indent(true).to_string();
+        let actual: Vec<&str> = formatted.trim().lines().collect();
+        println!("{:#?}", actual);
+        Ok(())
+    }
+
+    const MULTIPLE_ORDERED_TABLE: &str = "CREATE EXTERNAL TABLE multiple_ordered_table (
+          a0 INTEGER,
+          a INTEGER,
+          b INTEGER,
+          c INTEGER,
+          d INTEGER
+        )
+        STORED AS CSV
+        WITH HEADER ROW
+        WITH ORDER (a ASC, b ASC)
+        WITH ORDER (c ASC)
+        LOCATION '../core/tests/data/window_2.csv'";
+
+    const MULTIPLE_ORDERED_TABLE2: &str =
+        "CREATE EXTERNAL TABLE multiple_ordered_table2 (
+          a0 INTEGER,
+          a INTEGER,
+          b INTEGER,
+          c INTEGER,
+          d INTEGER
+        )
+        STORED AS CSV
+        WITH HEADER ROW
+        WITH ORDER (a ASC, b ASC)
+        WITH ORDER (c ASC)
+        LOCATION '../core/tests/data/window_2.csv'";
+
+    const MULTIPLE_ORDERED_TABLE3: &str =
+        "CREATE EXTERNAL TABLE multiple_ordered_table3 (
+          a0 INTEGER,
+          a INTEGER,
+          b INTEGER,
+          c INTEGER,
+          d INTEGER
+        )
+        STORED AS CSV
+        WITH HEADER ROW
+        WITH ORDER (a ASC, b ASC)
+        WITH ORDER (c ASC)
+        LOCATION '../core/tests/data/window_2.csv'";
+
+    const QUERY1: &str = "SELECT *
+        FROM multiple_ordered_table as t1, multiple_ordered_table2 as t2, multiple_ordered_table3 as t3
+        WHERE t1.a>t2.a AND t3.a >t1.a
+        LIMIT 5";
+
+    const QUERY2: &str = "SELECT *
+        FROM multiple_ordered_table as t1, multiple_ordered_table2 as t2
+        WHERE 1=1
+        LIMIT 5";
+
+    #[tokio::test]
+    async fn test_query() -> Result<()> {
+        let config = SessionConfig::new().with_target_partitions(1);
+        let ctx = SessionContext::new_with_config(config);
+
+        ctx.sql(MULTIPLE_ORDERED_TABLE).await?;
+        ctx.sql(MULTIPLE_ORDERED_TABLE2).await?;
+        ctx.sql(MULTIPLE_ORDERED_TABLE3).await?;
+
+        let sql = QUERY1;
+
+        let msg = format!("Creating logical plan for '{sql}'");
+        let dataframe = ctx.sql(sql).await.expect(&msg);
+        let physical_plan = dataframe.create_physical_plan().await?;
+        print_plan(&physical_plan)?;
+        let batches = collect(physical_plan.clone(), ctx.task_ctx()).await?;
+        print_batches(&batches)?;
+
+        let expected = vec![
+            "GlobalLimitExec: skip=0, fetch=5",
+            "  NestedLoopJoinExec: join_type=Inner, filter=a@1 > a@0",
+            "    NestedLoopJoinExec: join_type=Inner, filter=a@1 > a@0",
+            "      CsvExec: file_groups={1 group: [[Users/akurmustafa/projects/synnada/arrow-datafusion-synnada/datafusion/core/tests/data/window_2.csv]]}, projection=[a0, a, b, c, d], output_orderings=[[a@1 ASC NULLS LAST, b@2 ASC NULLS LAST], [c@3 ASC NULLS LAST]], has_header=true",
+            "      CsvExec: file_groups={1 group: [[Users/akurmustafa/projects/synnada/arrow-datafusion-synnada/datafusion/core/tests/data/window_2.csv]]}, projection=[a0, a, b, c, d], output_orderings=[[a@1 ASC NULLS LAST, b@2 ASC NULLS LAST], [c@3 ASC NULLS LAST]], has_header=true",
+            "    CsvExec: file_groups={1 group: [[Users/akurmustafa/projects/synnada/arrow-datafusion-synnada/datafusion/core/tests/data/window_2.csv]]}, projection=[a0, a, b, c, d], output_orderings=[[a@1 ASC NULLS LAST, b@2 ASC NULLS LAST], [c@3 ASC NULLS LAST]], has_header=true",
+        ];
+        // Get string representation of the plan
+        let actual = get_plan_string(&physical_plan);
+        assert_eq!(
+            expected, actual,
+            "\n**Optimized Plan Mismatch\n\nexpected:\n\n{expected:#?}\nactual:\n\n{actual:#?}\n\n"
+        );
+
+        let expected = [
+            "+----+---+---+---+---+----+---+---+---+---+----+---+---+---+---+",
+            "| a0 | a | b | c | d | a0 | a | b | c | d | a0 | a | b | c | d |",
+            "+----+---+---+---+---+----+---+---+---+---+----+---+---+---+---+",
+            "+----+---+---+---+---+----+---+---+---+---+----+---+---+---+---+",
+        ];
+        assert_batches_eq!(expected, &batches);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_query2() -> Result<()> {
+        let config = SessionConfig::new().with_target_partitions(1);
+        let ctx = SessionContext::new_with_config(config);
+
+        ctx.sql(MULTIPLE_ORDERED_TABLE).await?;
+        ctx.sql(MULTIPLE_ORDERED_TABLE2).await?;
+        ctx.sql(MULTIPLE_ORDERED_TABLE3).await?;
+
+        let sql = QUERY2;
+
+        let msg = format!("Creating logical plan for '{sql}'");
+        let dataframe = ctx.sql(sql).await.expect(&msg);
+        let physical_plan = dataframe.create_physical_plan().await?;
+        print_plan(&physical_plan)?;
+        let batches = collect(physical_plan.clone(), ctx.task_ctx()).await?;
+        print_batches(&batches)?;
+
+        let expected = vec![
+            "GlobalLimitExec: skip=0, fetch=5",
+            "  NestedLoopJoinExec: join_type=Inner, filter=a@1 > a@0",
+            "    NestedLoopJoinExec: join_type=Inner, filter=a@1 > a@0",
+            "      CsvExec: file_groups={1 group: [[Users/akurmustafa/projects/synnada/arrow-datafusion-synnada/datafusion/core/tests/data/window_2.csv]]}, projection=[a0, a, b, c, d], output_orderings=[[a@1 ASC NULLS LAST, b@2 ASC NULLS LAST], [c@3 ASC NULLS LAST]], has_header=true",
+            "      CsvExec: file_groups={1 group: [[Users/akurmustafa/projects/synnada/arrow-datafusion-synnada/datafusion/core/tests/data/window_2.csv]]}, projection=[a0, a, b, c, d], output_orderings=[[a@1 ASC NULLS LAST, b@2 ASC NULLS LAST], [c@3 ASC NULLS LAST]], has_header=true",
+            "    CsvExec: file_groups={1 group: [[Users/akurmustafa/projects/synnada/arrow-datafusion-synnada/datafusion/core/tests/data/window_2.csv]]}, projection=[a0, a, b, c, d], output_orderings=[[a@1 ASC NULLS LAST, b@2 ASC NULLS LAST], [c@3 ASC NULLS LAST]], has_header=true",
+        ];
+        // Get string representation of the plan
+        let actual = get_plan_string(&physical_plan);
+        assert_eq!(
+            expected, actual,
+            "\n**Optimized Plan Mismatch\n\nexpected:\n\n{expected:#?}\nactual:\n\n{actual:#?}\n\n"
+        );
+
+        let expected = [
+            "+----+---+---+---+---+----+---+---+---+---+----+---+---+---+---+",
+            "| a0 | a | b | c | d | a0 | a | b | c | d | a0 | a | b | c | d |",
+            "+----+---+---+---+---+----+---+---+---+---+----+---+---+---+---+",
+            "+----+---+---+---+---+----+---+---+---+---+----+---+---+---+---+",
+        ];
+        assert_batches_eq!(expected, &batches);
+        Ok(())
+    }
+}

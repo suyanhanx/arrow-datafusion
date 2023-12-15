@@ -56,10 +56,17 @@ pub fn is_filter_expr_prunable(
     let left_indices = collect_one_side_columns(&filter.column_indices, JoinSide::Left);
     let right_indices = collect_one_side_columns(&filter.column_indices, JoinSide::Right);
 
+    // println!("left_indices {:?}", left_indices);
+    // println!("right_indices {:?}", right_indices);
+
     let left_sort_expr =
         intermediate_schema_sort_expr(left_sort_expr, &left_indices, filter.schema())?;
     let right_sort_expr =
         intermediate_schema_sort_expr(right_sort_expr, &right_indices, filter.schema())?;
+
+    // println!("left_sort_expr {:?}", left_sort_expr);
+    // println!("right_sort_expr {:?}", right_sort_expr);
+    // println!("filter.schema() {}", filter.schema());
     let new_eq = merge_equivalence_classes_for_intermediate_schema(
         &left_indices,
         &right_indices,
@@ -67,6 +74,8 @@ pub fn is_filter_expr_prunable(
         left_equal_properties,
         right_equal_properties,
     );
+
+    // println!("new_eq {:?}", new_eq);
 
     let initial_expr = ExprPrunability::new(filter.expression.clone());
     let transformed_expr = initial_expr.transform_up(&|expr| {
@@ -593,7 +602,7 @@ fn transform_orders(
 ) -> Vec<PhysicalSortExpr> {
     class
         .iter()
-        .filter_map(|order| {
+        .take_while(|order| {
             let columns = collect_columns(&order.expr);
             let columns = columns.iter().collect::<Vec<_>>();
             columns
@@ -603,28 +612,28 @@ fn transform_orders(
                         .iter()
                         .any(|(_ind, col_ind)| col_ind.index == c.index())
                 })
-                .then(|| {
-                    let mut order = order.clone();
-                    order.expr = order
-                        .expr
-                        .transform(&|expr| {
-                            if let Some(col) = expr.as_any().downcast_ref::<Column>() {
-                                if let Some(position) = indices
-                                    .iter()
-                                    .find(|(_ind, col_ind)| col_ind.index == col.index())
-                                {
-                                    return Ok(Transformed::Yes(Arc::new(Column::new(
-                                        fields[position.0].name(),
-                                        position.0,
-                                    ))));
-                                }
-                            }
-                            Ok(Transformed::No(expr))
-                        })
-                        .unwrap();
-                    eq.eq_group().normalize_sort_exprs(&[order])[0].clone()
-                    // normalize_sort_expr_with_equivalence_properties(order, eq.classes())
+        })
+        .filter_map(|order| {
+            let mut order = order.clone();
+            order.expr = order
+                .expr
+                .transform(&|expr| {
+                    if let Some(col) = expr.as_any().downcast_ref::<Column>() {
+                        if let Some(position) = indices
+                            .iter()
+                            .find(|(_ind, col_ind)| col_ind.index == col.index())
+                        {
+                            return Ok(Transformed::Yes(Arc::new(Column::new(
+                                fields[position.0].name(),
+                                position.0,
+                            ))));
+                        }
+                    }
+                    Ok(Transformed::No(expr))
                 })
+                .unwrap();
+            Some(eq.eq_group().normalize_sort_exprs(&[order])[0].clone())
+            // normalize_sort_expr_with_equivalence_properties(order, eq.classes())
         })
         .collect()
 }
