@@ -33,7 +33,7 @@ use crate::{
 use arrow::compute::concat_batches;
 use arrow_array::builder::{UInt32Builder, UInt64Builder};
 use arrow_array::{ArrayRef, RecordBatch, UInt32Array, UInt64Array};
-use arrow_schema::{Field, Schema, SchemaRef};
+use arrow_schema::SchemaRef;
 use datafusion_common::hash_utils::create_hashes;
 use datafusion_common::utils::{
     get_record_batch_at_indices, get_row_at_idx, linear_search,
@@ -150,6 +150,9 @@ impl AggregativeHashJoinExec {
         partition_mode: StreamJoinPartitionMode,
         working_mode: SlidingWindowWorkingMode,
     ) -> Result<Self> {
+        let left_schema = left.schema();
+        let right_schema = right.schema();
+
         if on.is_empty() {
             return plan_err!(
                 "On constraints in AggregativeHashJoinExec should be non-empty"
@@ -170,50 +173,6 @@ impl AggregativeHashJoinExec {
                 join_type
             );
         }
-
-        let left_fields = left
-            .schema()
-            .fields()
-            .iter()
-            .map(|field| {
-                let mut metadata = field.metadata().clone();
-                let mut new_field = Field::new(
-                    field.name(),
-                    field.data_type().clone(),
-                    field.is_nullable(),
-                );
-                metadata
-                    .insert("AggregativeHashJoinExec".into(), "JoinSide::Left".into());
-                new_field.set_metadata(metadata);
-                Ok(new_field)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let left_schema = Arc::new(Schema::new_with_metadata(
-            left_fields,
-            left.schema().metadata().clone(),
-        ));
-
-        let right_fields = right
-            .schema()
-            .fields()
-            .iter()
-            .map(|field| {
-                let mut metadata = field.metadata().clone();
-                let mut new_field = Field::new(
-                    field.name(),
-                    field.data_type().clone(),
-                    field.is_nullable(),
-                );
-                metadata
-                    .insert("AggregativeHashJoinExec".into(), "JoinSide::Right".into());
-                new_field.set_metadata(metadata);
-                Ok(new_field)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let right_schema = Arc::new(Schema::new_with_metadata(
-            right_fields,
-            right.schema().metadata().clone(),
-        ));
 
         check_join_is_valid(&left_schema, &right_schema, &on)?;
 
@@ -1447,7 +1406,7 @@ mod fuzzy_tests {
     use crate::sorts::sort_preserving_merge::SortPreservingMergeExec;
 
     use arrow::datatypes::{DataType, Field};
-    use arrow_schema::{SortOptions, TimeUnit};
+    use arrow_schema::{Schema, SortOptions, TimeUnit};
     use datafusion_common::{internal_datafusion_err, DataFusionError};
     use datafusion_execution::config::SessionConfig;
     use datafusion_expr::Operator;
