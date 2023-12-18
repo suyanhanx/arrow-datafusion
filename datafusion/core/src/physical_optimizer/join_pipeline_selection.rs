@@ -3947,14 +3947,14 @@ mod order_preserving_join_swap_tests {
 
         let expected_input = [
             "ProjectionExec: expr=[FirstValue(b) ORDER BY A DESC@1 as first_val]",
-            "  AggregateExec: mode=Partial, gby=[d@3 as d], aggr=[LAST_VALUE(b@1)], ordering_mode=Sorted",
+            "  AggregateExec: mode=Partial, gby=[d@3 as d], aggr=[FirstValue(b) ORDER BY A DESC], ordering_mode=Sorted",
             "    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, d@0)], filter=0@0 > 1@1",
             "      StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
             "      StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
         ];
         let expected_optimized = [
             "ProjectionExec: expr=[FirstValue(b) ORDER BY A DESC@1 as first_val]",
-            "  AggregateExec: mode=Partial, gby=[d@3 as d], aggr=[LAST_VALUE(b@1)], ordering_mode=Sorted",
+            "  AggregateExec: mode=Partial, gby=[d@3 as d], aggr=[FirstValue(b) ORDER BY A DESC], ordering_mode=Sorted",
             "    AggregativeHashJoinExec: join_type=Inner, on=[(a@0, d@0)], filter=0@0 > 1@1",
             "      StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
             "      StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
