@@ -1714,6 +1714,7 @@ mod order_preserving_join_swap_tests {
     };
     use datafusion_physical_expr::{AggregateExpr, PhysicalExpr, PhysicalSortExpr};
     use datafusion_physical_plan::joins::{HashJoinExec, PartitionMode};
+    use datafusion_physical_plan::projection::ProjectionExec;
 
     // Util function to get string representation of a physical plan
     fn get_plan_string(plan: &Arc<dyn ExecutionPlan>) -> Vec<String> {
@@ -3883,8 +3884,6 @@ mod order_preserving_join_swap_tests {
         Ok(())
     }
 
-    // TODO: mustafa will fix this
-    #[ignore]
     #[tokio::test]
     async fn test_partitioned_hash_change_first_aggr_expr() -> Result<()> {
         let left_schema = create_test_schema()?;
@@ -3919,10 +3918,12 @@ mod order_preserving_join_swap_tests {
             descending: true,
             nulls_first: false,
         };
+
+        let aggr_name = "FirstValue(b) ORDER BY A DESC".to_string();
         // aggregation from build side, not expecting swaping.
         let aggr_expr = vec![Arc::new(FirstValue::new(
             col("b", &join_schema)?,
-            "mete".to_string(),
+            aggr_name.clone(),
             DataType::Int32,
             vec![PhysicalSortExpr {
                 expr: col("a", &join_schema)?,
@@ -3936,19 +3937,27 @@ mod order_preserving_join_swap_tests {
 
         let partial_group_by = PhysicalGroupBy::new_single(groups);
 
-        let physical_plan = partial_aggregate_exec(join, partial_group_by, aggr_expr);
+        let aggr_exec = partial_aggregate_exec(join, partial_group_by, aggr_expr);
+
+        let col_first = Arc::new(Column::new(&aggr_name, 1)) as Arc<dyn PhysicalExpr>;
+        let physical_plan = Arc::new(ProjectionExec::try_new(
+            vec![(col_first, "first_val".to_string())],
+            aggr_exec,
+        )?) as Arc<dyn ExecutionPlan>;
 
         let expected_input = [
-            "AggregateExec: mode=Partial, gby=[d@3 as d], aggr=[mete], ordering_mode=Sorted",
-            "  HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, d@0)], filter=0@0 > 1@1",
-            "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
-            "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+            "ProjectionExec: expr=[FirstValue(b) ORDER BY A DESC@1 as first_val]",
+            "  AggregateExec: mode=Partial, gby=[d@3 as d], aggr=[LAST_VALUE(b@1)], ordering_mode=Sorted",
+            "    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, d@0)], filter=0@0 > 1@1",
+            "      StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "      StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
         ];
         let expected_optimized = [
-            "AggregateExec: mode=Partial, gby=[d@3 as d], aggr=[mete], ordering_mode=Sorted",
-            "  AggregativeHashJoinExec: join_type=Inner, on=[(a@0, d@0)], filter=0@0 > 1@1",
-            "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
-            "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
+            "ProjectionExec: expr=[FirstValue(b) ORDER BY A DESC@1 as first_val]",
+            "  AggregateExec: mode=Partial, gby=[d@3 as d], aggr=[LAST_VALUE(b@1)], ordering_mode=Sorted",
+            "    AggregativeHashJoinExec: join_type=Inner, on=[(a@0, d@0)], filter=0@0 > 1@1",
+            "      StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
+            "      StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
         ];
         assert_original_plan!(expected_input, physical_plan.clone());
         assert_join_selection_enforce_sorting!(expected_optimized, physical_plan.clone());
