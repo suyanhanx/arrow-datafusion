@@ -1,3 +1,10 @@
+// This file contains both Apache Software Foundation (ASF) licensed code as
+// well as Synnada, Inc. extensions. Changes that constitute Synnada, Inc.
+// extensions are available in the SYNNADA-CONTRIBUTIONS.txt file. Synnada, Inc.
+// claims copyright only for Synnada, Inc. extensions. The license notice
+// applicable to non-Synnada sections of the file is given below.
+// --
+//
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -36,7 +43,9 @@ use crate::joins::utils::{
     estimate_join_statistics, partitioned_join_output_partitioning, swap_join_type,
     swap_reverting_projection, JoinOn,
 };
+use crate::joins::HashJoinExec;
 use crate::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
+use crate::projection::ProjectionExec;
 use crate::{
     metrics, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning,
     PhysicalExpr, RecordBatchStream, SendableRecordBatchStream, Statistics,
@@ -55,8 +64,6 @@ use datafusion_execution::TaskContext;
 use datafusion_physical_expr::equivalence::join_equivalence_properties;
 use datafusion_physical_expr::{EquivalenceProperties, PhysicalSortRequirement};
 
-use crate::joins::HashJoinExec;
-use crate::projection::ProjectionExec;
 use futures::{Stream, StreamExt};
 
 /// join execution plan executes partitions in parallel and combines them into a set of
@@ -397,9 +404,7 @@ pub fn swap_sort_merge_join(
     let right = hash_join.right();
     let swapped_join_type = swap_join_type(hash_join.join_type);
     if matches!(swapped_join_type, JoinType::RightSemi) {
-        return Err(DataFusionError::Plan(
-            "RightSemi is not supported for SortMergeJoin".to_owned(),
-        ));
+        return plan_err!("RightSemi is not supported for SortMergeJoin");
     }
     let new_join = SortMergeJoinExec::try_new(
         Arc::clone(right),

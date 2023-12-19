@@ -1,5 +1,5 @@
 // Copyright (C) Synnada, Inc. - All Rights Reserved.
-// This file does not contain any Apache Software Foundation copyrighted code.
+// This file does not contain any Apache Software Foundation (ASF) licensed code.
 
 //! This file implements the sliding window hash join algorithm with range-based
 //! data pruning to join two (potentially infinite) streams.

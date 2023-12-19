@@ -1,5 +1,5 @@
 // Copyright (C) Synnada, Inc. - All Rights Reserved.
-// This file does not contain any Apache Software Foundation copyrighted code.
+// This file does not contain any Apache Software Foundation (ASF) licensed code.
 
 use std::any::Any;
 use std::fmt::Formatter;
