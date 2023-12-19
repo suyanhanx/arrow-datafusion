@@ -24,13 +24,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::{fmt, usize};
 
-use crate::joins::utils::{JoinFilter, JoinHashMapType, ColumnIndex};
+use crate::joins::utils::{ColumnIndex, JoinFilter, JoinHashMapType};
 use crate::metrics::{ExecutionPlanMetricsSet, MetricBuilder};
 use crate::{handle_async_state, metrics, ExecutionPlan};
-use crate::joins::utils::{
-    get_filter_representation_of_build_side,
-    get_filter_representation_schema_of_build_side, JoinFilter, JoinHashMapType,
-};
 
 use arrow::compute::concat_batches;
 use arrow_array::{
@@ -521,6 +517,10 @@ impl StreamJoinMetrics {
             output_batches,
             stream_memory_usage,
             output_rows,
+        }
+    }
+}
+
 /// Constructs a schema for the filter representation of the build side.
 ///
 /// This function generates a [`SchemaRef`] with fields from the build side that are used

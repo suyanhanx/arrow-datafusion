@@ -315,19 +315,19 @@ SortPreservingMergeExec: [ts@0 ASC NULLS LAST,sn@1 ASC NULLS LAST]
 --ProjectionExec: expr=[ts@1 as ts, sn@0 as sn, amount@2 as amount, currency@3 as currency, CAST(amount@2 AS Float32) * LAST_VALUE(e.rate)@4 as amount_usd]
 ----AggregateExec: mode=FinalPartitioned, gby=[sn@0 as sn, ts@1 as ts, amount@2 as amount, currency@3 as currency], aggr=[LAST_VALUE(e.rate)], ordering_mode=PartiallySorted([0, 1])
 ------CoalesceBatchesExec: target_batch_size=8192
---------SortPreservingRepartitionExec: partitioning=Hash([sn@0, ts@1, amount@2, currency@3], 4), input_partitions=4, sort_exprs=ts@1 ASC NULLS LAST,sn@0 ASC NULLS LAST
+--------RepartitionExec: partitioning=Hash([sn@0, ts@1, amount@2, currency@3], 4), input_partitions=4, preserve_order=true, sort_exprs=sn@0 ASC NULLS LAST,ts@1 ASC NULLS LAST
 ----------AggregateExec: mode=Partial, gby=[sn@1 as sn, ts@0 as ts, amount@2 as amount, currency@3 as currency], aggr=[LAST_VALUE(e.rate)], ordering_mode=PartiallySorted([0, 1])
 ------------ProjectionExec: expr=[ts@3 as ts, sn@4 as sn, amount@5 as amount, currency@6 as currency, rate@2 as rate]
 --------------AggregativeHashJoinExec: join_type=Inner, on=[(currency_from@1, currency@3)], filter=ts@0 >= ts@1
 ----------------CoalesceBatchesExec: target_batch_size=8192
-------------------SortPreservingRepartitionExec: partitioning=Hash([currency_from@1], 4), input_partitions=4, sort_exprs=ts@0 ASC NULLS LAST
+------------------RepartitionExec: partitioning=Hash([currency_from@1], 4), input_partitions=4, preserve_order=true, sort_exprs=ts@0 ASC NULLS LAST
 --------------------ProjectionExec: expr=[ts@0 as ts, currency_from@1 as currency_from, rate@3 as rate]
 ----------------------CoalesceBatchesExec: target_batch_size=8192
 ------------------------FilterExec: currency_to@2 = USD
 --------------------------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
 ----------------------------StreamingTableExec: partition_sizes=1, projection=[ts, currency_from, currency_to, rate], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST]
 ----------------CoalesceBatchesExec: target_batch_size=8192
-------------------SortPreservingRepartitionExec: partitioning=Hash([currency@3], 4), input_partitions=4, sort_exprs=ts@0 ASC NULLS LAST
+------------------RepartitionExec: partitioning=Hash([currency@3], 4), input_partitions=4, preserve_order=true, sort_exprs=ts@0 ASC NULLS LAST
 --------------------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
 ----------------------StreamingTableExec: partition_sizes=1, projection=[ts, sn, amount, currency], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST]
 
@@ -367,23 +367,23 @@ Sort: s.sn ASC NULLS LAST
 --------------Filter: exchange_rates.currency_to = Utf8("USD")
 ----------------TableScan: exchange_rates projection=[ts, sn, currency_from, currency_to, rate]
 physical_plan
-SortPreservingMergeExec: [sn@1 ASC NULLS LAST,ts@0 ASC NULLS LAST]
+SortPreservingMergeExec: [ts@0 ASC NULLS LAST,sn@1 ASC NULLS LAST]
 --ProjectionExec: expr=[ts@1 as ts, sn@0 as sn, amount@2 as amount, currency@3 as currency, CAST(amount@2 AS Float32) * LAST_VALUE(e.rate) ORDER BY [e.sn ASC NULLS LAST]@4 as amount_usd]
 ----AggregateExec: mode=FinalPartitioned, gby=[sn@0 as sn, ts@1 as ts, amount@2 as amount, currency@3 as currency], aggr=[LAST_VALUE(e.rate)], ordering_mode=PartiallySorted([0, 1])
 ------CoalesceBatchesExec: target_batch_size=8192
---------SortPreservingRepartitionExec: partitioning=Hash([sn@0, ts@1, amount@2, currency@3], 4), input_partitions=4, sort_exprs=sn@0 ASC NULLS LAST,ts@1 ASC NULLS LAST
+--------RepartitionExec: partitioning=Hash([sn@0, ts@1, amount@2, currency@3], 4), input_partitions=4, preserve_order=true, sort_exprs=sn@0 ASC NULLS LAST,ts@1 ASC NULLS LAST
 ----------AggregateExec: mode=Partial, gby=[sn@1 as sn, ts@0 as ts, amount@2 as amount, currency@3 as currency], aggr=[LAST_VALUE(e.rate)], ordering_mode=PartiallySorted([0, 1])
 ------------ProjectionExec: expr=[ts@4 as ts, sn@5 as sn, amount@6 as amount, currency@7 as currency, sn@1 as sn, rate@3 as rate]
 --------------AggregativeHashJoinExec: join_type=Inner, on=[(currency_from@2, currency@3)], filter=ts@0 >= ts@1
 ----------------CoalesceBatchesExec: target_batch_size=8192
-------------------SortPreservingRepartitionExec: partitioning=Hash([currency_from@2], 4), input_partitions=4, sort_exprs=ts@0 ASC NULLS LAST,sn@1 ASC NULLS LAST
+------------------RepartitionExec: partitioning=Hash([currency_from@2], 4), input_partitions=4, preserve_order=true, sort_exprs=ts@0 ASC NULLS LAST,sn@1 ASC NULLS LAST
 --------------------ProjectionExec: expr=[ts@0 as ts, sn@1 as sn, currency_from@2 as currency_from, rate@4 as rate]
 ----------------------CoalesceBatchesExec: target_batch_size=8192
 ------------------------FilterExec: currency_to@3 = USD
 --------------------------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
 ----------------------------StreamingTableExec: partition_sizes=1, projection=[ts, sn, currency_from, currency_to, rate], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST]
 ----------------CoalesceBatchesExec: target_batch_size=8192
-------------------SortPreservingRepartitionExec: partitioning=Hash([currency@3], 4), input_partitions=4, sort_exprs=ts@0 ASC NULLS LAST
+------------------RepartitionExec: partitioning=Hash([currency@3], 4), input_partitions=4, preserve_order=true, sort_exprs=ts@0 ASC NULLS LAST
 --------------------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
 ----------------------StreamingTableExec: partition_sizes=1, projection=[ts, sn, amount, currency], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST]
 
@@ -427,19 +427,19 @@ SortPreservingMergeExec: [ts@0 ASC NULLS LAST,sn@1 ASC NULLS LAST]
 --ProjectionExec: expr=[ts@1 as ts, sn@0 as sn, amount@2 as amount, currency@3 as currency, CAST(amount@2 AS Float32) * FIRST_VALUE(e.rate)@4 as amount_usd]
 ----AggregateExec: mode=FinalPartitioned, gby=[sn@0 as sn, ts@1 as ts, amount@2 as amount, currency@3 as currency], aggr=[FIRST_VALUE(e.rate)], ordering_mode=PartiallySorted([0, 1])
 ------CoalesceBatchesExec: target_batch_size=8192
---------SortPreservingRepartitionExec: partitioning=Hash([sn@0, ts@1, amount@2, currency@3], 4), input_partitions=4, sort_exprs=ts@1 ASC NULLS LAST,sn@0 ASC NULLS LAST
+--------RepartitionExec: partitioning=Hash([sn@0, ts@1, amount@2, currency@3], 4), input_partitions=4, preserve_order=true, sort_exprs=sn@0 ASC NULLS LAST,ts@1 ASC NULLS LAST
 ----------AggregateExec: mode=Partial, gby=[sn@1 as sn, ts@0 as ts, amount@2 as amount, currency@3 as currency], aggr=[FIRST_VALUE(e.rate)], ordering_mode=PartiallySorted([0, 1])
 ------------ProjectionExec: expr=[ts@3 as ts, sn@4 as sn, amount@5 as amount, currency@6 as currency, rate@2 as rate]
 --------------AggregativeHashJoinExec: join_type=Inner, on=[(currency_from@1, currency@3)], filter=ts@0 >= ts@1
 ----------------CoalesceBatchesExec: target_batch_size=8192
-------------------SortPreservingRepartitionExec: partitioning=Hash([currency_from@1], 4), input_partitions=4, sort_exprs=ts@0 ASC NULLS LAST
+------------------RepartitionExec: partitioning=Hash([currency_from@1], 4), input_partitions=4, preserve_order=true, sort_exprs=ts@0 ASC NULLS LAST
 --------------------ProjectionExec: expr=[ts@0 as ts, currency_from@1 as currency_from, rate@3 as rate]
 ----------------------CoalesceBatchesExec: target_batch_size=8192
 ------------------------FilterExec: currency_to@2 = USD
 --------------------------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
 ----------------------------StreamingTableExec: partition_sizes=1, projection=[ts, currency_from, currency_to, rate], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST]
 ----------------CoalesceBatchesExec: target_batch_size=8192
-------------------SortPreservingRepartitionExec: partitioning=Hash([currency@3], 4), input_partitions=4, sort_exprs=ts@0 ASC NULLS LAST
+------------------RepartitionExec: partitioning=Hash([currency@3], 4), input_partitions=4, preserve_order=true, sort_exprs=ts@0 ASC NULLS LAST
 --------------------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
 ----------------------StreamingTableExec: partition_sizes=1, projection=[ts, sn, amount, currency], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST]
 
@@ -479,23 +479,23 @@ Sort: s.sn ASC NULLS LAST
 --------------Filter: exchange_rates.currency_to = Utf8("USD")
 ----------------TableScan: exchange_rates projection=[ts, sn, currency_from, currency_to, rate]
 physical_plan
-SortPreservingMergeExec: [sn@1 ASC NULLS LAST,ts@0 ASC NULLS LAST]
+SortPreservingMergeExec: [ts@0 ASC NULLS LAST,sn@1 ASC NULLS LAST]
 --ProjectionExec: expr=[ts@1 as ts, sn@0 as sn, amount@2 as amount, currency@3 as currency, CAST(amount@2 AS Float32) * FIRST_VALUE(e.rate) ORDER BY [e.sn DESC NULLS FIRST]@4 as amount_usd]
 ----AggregateExec: mode=FinalPartitioned, gby=[sn@0 as sn, ts@1 as ts, amount@2 as amount, currency@3 as currency], aggr=[LAST_VALUE(e.rate)], ordering_mode=PartiallySorted([0, 1])
 ------CoalesceBatchesExec: target_batch_size=8192
---------SortPreservingRepartitionExec: partitioning=Hash([sn@0, ts@1, amount@2, currency@3], 4), input_partitions=4, sort_exprs=sn@0 ASC NULLS LAST,ts@1 ASC NULLS LAST
+--------RepartitionExec: partitioning=Hash([sn@0, ts@1, amount@2, currency@3], 4), input_partitions=4, preserve_order=true, sort_exprs=sn@0 ASC NULLS LAST,ts@1 ASC NULLS LAST
 ----------AggregateExec: mode=Partial, gby=[sn@1 as sn, ts@0 as ts, amount@2 as amount, currency@3 as currency], aggr=[LAST_VALUE(e.rate)], ordering_mode=PartiallySorted([0, 1])
 ------------ProjectionExec: expr=[ts@4 as ts, sn@5 as sn, amount@6 as amount, currency@7 as currency, sn@1 as sn, rate@3 as rate]
 --------------AggregativeHashJoinExec: join_type=Inner, on=[(currency_from@2, currency@3)], filter=ts@0 >= ts@1
 ----------------CoalesceBatchesExec: target_batch_size=8192
-------------------SortPreservingRepartitionExec: partitioning=Hash([currency_from@2], 4), input_partitions=4, sort_exprs=ts@0 ASC NULLS LAST,sn@1 ASC NULLS LAST
+------------------RepartitionExec: partitioning=Hash([currency_from@2], 4), input_partitions=4, preserve_order=true, sort_exprs=ts@0 ASC NULLS LAST,sn@1 ASC NULLS LAST
 --------------------ProjectionExec: expr=[ts@0 as ts, sn@1 as sn, currency_from@2 as currency_from, rate@4 as rate]
 ----------------------CoalesceBatchesExec: target_batch_size=8192
 ------------------------FilterExec: currency_to@3 = USD
 --------------------------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
 ----------------------------StreamingTableExec: partition_sizes=1, projection=[ts, sn, currency_from, currency_to, rate], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST]
 ----------------CoalesceBatchesExec: target_batch_size=8192
-------------------SortPreservingRepartitionExec: partitioning=Hash([currency@3], 4), input_partitions=4, sort_exprs=ts@0 ASC NULLS LAST
+------------------RepartitionExec: partitioning=Hash([currency@3], 4), input_partitions=4, preserve_order=true, sort_exprs=ts@0 ASC NULLS LAST
 --------------------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
 ----------------------StreamingTableExec: partition_sizes=1, projection=[ts, sn, amount, currency], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST]
 
@@ -588,19 +588,19 @@ ProjectionExec: expr=[amount_usd@0 as amount_usd]
 ----ProjectionExec: expr=[LAST_VALUE(e.rate) ORDER BY [e.sn2 ASC NULLS LAST]@1 as amount_usd, sn@0 as sn]
 ------AggregateExec: mode=FinalPartitioned, gby=[sn@0 as sn], aggr=[LAST_VALUE(e.rate)], ordering_mode=Sorted
 --------CoalesceBatchesExec: target_batch_size=8192
-----------SortPreservingRepartitionExec: partitioning=Hash([sn@0], 4), input_partitions=4, sort_exprs=sn@0 ASC NULLS LAST
+----------RepartitionExec: partitioning=Hash([sn@0], 4), input_partitions=4, preserve_order=true, sort_exprs=sn@0 ASC NULLS LAST
 ------------AggregateExec: mode=Partial, gby=[sn@0 as sn], aggr=[LAST_VALUE(e.rate)], ordering_mode=Sorted
 --------------ProjectionExec: expr=[sn@5 as sn, sn2@1 as sn2, rate@3 as rate]
 ----------------AggregativeHashJoinExec: join_type=Inner, on=[(currency_from@2, currency@2)], filter=ts@0 >= ts@1
 ------------------CoalesceBatchesExec: target_batch_size=8192
---------------------SortPreservingRepartitionExec: partitioning=Hash([currency_from@2], 4), input_partitions=4, sort_exprs=sn2@1 ASC NULLS LAST,ts@0 ASC NULLS LAST
+--------------------RepartitionExec: partitioning=Hash([currency_from@2], 4), input_partitions=4, preserve_order=true, sort_exprs=ts@0 ASC NULLS LAST,sn2@1 ASC NULLS LAST
 ----------------------ProjectionExec: expr=[ts@0 as ts, sn2@1 as sn2, currency_from@2 as currency_from, rate@4 as rate]
 ------------------------CoalesceBatchesExec: target_batch_size=8192
 --------------------------FilterExec: currency_to@3 = USD
 ----------------------------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
 ------------------------------StreamingTableExec: partition_sizes=1, projection=[ts, sn2, currency_from, currency_to, rate], infinite_source=true, output_ordering=[sn2@1 ASC NULLS LAST]
 ------------------CoalesceBatchesExec: target_batch_size=8192
---------------------SortPreservingRepartitionExec: partitioning=Hash([currency@2], 4), input_partitions=4, sort_exprs=sn@1 ASC NULLS LAST
+--------------------RepartitionExec: partitioning=Hash([currency@2], 4), input_partitions=4, preserve_order=true, sort_exprs=sn@1 ASC NULLS LAST
 ----------------------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
 ------------------------StreamingTableExec: partition_sizes=1, projection=[ts, sn, currency], infinite_source=true, output_ordering=[sn@1 ASC NULLS LAST]
 
@@ -723,19 +723,19 @@ ProjectionExec: expr=[amount_usd@0 as amount_usd]
 ----ProjectionExec: expr=[AVG(e.rate)@1 as amount_usd, ts@0 as ts]
 ------AggregateExec: mode=FinalPartitioned, gby=[ts@0 as ts], aggr=[AVG(e.rate)], ordering_mode=Sorted
 --------CoalesceBatchesExec: target_batch_size=8192
-----------SortPreservingRepartitionExec: partitioning=Hash([ts@0], 4), input_partitions=4, sort_exprs=ts@0 ASC NULLS LAST
+----------RepartitionExec: partitioning=Hash([ts@0], 4), input_partitions=4, preserve_order=true, sort_exprs=ts@0 ASC NULLS LAST
 ------------AggregateExec: mode=Partial, gby=[ts@0 as ts], aggr=[AVG(e.rate)], ordering_mode=Sorted
 --------------ProjectionExec: expr=[ts@3 as ts, rate@2 as rate]
 ----------------SlidingHashJoinExec: join_type=Right, on=[(currency_from@1, currency@1)], filter=ts@0 >= ts@1 AND ts@1 >= ts@0 - 600000000000
 ------------------CoalesceBatchesExec: target_batch_size=8192
---------------------SortPreservingRepartitionExec: partitioning=Hash([currency_from@1], 4), input_partitions=4, sort_exprs=ts@0 ASC NULLS LAST
+--------------------RepartitionExec: partitioning=Hash([currency_from@1], 4), input_partitions=4, preserve_order=true, sort_exprs=ts@0 ASC NULLS LAST
 ----------------------ProjectionExec: expr=[ts@0 as ts, currency_from@1 as currency_from, rate@3 as rate]
 ------------------------CoalesceBatchesExec: target_batch_size=8192
 --------------------------FilterExec: currency_to@2 = USD
 ----------------------------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
 ------------------------------StreamingTableExec: partition_sizes=1, projection=[ts, currency_from, currency_to, rate], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST]
 ------------------CoalesceBatchesExec: target_batch_size=8192
---------------------SortPreservingRepartitionExec: partitioning=Hash([currency@1], 4), input_partitions=4, sort_exprs=ts@0 ASC NULLS LAST
+--------------------RepartitionExec: partitioning=Hash([currency@1], 4), input_partitions=4, preserve_order=true, sort_exprs=ts@0 ASC NULLS LAST
 ----------------------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
 ------------------------StreamingTableExec: partition_sizes=1, projection=[ts, currency], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST]
 
@@ -770,19 +770,19 @@ ProjectionExec: expr=[amount_usd@0 as amount_usd]
 ----ProjectionExec: expr=[AVG(e.rate)@1 as amount_usd, sn@0 as sn]
 ------AggregateExec: mode=FinalPartitioned, gby=[sn@0 as sn], aggr=[AVG(e.rate)], ordering_mode=Sorted
 --------CoalesceBatchesExec: target_batch_size=8192
-----------SortPreservingRepartitionExec: partitioning=Hash([sn@0], 4), input_partitions=4, sort_exprs=sn@0 ASC NULLS LAST
+----------RepartitionExec: partitioning=Hash([sn@0], 4), input_partitions=4, preserve_order=true, sort_exprs=sn@0 ASC NULLS LAST
 ------------AggregateExec: mode=Partial, gby=[sn@0 as sn], aggr=[AVG(e.rate)], ordering_mode=Sorted
 --------------ProjectionExec: expr=[sn@4 as sn, rate@2 as rate]
 ----------------SlidingHashJoinExec: join_type=Right, on=[(currency_from@1, currency@2)], filter=ts@0 >= ts@1 AND ts@1 >= ts@0 - 600000000000
 ------------------CoalesceBatchesExec: target_batch_size=8192
---------------------SortPreservingRepartitionExec: partitioning=Hash([currency_from@1], 4), input_partitions=4, sort_exprs=ts@0 ASC NULLS LAST
+--------------------RepartitionExec: partitioning=Hash([currency_from@1], 4), input_partitions=4, preserve_order=true, sort_exprs=ts@0 ASC NULLS LAST
 ----------------------ProjectionExec: expr=[ts@0 as ts, currency_from@1 as currency_from, rate@3 as rate]
 ------------------------CoalesceBatchesExec: target_batch_size=8192
 --------------------------FilterExec: currency_to@2 = USD
 ----------------------------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
 ------------------------------StreamingTableExec: partition_sizes=1, projection=[ts, currency_from, currency_to, rate], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST]
 ------------------CoalesceBatchesExec: target_batch_size=8192
---------------------SortPreservingRepartitionExec: partitioning=Hash([currency@2], 4), input_partitions=4, sort_exprs=ts@0 ASC NULLS LAST
+--------------------RepartitionExec: partitioning=Hash([currency@2], 4), input_partitions=4, preserve_order=true, sort_exprs=ts@0 ASC NULLS LAST
 ----------------------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
 ------------------------StreamingTableExec: partition_sizes=1, projection=[ts, sn, currency], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST]
 
@@ -812,7 +812,7 @@ SortPreservingMergeExec: [ts@0 ASC NULLS LAST,sn@1 ASC NULLS LAST]
 --ProjectionExec: expr=[ts@0 as ts, sn@1 as sn, currency_from@2 as currency_from, currency_to@3 as currency_to, rate@4 as rate, AVG(e.rate) PARTITION BY [e.currency_from, e.currency_to] ORDER BY [e.ts ASC NULLS LAST] RANGE BETWEEN 10 MINUTE PRECEDING AND CURRENT ROW@5 as avg_rate]
 ----BoundedWindowAggExec: wdw=[AVG(e.rate) PARTITION BY [e.currency_from, e.currency_to] ORDER BY [e.ts ASC NULLS LAST] RANGE BETWEEN 10 MINUTE PRECEDING AND CURRENT ROW: Ok(Field { name: "AVG(e.rate) PARTITION BY [e.currency_from, e.currency_to] ORDER BY [e.ts ASC NULLS LAST] RANGE BETWEEN 10 MINUTE PRECEDING AND CURRENT ROW", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(IntervalMonthDayNano("600000000000")), end_bound: CurrentRow }], mode=[Linear]
 ------CoalesceBatchesExec: target_batch_size=8192
---------SortPreservingRepartitionExec: partitioning=Hash([currency_from@2, currency_to@3], 4), input_partitions=4, sort_exprs=ts@0 ASC NULLS LAST
+--------RepartitionExec: partitioning=Hash([currency_from@2, currency_to@3], 4), input_partitions=4, preserve_order=true, sort_exprs=ts@0 ASC NULLS LAST
 ----------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
 ------------StreamingTableExec: partition_sizes=1, projection=[ts, sn, currency_from, currency_to, rate], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST]
 
@@ -838,7 +838,7 @@ SortPreservingMergeExec: [ts@0 ASC NULLS LAST,sn@1 ASC NULLS LAST]
 --ProjectionExec: expr=[ts@0 as ts, sn@1 as sn, currency_from@2 as currency_from, currency_to@3 as currency_to, rate@4 as rate, AVG(e.rate) PARTITION BY [e.currency_from, e.currency_to] ORDER BY [e.ts ASC NULLS LAST] RANGE BETWEEN 10 MINUTE PRECEDING AND CURRENT ROW@5 as avg_rate]
 ----BoundedWindowAggExec: wdw=[AVG(e.rate) PARTITION BY [e.currency_from, e.currency_to] ORDER BY [e.ts ASC NULLS LAST] RANGE BETWEEN 10 MINUTE PRECEDING AND CURRENT ROW: Ok(Field { name: "AVG(e.rate) PARTITION BY [e.currency_from, e.currency_to] ORDER BY [e.ts ASC NULLS LAST] RANGE BETWEEN 10 MINUTE PRECEDING AND CURRENT ROW", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }), frame: WindowFrame { units: Range, start_bound: Preceding(IntervalMonthDayNano("600000000000")), end_bound: CurrentRow }], mode=[Linear]
 ------CoalesceBatchesExec: target_batch_size=8192
---------SortPreservingRepartitionExec: partitioning=Hash([currency_from@2, currency_to@3], 4), input_partitions=4, sort_exprs=ts@0 ASC NULLS LAST
+--------RepartitionExec: partitioning=Hash([currency_from@2, currency_to@3], 4), input_partitions=4, preserve_order=true, sort_exprs=ts@0 ASC NULLS LAST
 ----------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
 ------------StreamingTableExec: partition_sizes=1, projection=[ts, sn, currency_from, currency_to, rate], infinite_source=true, output_ordering=[ts@0 ASC NULLS LAST]
 
