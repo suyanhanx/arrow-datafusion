@@ -1,5 +1,5 @@
 // Copyright (C) Synnada, Inc. - All Rights Reserved.
-// This file does not contain any Apache Software Foundation copyrighted code.
+// This file does not contain any Apache Software Foundation (ASF) licensed code.
 
 //! Defines the sliding window nested loop join plan, which supports all [`JoinType`]s.
 //! The sliding window nested loop join can execute in parallel by partitions depending

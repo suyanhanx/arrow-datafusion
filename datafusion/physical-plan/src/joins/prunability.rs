@@ -1,5 +1,5 @@
 // Copyright (C) Synnada, Inc. - All Rights Reserved.
-// This file does not contain any Apache Software Foundation copyrighted code.
+// This file does not contain any Apache Software Foundation (ASF) licensed code.
 
 //! Includes prunability analysis of join tables and related utilities.
 
@@ -738,72 +738,72 @@ fn get_pruneside_at_and(left: &PrunabilityState, right: &PrunabilityState) -> Ta
 /// all columns have monotonically increasing values.
 ///
 /// ``` text
-///                                                                                             
-/// a: Increasing column from left table              Original Expression Graph                                                                     
-/// b: Increasing column from left table                                                                                                        
-/// x: Increasing column from right table                      +---+                                                                                   
-///                                                          /-| > |-\                                                                                 
-///                                                        /-  +---+  -\                                                                               
-///                                                      /-             -\                                                                             
-///                                                   +---+             +---+                                                                          
-///                                                   | a |           / | + |-\                                                                        
-///                                                   +---+         /-  +---+  -\                                                                      
-///                                                               /-             -\                                                                    
-///                                                            +---+             +---+                                                                 
-///                                                            | x |           /-| - |-\                                                               
-///                                                            +---+         /-  +---+  -\                                                             
-///                                                                        /-             -\                                                           
-///                                                                     +---+             +---+                                                        
+///
+/// a: Increasing column from left table              Original Expression Graph
+/// b: Increasing column from left table
+/// x: Increasing column from right table                      +---+
+///                                                          /-| > |-\
+///                                                        /-  +---+  -\
+///                                                      /-             -\
+///                                                   +---+             +---+
+///                                                   | a |           / | + |-\
+///                                                   +---+         /-  +---+  -\
+///                                                               /-             -\
+///                                                            +---+             +---+
+///                                                            | x |           /-| - |-\
+///                                                            +---+         /-  +---+  -\
+///                                                                        /-             -\
+///                                                                     +---+             +---+
 /// This expression has the following prunability states:               | 5 |             | b |
-///                      +-----------------------+                      +---+             +---+                     
-///                     /|Monotonicity: Unordered|\                                                      
-///                    / |TableSide: None        | \                                                     
-///                  /-  +-----------------------+  -\                                                   
-///                 /                                 \                                                  
-///    +-----------------------+           +-----------------------+                                     
-///    |Monotonicity: Inc      |          /|Monotonicity: Unordered|\                                    
-///    |TableSide: Left        |         / |TableSide: None        | \                                   
-///    +-----------------------+       /-  +-----------------------+  -\                                 
-///                                   /                                 \                                
-///                      +-----------------------+           +-----------------------+                   
-///                      |Monotonicity: Inc      |          /|Monotonicity: Dec      |\                  
-///                      |TableSide: Right       |         / |TableSide: Left        | -\                
-///                      +-----------------------+       /-  +-----------------------+   \               
-///                                                     /                                 -\             
+///                      +-----------------------+                      +---+             +---+
+///                     /|Monotonicity: Unordered|\
+///                    / |TableSide: None        | \
+///                  /-  +-----------------------+  -\
+///                 /                                 \
+///    +-----------------------+           +-----------------------+
+///    |Monotonicity: Inc      |          /|Monotonicity: Unordered|\
+///    |TableSide: Left        |         / |TableSide: None        | \
+///    +-----------------------+       /-  +-----------------------+  -\
+///                                   /                                 \
+///                      +-----------------------+           +-----------------------+
+///                      |Monotonicity: Inc      |          /|Monotonicity: Dec      |\
+///                      |TableSide: Right       |         / |TableSide: Left        | -\
+///                      +-----------------------+       /-  +-----------------------+   \
+///                                                     /                                 -\
 ///                                        +-----------------------+            +-----------------------+
 ///                                        |Monotonicity: Singleton|            |Monotonicity: Inc      |
 ///                                        |TableSide: None        |            |TableSide: Left        |
-///                                        +-----------------------+            +-----------------------+                                                                                                                                                                                                                                                     
+///                                        +-----------------------+            +-----------------------+
 ///
 /// As seen from the root node, the tables cannot be pruned during execution
 /// due to the heterogenous nature of the right hand side with respect to table
 /// sides. However, separating columns according to the tables they are
 /// coming from, we can transform the expression graph to:
-///                            +---+                                                                                               
-///                         /- | > |-\                                                                                             
-///                     /---   +---+  ---\                                                                                         
-///                  /--                  ---\                                                                                     
-///              +---+                       +---+                                                                                 
-///            /-| + |-\                   /-| + |-\                                                                               
-///          /-  +---+  -\               /-  +---+  -\                                                                             
-///        /-             -\           /-             -\                                                                           
-///     +---+             +---+     +---+             +---+                                                                        
-///     | a |             | b |     | x |             | 5 |                                                                        
-///     +---+             +---+     +---+             +---+                                                                        
-///                                                                                                                                                                                                                                                 
+///                            +---+
+///                         /- | > |-\
+///                     /---   +---+  ---\
+///                  /--                  ---\
+///              +---+                       +---+
+///            /-| + |-\                   /-| + |-\
+///          /-  +---+  -\               /-  +---+  -\
+///        /-             -\           /-             -\
+///     +---+             +---+     +---+             +---+
+///     | a |             | b |     | x |             | 5 |
+///     +---+             +---+     +---+             +---+
+///
 /// This expression graph has the following prunability states:
 ///
-///                                                      +-----------------------+                                                 
-///                                                   /--|Monotonicity: Unordered|--\                                              
-///                                               /---   |TableSide: Left        |   ---\                                          
-///                                          /----       +-----------------------+       ----\                                     
-///                                      /---                                                 ---\                                 
-///                       +-----------------------+                                     +-----------------------+                  
-///                       |Monotonicity: Inc      |                                     |Monotonicity: Inc      |                  
-///                      /|TableSide: Left        |\                                   /|TableSide: Right       |\                 
-///                     / +-----------------------+ \                                 / +-----------------------+ \                
-///                   /-                             -\                             /-                             -\              
-///                  /                                 \                           /                                 \             
+///                                                      +-----------------------+
+///                                                   /--|Monotonicity: Unordered|--\
+///                                               /---   |TableSide: Left        |   ---\
+///                                          /----       +-----------------------+       ----\
+///                                      /---                                                 ---\
+///                       +-----------------------+                                     +-----------------------+
+///                       |Monotonicity: Inc      |                                     |Monotonicity: Inc      |
+///                      /|TableSide: Left        |\                                   /|TableSide: Right       |\
+///                     / +-----------------------+ \                                 / +-----------------------+ \
+///                   /-                             -\                             /-                             -\
+///                  /                                 \                           /                                 \
 ///     +-----------------------+           +-----------------------+ +-----------------------+           +-----------------------+
 ///     |Monotonicity: Inc      |           |Monotonicity: Inc      | |Monotonicity: Inc      |           |Monotonicity: Singleton|
 ///     |TableSide: Left        |           |TableSide: Left        | |TableSide: Right       |           |TableSide: None        |

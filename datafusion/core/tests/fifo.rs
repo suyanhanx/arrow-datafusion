@@ -1,3 +1,10 @@
+// This file contains both Apache Software Foundation (ASF) licensed code as
+// well as Synnada, Inc. extensions. Changes that constitute Synnada, Inc.
+// extensions are available in the SYNNADA-CONTRIBUTIONS.txt file. Synnada, Inc.
+// claims copyright only for Synnada, Inc. extensions. The license notice
+// applicable to non-Synnada sections of the file is given below.
+// --
+//
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -31,12 +38,6 @@ mod unix_test {
     use arrow::csv::ReaderBuilder;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow_schema::SchemaRef;
-    use futures::StreamExt;
-    use nix::sys::stat;
-    use nix::unistd;
-    use tempfile::TempDir;
-    use tokio::task::{spawn_blocking, JoinHandle};
-
     use datafusion::datasource::stream::{StreamConfig, StreamTable};
     use datafusion::datasource::TableProvider;
     use datafusion::{
@@ -45,6 +46,12 @@ mod unix_test {
     };
     use datafusion_common::{exec_err, DataFusionError, Result};
     use datafusion_expr::Expr;
+
+    use futures::StreamExt;
+    use nix::sys::stat;
+    use nix::unistd;
+    use tempfile::TempDir;
+    use tokio::task::{spawn_blocking, JoinHandle};
 
     /// Makes a TableProvider for a fifo file
     fn fifo_table(

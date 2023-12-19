@@ -31,7 +31,6 @@ pub mod limited_distinct_aggregation;
 pub mod optimizer;
 pub mod output_requirements;
 pub mod pipeline_checker;
-mod projection_pushdown;
 pub mod pruning;
 pub mod replace_with_order_preserving_variants;
 #[cfg(test)]
@@ -39,6 +38,7 @@ pub mod test_utils;
 pub mod topk_aggregation;
 
 mod join_pipeline_selection;
+mod projection_pushdown;
 mod sort_pushdown;
 mod utils;
 
