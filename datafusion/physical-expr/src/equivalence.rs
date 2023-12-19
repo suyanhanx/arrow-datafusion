@@ -20,8 +20,8 @@
 // are available in the SYNNADA-CONTRIBUTIONS.txt file.
 // Synnada, Inc. claims copyright only for Synnada, Inc. extensions.
 
-use std::hash::Hash;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use crate::expressions::{Column, Literal};

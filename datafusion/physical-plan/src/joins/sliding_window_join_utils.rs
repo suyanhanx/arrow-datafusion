@@ -10,9 +10,9 @@ use crate::joins::{
         calculate_side_prune_length_helper, get_build_side_pruned_exprs,
         get_filter_representation_of_join_side,
         get_filter_representation_schema_of_build_side, get_pruning_anti_indices,
-        get_pruning_semi_indices, SortedFilterExpr, StreamJoinStateResult,
+        get_pruning_semi_indices, SortedFilterExpr, StreamJoinMetrics,
+        StreamJoinStateResult,
     },
-    symmetric_hash_join::StreamJoinMetrics,
     utils::{
         append_right_indices, get_anti_indices, get_semi_indices, ColumnIndex, JoinFilter,
     },

@@ -22,9 +22,8 @@ use crate::joins::sliding_window_join_utils::{
 use crate::joins::stream_join_utils::{
     calculate_side_prune_length_helper, combine_two_batches, prepare_sorted_exprs,
     record_visited_indices, EagerJoinStream, EagerJoinStreamState, SortedFilterExpr,
-    StreamJoinStateResult,
+    StreamJoinMetrics, StreamJoinStateResult,
 };
-use crate::joins::symmetric_hash_join::StreamJoinMetrics;
 use crate::joins::utils::{
     apply_join_filter_to_indices, build_batch_from_indices, build_join_schema,
     calculate_join_output_ordering, estimate_join_statistics,

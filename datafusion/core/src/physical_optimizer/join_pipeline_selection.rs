@@ -3603,7 +3603,6 @@ mod order_preserving_join_swap_tests {
                 group_by,
                 aggr_expr,
                 vec![],
-                vec![],
                 input,
                 schema,
             )
@@ -3918,10 +3917,12 @@ mod order_preserving_join_swap_tests {
             descending: true,
             nulls_first: false,
         };
+
+        let aggr_name = "FirstValue(b) ORDER BY A DESC".to_string();
         // aggregation from build side, not expecting swaping.
         let aggr_expr = vec![Arc::new(FirstValue::new(
             col("b", &join_schema)?,
-            "FirstValue(b) ORDER BY a DESC".to_string(),
+            aggr_name,
             DataType::Int32,
             vec![PhysicalSortExpr {
                 expr: col("a", &join_schema)?,
@@ -3938,13 +3939,13 @@ mod order_preserving_join_swap_tests {
         let physical_plan = partial_aggregate_exec(join, partial_group_by, aggr_expr);
 
         let expected_input = [
-            "AggregateExec: mode=Partial, gby=[d@3 as d], aggr=[FirstValue(b) ORDER BY a DESC], ordering_mode=Sorted",
+            "AggregateExec: mode=Partial, gby=[d@3 as d], aggr=[LAST_VALUE(b@1)], ordering_mode=Sorted",
             "  HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, d@0)], filter=0@0 > 1@1",
             "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
             "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",
         ];
         let expected_optimized = [
-            "AggregateExec: mode=Partial, gby=[d@3 as d], aggr=[FirstValue(b) ORDER BY a DESC], ordering_mode=Sorted",
+            "AggregateExec: mode=Partial, gby=[d@3 as d], aggr=[LAST_VALUE(b@1)], ordering_mode=Sorted",
             "  AggregativeHashJoinExec: join_type=Inner, on=[(a@0, d@0)], filter=0@0 > 1@1",
             "    StreamingTableExec: partition_sizes=0, projection=[a, b, c], infinite_source=true, output_ordering=[a@0 ASC]",
             "    StreamingTableExec: partition_sizes=0, projection=[d, e, c], infinite_source=true, output_ordering=[d@0 ASC]",

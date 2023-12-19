@@ -434,6 +434,7 @@ pub fn expand_qualified_wildcard(
     if qualified_fields.is_empty() {
         return plan_err!("Invalid qualifier {qualifier}");
     }
+
     let qualified_schema =
         DFSchema::new_with_metadata(qualified_fields, schema.metadata().clone())?
             // We can use the functional dependencies as is, since it only stores indices:

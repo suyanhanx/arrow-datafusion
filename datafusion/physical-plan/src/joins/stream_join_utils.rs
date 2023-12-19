@@ -1182,6 +1182,10 @@ impl StreamJoinMetrics {
             output_batches,
             stream_memory_usage,
             output_rows,
+        }
+    }
+}
+
 /// Constructs a schema for the filter representation of the build side.
 ///
 /// This function generates a [`SchemaRef`] with fields from the build side that are used
