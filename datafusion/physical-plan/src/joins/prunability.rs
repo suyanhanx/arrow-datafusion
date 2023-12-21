@@ -13,7 +13,7 @@ use crate::EquivalenceProperties;
 use arrow::datatypes::Schema;
 use arrow_schema::{DataType, Fields, SortOptions};
 use datafusion_common::tree_node::{Transformed, TreeNode, VisitRecursion};
-use datafusion_common::{DataFusionError, JoinSide, Result, ScalarValue};
+use datafusion_common::{internal_err, DataFusionError, JoinSide, Result, ScalarValue};
 use datafusion_expr::Operator;
 use datafusion_physical_expr::equivalence::{
     EquivalenceClass, EquivalenceGroup, OrderingEquivalenceClass,
@@ -21,9 +21,7 @@ use datafusion_physical_expr::equivalence::{
 use datafusion_physical_expr::expressions::{
     BinaryExpr, CastExpr, Column, Literal, NegativeExpr,
 };
-use datafusion_physical_expr::utils::{
-    collect_columns, get_indices_of_matching_sort_exprs_with_order_eq,
-};
+use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr::{PhysicalExpr, PhysicalSortExpr, SortProperties};
 
 /// Takes information about the join inputs (i.e. tables) and determines
@@ -33,14 +31,8 @@ use datafusion_physical_expr::{PhysicalExpr, PhysicalSortExpr, SortProperties};
 ///
 /// * `filter` - A reference to the [`JoinFilter`] showing the expression
 /// indices of the columns at their original tables, and the intermediate schema.
-/// * `left_sort_expr` - A reference to the [`PhysicalSortExpr`] for the left side of the join.
-/// * `right_sort_expr` - A reference to the [`PhysicalSortExpr`] for the right side of the join.
-/// * `left_equal_properties` - Equivalence columns at the left table of the join.
-/// * `left_ordering_equal_properties` - Class that shows which of the others are sorted when one of
-/// the columns is sorted for the left table.
-/// * `right_equal_properties` - Equivalence columns at the right table of the join.
-/// * `right_ordering_equal_properties` - Class that shows which of the others are sorted when one of
-/// the columns is sorted for the right table.
+/// * `left_equal_properties` - Equivalence properties for the left table of the join.
+/// * `right_equal_properties` - Equivalence properties for the right table of the join.
 ///
 /// # Returns
 ///
@@ -48,18 +40,12 @@ use datafusion_physical_expr::{PhysicalExpr, PhysicalSortExpr, SortProperties};
 /// the second one indicates whether the right table is.
 pub fn is_filter_expr_prunable(
     filter: &JoinFilter,
-    left_sort_expr: Option<PhysicalSortExpr>,
-    right_sort_expr: Option<PhysicalSortExpr>,
     left_equal_properties: &EquivalenceProperties,
     right_equal_properties: &EquivalenceProperties,
 ) -> Result<(bool, bool)> {
     let left_indices = collect_one_side_columns(&filter.column_indices, JoinSide::Left);
     let right_indices = collect_one_side_columns(&filter.column_indices, JoinSide::Right);
 
-    let left_sort_expr =
-        intermediate_schema_sort_expr(left_sort_expr, &left_indices, filter.schema())?;
-    let right_sort_expr =
-        intermediate_schema_sort_expr(right_sort_expr, &right_indices, filter.schema())?;
     let new_eq = merge_equivalence_classes_for_intermediate_schema(
         &left_indices,
         &right_indices,
@@ -72,8 +58,6 @@ pub fn is_filter_expr_prunable(
     let transformed_expr = initial_expr.transform_up(&|expr| {
         update_prunability(
             expr,
-            &left_sort_expr,
-            &right_sort_expr,
             || new_eq.clone(),
             &left_indices,
             &right_indices,
@@ -100,61 +84,6 @@ fn collect_one_side_columns(
         .enumerate()
         .filter(|&(_, ci)| ci.side == side)
         .collect()
-}
-
-/// Modifies the original sort expression of a table to align with the intermediate schema
-/// of a join operator.
-///
-/// # Example
-/// Suppose the filter predicate is: `a_right + 3 < a_left` AND `b_left - b_right < 10`.
-///
-/// Original sort expression: `(b_left, 1)`.
-///
-/// Indices mapping: `(1, (0, JoinSide::Left))`, `(2, (1, JoinSide::Left))`.
-///
-/// Schema: `|a_right_inter | a_left_inter | b_left_inter | b_right_inter|`.
-///
-/// The function returns the updated sort expression: `(b_left_inter, 2)`.
-///
-/// # Parameters
-/// - `original_sort_expr`: The original sort expression to be modified, if provided.
-/// - `indices`: The mapping of expression indices coming from the one side
-/// of the join and their indices at their original table.
-/// - `schema`: The intermediate schema of the join operator.
-///
-/// # Returns
-///
-/// Returns `Ok(None)` if the input `original_sort_expr` is `None`. Otherwise, returns
-/// an updated version of the sort expression that aligns with the intermediate schema.
-fn intermediate_schema_sort_expr(
-    original_sort_expr: Option<PhysicalSortExpr>,
-    indices: &[(usize, &ColumnIndex)],
-    schema: &Schema,
-) -> Result<Option<PhysicalSortExpr>> {
-    original_sort_expr
-        .map(|sort_expr| {
-            sort_expr
-                .expr
-                .transform(&|expr| {
-                    if let Some(col) = expr.as_any().downcast_ref::<Column>() {
-                        if let Some(position) = indices
-                            .iter()
-                            .find(|(_, col_ind)| col_ind.index == col.index())
-                        {
-                            return Ok(Transformed::Yes(Arc::new(Column::new(
-                                schema.fields()[position.0].name(),
-                                position.0,
-                            ))));
-                        }
-                    }
-                    Ok(Transformed::No(expr))
-                })
-                .map(|expr| PhysicalSortExpr {
-                    expr,
-                    options: sort_expr.options,
-                })
-        })
-        .transpose()
 }
 
 /// This struct encapsulates three pieces of information about a [`PhysicalExpr`]:
@@ -232,8 +161,6 @@ enum TableSide {
 /// # Arguments
 ///
 /// * `node` - The [`ExprPrunability`] node to update.
-/// * `left_sort_expr` - [`PhysicalSortExpr`] of the left side of the join.
-/// * `right_sort_expr` - [`PhysicalSortExpr`] of the right side of the join.
 /// * `equal_properties` - A closure returning the equivalence properties of columns according to the intermediate schema.
 /// * `ordering_equal_properties` - A closure returning the ordering equivalence properties of columns according to the intermediate schema.
 /// * `left_indices` - The mapping of expression indices coming from the left side of the join and their indices at their original table.
@@ -243,25 +170,13 @@ enum TableSide {
 /// # Returns
 ///
 /// Returns the updated [`ExprPrunability`] node if no errors are encountered.
-#[allow(clippy::too_many_arguments)]
 fn update_prunability<F: Fn() -> EquivalenceProperties>(
     mut node: ExprPrunability,
-    left_sort_expr: &Option<PhysicalSortExpr>,
-    right_sort_expr: &Option<PhysicalSortExpr>,
     equal_properties: F,
     left_indices: &[(usize, &ColumnIndex)],
     right_indices: &[(usize, &ColumnIndex)],
     filter_schema: &Schema,
 ) -> Result<Transformed<ExprPrunability>> {
-    // If we can directly match a sort expr with the current node, we can set
-    // its state and return early.
-    // TODO: If there is a PhysicalExpr other than Column at the node (let's say
-    //       a + b), and there is an ordering equivalence of it (let's say c + d),
-    //       we actually can find it at this step.
-    if check_direct_matching(&mut node, left_sort_expr, right_sort_expr, filter_schema) {
-        return Ok(Transformed::Yes(node));
-    }
-
     if !node.children.is_empty() {
         // Handle the intermediate (non-leaf) node case:
         let children = node.children_state();
@@ -306,14 +221,18 @@ fn update_prunability<F: Fn() -> EquivalenceProperties>(
         {
             TableSide::Right
         } else {
-            return Err(DataFusionError::Internal(
-                "Unknown column to determine prunable table side".to_string(),
-            ));
+            return internal_err!("Unknown column to determine prunable table side");
         };
 
-        let column_sort_options = assign_column_ordering(column, equal_properties);
+        let sp = equal_properties()
+            .get_expr_ordering(node.expr.clone())
+            .state;
+        let column_sort_options = if let SortProperties::Ordered(order) = sp {
+            SortProperties::Ordered(order)
+        } else {
+            SortProperties::Unordered
+        };
 
-        // Column ordering can also be set via equivalence properties.
         let prune_side = match (column.data_type(filter_schema), column_sort_options) {
             (Ok(DataType::Boolean), SortProperties::Ordered(sort_options))
                 if !sort_options.descending =>
@@ -337,45 +256,6 @@ fn update_prunability<F: Fn() -> EquivalenceProperties>(
         };
     }
     Ok(Transformed::Yes(node))
-}
-
-/// Checks whether the node satisfies the sort expression of left or right
-/// table without deeply traversing the node expression. Only direct expression
-/// matching is done.
-fn check_direct_matching(
-    node: &mut ExprPrunability,
-    left_sort_expr: &Option<PhysicalSortExpr>,
-    right_sort_expr: &Option<PhysicalSortExpr>,
-    filter_schema: &Schema,
-) -> bool {
-    [
-        left_sort_expr.as_ref().map(|x| (x, TableSide::Left)),
-        right_sort_expr.as_ref().map(|x| (x, TableSide::Right)),
-    ]
-    .iter()
-    .flatten()
-    .find(|(sort_expr, _)| sort_expr.expr.eq(&node.expr))
-    .map(|(sort_expr, side)| {
-        node.state = PrunabilityState {
-            sort_options: SortProperties::Ordered(sort_expr.options),
-            table_side: *side,
-            prune_side: if matches!(
-                node.expr.data_type(filter_schema),
-                Ok(DataType::Boolean)
-            ) && !sort_expr.options.descending
-            {
-                // Check whether we have a boolean column, which can introduce
-                // a left or right prunable side directly if it is a increasing
-                // or decreasing column. Note that boolean columns can also be
-                // children of logical operations.
-                *side
-            } else {
-                TableSide::None
-            },
-        };
-        true
-    })
-    .unwrap_or(false)
 }
 
 /// Determines the table side info of the target node according to given
@@ -414,36 +294,6 @@ fn calculate_pruneside_from_children(
         Operator::And => get_pruneside_at_and(&children[0], &children[1]),
         _ => TableSide::None,
     }
-}
-
-/// Given sort expressions of the join tables and equivalence properties,
-/// the function tries to assign the sort options of the column node.
-/// If it cannot find a match, it labels the node as unordered.
-fn assign_column_ordering<F: Fn() -> EquivalenceProperties>(
-    node_column: &Column,
-    equal_properties: F,
-) -> SortProperties {
-    get_matching_sort_options(node_column, &equal_properties)
-        .unwrap_or(SortProperties::Unordered)
-}
-
-/// Tries to find the order of the column by looking the sort expression and
-/// equivalence properties. If it fails to do so, it returns `None`.
-fn get_matching_sort_options<F: Fn() -> EquivalenceProperties>(
-    column: &Column,
-    equal_properties: &F,
-) -> Option<SortProperties> {
-    get_indices_of_matching_sort_exprs_with_order_eq(
-        &[column.clone()],
-        equal_properties(),
-    )
-    .map(|(sort_options, _)| {
-        // We are only concerned with leading orderings:
-        SortProperties::Ordered(SortOptions {
-            descending: sort_options[0].descending,
-            nulls_first: sort_options[0].nulls_first,
-        })
-    })
 }
 
 impl TreeNode for ExprPrunability {
@@ -516,17 +366,12 @@ fn merge_equivalence_classes_for_intermediate_schema(
         new_eq,
     );
 
-    let (left_oeq, right_oeq) = (
-        left_eq_properties.oeq_class(),
-        right_eq_properties.oeq_class(),
-    );
     let new_oeq = new_ordering_equivalences_for_join(
-        left_oeq,
-        right_oeq,
+        left_eq_properties,
+        right_eq_properties,
         left_indices,
         right_indices,
         filter_schema,
-        &new_eq,
     );
 
     new_eq.add_ordering_equivalence_class(new_oeq);
@@ -591,17 +436,18 @@ fn transform_orders(
     fields: &Fields,
     eq: &EquivalenceProperties,
 ) -> Vec<PhysicalSortExpr> {
+    let grp = eq.eq_group();
     class
         .iter()
-        .filter_map(|order| {
+        .map_while(|order| {
             let columns = collect_columns(&order.expr);
-            let columns = columns.iter().collect::<Vec<_>>();
+
             columns
                 .iter()
-                .any(|c| {
+                .all(|col| {
                     indices
                         .iter()
-                        .any(|(_ind, col_ind)| col_ind.index == c.index())
+                        .any(|(_, col_idx)| grp.fields_equal(col.index(), col_idx.index))
                 })
                 .then(|| {
                     let mut order = order.clone();
@@ -609,21 +455,25 @@ fn transform_orders(
                         .expr
                         .transform(&|expr| {
                             if let Some(col) = expr.as_any().downcast_ref::<Column>() {
-                                if let Some(position) = indices
+                                indices
                                     .iter()
-                                    .find(|(_ind, col_ind)| col_ind.index == col.index())
-                                {
-                                    return Ok(Transformed::Yes(Arc::new(Column::new(
-                                        fields[position.0].name(),
-                                        position.0,
-                                    ))));
-                                }
+                                    .find(|(_, col_idx)| {
+                                        grp.fields_equal(col.index(), col_idx.index)
+                                    })
+                                    .map(|position| {
+                                        let result = Column::new(
+                                            fields[position.0].name(),
+                                            position.0,
+                                        );
+                                        Ok(Transformed::Yes(Arc::new(result) as _))
+                                    })
+                                    .unwrap_or_else(|| Ok(Transformed::No(expr)))
+                            } else {
+                                Ok(Transformed::No(expr))
                             }
-                            Ok(Transformed::No(expr))
                         })
                         .unwrap();
-                    eq.eq_group().normalize_sort_exprs(&[order])[0].clone()
-                    // normalize_sort_expr_with_equivalence_properties(order, eq.classes())
+                    order
                 })
         })
         .collect()
@@ -633,13 +483,12 @@ fn transform_orders(
 /// according to the original tables of join operation. The aim is to update these column names
 /// and indices according to the intermediate schema of the join.
 fn add_ordering_classes(
-    oeq: &OrderingEquivalenceClass,
+    eq: &EquivalenceProperties,
     indices: &[(usize, &ColumnIndex)],
     fields: &Fields,
-    eq: &EquivalenceProperties,
     new_oeq_vec: &mut Vec<Vec<PhysicalSortExpr>>,
 ) {
-    for class in oeq.iter() {
+    for class in eq.normalized_oeq_class().iter() {
         let orderings = transform_orders(class, indices, fields, eq);
         new_oeq_vec.push(orderings);
     }
@@ -653,19 +502,17 @@ fn add_ordering_classes(
 /// original table. `schema` and `eq` are the schema and equivalence class of
 /// the intermediate schema.
 fn new_ordering_equivalences_for_join(
-    left_oeq: &OrderingEquivalenceClass,
-    right_oeq: &OrderingEquivalenceClass,
+    left_eq: &EquivalenceProperties,
+    right_eq: &EquivalenceProperties,
     left_indices: &[(usize, &ColumnIndex)],
     right_indices: &[(usize, &ColumnIndex)],
     schema: &Schema,
-    eq: &EquivalenceProperties,
 ) -> OrderingEquivalenceClass {
     let mut new_oeq = OrderingEquivalenceClass::new(vec![]);
     let mut new_oeq_vec = vec![];
-
-    let left_right_oeq_ind = [(left_oeq, left_indices), (right_oeq, right_indices)];
-    for (oeq, indices) in left_right_oeq_ind {
-        add_ordering_classes(oeq, indices, schema.fields(), eq, &mut new_oeq_vec)
+    let left_right_oeq_ind = [(left_eq, left_indices), (right_eq, right_indices)];
+    for (eq, indices) in left_right_oeq_ind {
+        add_ordering_classes(eq, indices, schema.fields(), &mut new_oeq_vec)
     }
 
     new_oeq.add_new_orderings(new_oeq_vec);
@@ -1127,6 +974,7 @@ fn construct_one_side(mut vecs: PositiveNegativeVecs) -> Arc<dyn PhysicalExpr> {
 #[cfg(test)]
 mod tests {
     use std::ops::Not;
+    use std::sync::Arc;
 
     use super::*;
     use crate::joins::utils::{ColumnIndex, JoinFilter};
@@ -1140,27 +988,18 @@ mod tests {
     };
     use datafusion_physical_expr::physical_exprs_bag_equal;
 
-    fn create_basic_schemas_and_sort_exprs(
-    ) -> (Schema, Schema, PhysicalSortExpr, PhysicalSortExpr) {
-        // Create 2 schemas having an interger column
+    fn create_basic_schemas() -> (Schema, Schema) {
+        // Create 2 schemas having an integer column
         let schema_left =
             Schema::new(vec![Field::new("left_column", DataType::Int32, true)]);
         let schema_right =
             Schema::new(vec![Field::new("right_column", DataType::Int32, true)]);
-        let left_sorted_asc = PhysicalSortExpr {
-            expr: col("left_column", &schema_left).unwrap(),
-            options: SortOptions::default(),
-        };
-        let right_sorted_asc = PhysicalSortExpr {
-            expr: col("right_column", &schema_right).unwrap(),
-            options: SortOptions::default(),
-        };
-        (schema_left, schema_right, left_sorted_asc, right_sorted_asc)
+
+        (schema_left, schema_right)
     }
 
-    fn create_multi_columns_schemas_and_sort_exprs(
-    ) -> (Schema, Schema, PhysicalSortExpr, PhysicalSortExpr) {
-        // Create 2 schemas having two interger columns
+    fn create_two_column_schemas() -> (Schema, Schema) {
+        // Create 2 schemas having two integer columns
         let schema_left = Schema::new(vec![
             Field::new("left_column1", DataType::Int32, true),
             Field::new("left_column2", DataType::Int32, true),
@@ -1169,24 +1008,27 @@ mod tests {
             Field::new("right_column1", DataType::Int32, true),
             Field::new("right_column2", DataType::Int32, true),
         ]);
-        let left_sorted_asc = PhysicalSortExpr {
-            expr: col("left_column2", &schema_left).unwrap(),
-            options: SortOptions::default(),
-        };
-        let right_sorted_desc = PhysicalSortExpr {
-            expr: col("right_column1", &schema_right).unwrap(),
-            options: SortOptions::default().not(),
-        };
-        (
-            schema_left,
-            schema_right,
-            left_sorted_asc,
-            right_sorted_desc,
-        )
+
+        (schema_left, schema_right)
     }
 
-    fn create_complex_schemas_and_sort_exprs(
-    ) -> (Schema, Schema, PhysicalSortExpr, PhysicalSortExpr) {
+    fn create_three_column_schemas() -> (Schema, Schema) {
+        // Create 2 schemas having three integer columns:
+        let schema_left = Schema::new(vec![
+            Field::new("left_column1", DataType::Int32, true),
+            Field::new("left_column2", DataType::Int32, true),
+            Field::new("left_column3", DataType::Int32, true),
+        ]);
+        let schema_right = Schema::new(vec![
+            Field::new("right_column1", DataType::Int32, true),
+            Field::new("right_column2", DataType::Int32, true),
+            Field::new("right_column3", DataType::Int32, true),
+        ]);
+
+        (schema_left, schema_right)
+    }
+
+    fn create_complex_schemas() -> (Schema, Schema) {
         let schema_left = Schema::new(vec![
             Field::new("left_increasing", DataType::Int32, true),
             Field::new("left_decreasing", DataType::Int32, true),
@@ -1198,16 +1040,7 @@ mod tests {
             Field::new("right_unordered", DataType::Int32, true),
         ]);
 
-        let left_increasing = PhysicalSortExpr {
-            expr: col("left_increasing", &schema_left).unwrap(),
-            options: SortOptions::default(),
-        };
-
-        let right_increasing = PhysicalSortExpr {
-            expr: col("right_increasing", &schema_right).unwrap(),
-            options: SortOptions::default(),
-        };
-        (schema_left, schema_right, left_increasing, right_increasing)
+        (schema_left, schema_right)
     }
 
     fn prepare_join_filter_simple(op_config: i8) -> JoinFilter {
@@ -1547,6 +1380,52 @@ mod tests {
         }
     }
 
+    fn prepare_join_filter_three_columns() -> JoinFilter {
+        let col_ind = vec![
+            ColumnIndex {
+                index: 1,
+                side: JoinSide::Left,
+            },
+            ColumnIndex {
+                index: 0,
+                side: JoinSide::Right,
+            },
+            ColumnIndex {
+                index: 2,
+                side: JoinSide::Left,
+            },
+        ];
+
+        let fields: Fields = [
+            "inter_left_column2",
+            "inter_right_column1",
+            "inter_left_column3",
+        ]
+        .into_iter()
+        .map(|name| Field::new(name, DataType::Int32, true))
+        .collect();
+        let schema = Schema::new(fields);
+
+        let left_col2 = col("inter_left_column2", &schema).unwrap();
+        let right_col1 = col("inter_right_column1", &schema).unwrap();
+        let left_col3 = col("inter_left_column3", &schema).unwrap();
+        // (left_col2 >= right_col1 AND right_col1 > left_col3)
+        let left_expr = Arc::new(BinaryExpr::new(
+            left_col2,
+            Operator::GtEq,
+            right_col1.clone(),
+        ));
+        let right_expr = Arc::new(BinaryExpr::new(right_col1, Operator::Gt, left_col3));
+
+        let expr = Arc::new(BinaryExpr::new(left_expr, Operator::And, right_expr));
+
+        JoinFilter {
+            expression: expr,
+            column_indices: col_ind,
+            schema,
+        }
+    }
+
     fn get_col_indices() -> Vec<ColumnIndex> {
         vec![
             ColumnIndex {
@@ -1792,46 +1671,47 @@ mod tests {
 
     #[test]
     fn test_monotonicity_simple() -> Result<()> {
-        let (schema_left, schema_right, left_sorted_asc, right_sorted_asc) =
-            create_basic_schemas_and_sort_exprs();
+        let (schema_left, schema_right) = create_basic_schemas();
+        let mut left_eqp = EquivalenceProperties::new(Arc::new(schema_left.clone()));
+        left_eqp.add_new_orderings(vec![vec![PhysicalSortExpr {
+            expr: col("left_column", &schema_left).unwrap(),
+            options: SortOptions::default(),
+        }]]);
+        let mut right_eqp = EquivalenceProperties::new(Arc::new(schema_right.clone()));
+        right_eqp.add_new_orderings(vec![vec![PhysicalSortExpr {
+            expr: col("right_column", &schema_right).unwrap(),
+            options: SortOptions::default(),
+        }]]);
 
         assert_eq!(
             is_filter_expr_prunable(
                 &prepare_join_filter_simple(0),
-                Some(left_sorted_asc.clone()),
-                Some(right_sorted_asc.clone()),
-                &EquivalenceProperties::new(Arc::new(schema_left.clone())),
-                &EquivalenceProperties::new(Arc::new(schema_right.clone())),
+                &left_eqp,
+                &right_eqp,
             )?,
             (true, true)
         );
         assert_eq!(
             is_filter_expr_prunable(
                 &prepare_join_filter_simple(1),
-                Some(left_sorted_asc.clone()),
-                Some(right_sorted_asc.clone()),
-                &EquivalenceProperties::new(Arc::new(schema_left.clone())),
-                &EquivalenceProperties::new(Arc::new(schema_right.clone())),
+                &left_eqp,
+                &right_eqp,
             )?,
             (true, false)
         );
         assert_eq!(
             is_filter_expr_prunable(
                 &prepare_join_filter_simple(2),
-                Some(left_sorted_asc.clone()),
-                Some(right_sorted_asc.clone()),
-                &EquivalenceProperties::new(Arc::new(schema_left.clone())),
-                &EquivalenceProperties::new(Arc::new(schema_right.clone())),
+                &left_eqp,
+                &right_eqp,
             )?,
             (false, true)
         );
         assert_eq!(
             is_filter_expr_prunable(
                 &prepare_join_filter_simple(3),
-                Some(left_sorted_asc),
-                Some(right_sorted_asc),
-                &EquivalenceProperties::new(Arc::new(schema_left.clone())),
-                &EquivalenceProperties::new(Arc::new(schema_right.clone())),
+                &left_eqp,
+                &right_eqp,
             )?,
             (true, true)
         );
@@ -1841,43 +1721,53 @@ mod tests {
 
     #[test]
     fn test_monotonicity_without_filter() -> Result<()> {
-        let (schema_left, schema_right, left_sorted_asc, right_sorted_asc) =
-            create_basic_schemas_and_sort_exprs();
+        let (schema_left, schema_right) = create_basic_schemas();
+        let mut left_eqp = EquivalenceProperties::new(Arc::new(schema_left.clone()));
+        let mut right_eqp = EquivalenceProperties::new(Arc::new(schema_right.clone()));
+        left_eqp.add_new_orderings(vec![vec![PhysicalSortExpr {
+            expr: col("left_column", &schema_left)?,
+            options: SortOptions::default(),
+        }]]);
+        right_eqp.add_new_orderings(vec![vec![PhysicalSortExpr {
+            expr: col("right_column", &schema_right)?,
+            options: SortOptions::default(),
+        }]]);
 
         for op in 1..4 {
             assert_eq!(
                 is_filter_expr_prunable(
                     &prepare_join_filter_without_filter_expr(op),
-                    Some(left_sorted_asc.clone()),
-                    Some(right_sorted_asc.clone()),
-                    &EquivalenceProperties::new(Arc::new(schema_left.clone())),
-                    &EquivalenceProperties::new(Arc::new(schema_right.clone())),
+                    &left_eqp,
+                    &right_eqp,
                 )?,
                 (false, false)
             );
         }
 
         // expressions from the same table case:
-        let (schema_left, schema_right, left_sorted_asc, right_sorted_asc) =
-            create_multi_columns_schemas_and_sort_exprs();
-        let mut left_eq = EquivalenceProperties::new(Arc::new(schema_left.clone()));
-        left_eq.add_new_orderings(vec![
+        let (schema_left, schema_right) = create_two_column_schemas();
+        let mut left_eqp = EquivalenceProperties::new(Arc::new(schema_left.clone()));
+        let right_eqp = EquivalenceProperties::new(Arc::new(schema_right.clone()));
+        left_eqp.add_new_orderings(vec![
             vec![PhysicalSortExpr {
-                expr: col("left_column1", &schema_left).unwrap(),
+                expr: col("left_column1", &schema_left)?,
                 options: SortOptions::default(),
             }],
             vec![PhysicalSortExpr {
-                expr: col("left_column2", &schema_left).unwrap(),
+                expr: col("left_column2", &schema_left)?,
                 options: SortOptions::default(),
             }],
         ]);
+        left_eqp.add_new_orderings(vec![vec![PhysicalSortExpr {
+            expr: col("right_column1", &schema_right)?,
+            options: SortOptions::default(),
+        }]]);
+
         assert_eq!(
             is_filter_expr_prunable(
                 &prepare_join_filter_without_filter_expr(0),
-                Some(left_sorted_asc),
-                Some(right_sorted_asc),
-                &left_eq,
-                &EquivalenceProperties::new(Arc::new(schema_right.clone())),
+                &left_eqp,
+                &right_eqp,
             )?,
             (false, false)
         );
@@ -1887,27 +1777,33 @@ mod tests {
 
     #[test]
     fn test_monotonicity_asymmetric_filter() -> Result<()> {
-        let (schema_left, schema_right, left_sorted_asc, right_sorted_asc) =
-            create_basic_schemas_and_sort_exprs();
+        let (schema_left, schema_right) = create_basic_schemas();
+        let mut left_eqp = EquivalenceProperties::new(Arc::new(schema_left.clone()));
+        let mut right_eqp = EquivalenceProperties::new(Arc::new(schema_right.clone()));
+        left_eqp.add_new_orderings(vec![vec![PhysicalSortExpr {
+            expr: col("left_column", &schema_left)?,
+            options: SortOptions::default(),
+        }]]);
+        right_eqp.add_new_orderings(vec![vec![PhysicalSortExpr {
+            expr: col("right_column", &schema_right)?,
+            options: SortOptions::default(),
+        }]]);
 
         assert_eq!(
             is_filter_expr_prunable(
                 &prepare_join_filter_asymmetric(0),
-                Some(left_sorted_asc.clone()),
-                Some(right_sorted_asc.clone()),
-                &EquivalenceProperties::new(Arc::new(schema_left.clone())),
-                &EquivalenceProperties::new(Arc::new(schema_right.clone())),
+                &left_eqp,
+                &right_eqp,
             )?,
             (true, true)
         );
+
         for config in 1..3 {
             assert_eq!(
                 is_filter_expr_prunable(
                     &prepare_join_filter_asymmetric(config),
-                    Some(left_sorted_asc.clone()),
-                    Some(right_sorted_asc.clone()),
-                    &EquivalenceProperties::new(Arc::new(schema_left.clone())),
-                    &EquivalenceProperties::new(Arc::new(schema_right.clone())),
+                    &left_eqp,
+                    &right_eqp,
                 )?,
                 (false, false)
             );
@@ -1920,51 +1816,51 @@ mod tests {
     fn test_monotonicity_more_columns() -> Result<()> {
         // left table has an increasing order wrt. left_column2,
         // right table has a decreasing order wrt. right_column1
-        let (schema_left, schema_right, left_sorted_asc, right_sorted_desc) =
-            create_multi_columns_schemas_and_sort_exprs();
+        let (schema_left, schema_right) = create_two_column_schemas();
+
+        let left_sorted_asc = PhysicalSortExpr {
+            expr: col("left_column2", &schema_left)?,
+            options: SortOptions::default(),
+        };
+        let right_sorted_desc = PhysicalSortExpr {
+            expr: col("right_column1", &schema_right)?,
+            options: SortOptions::default().not(),
+        };
 
         let filter = prepare_join_filter_more_columns();
-        let mut left_equal_properties =
-            EquivalenceProperties::new(Arc::new(schema_left.clone()));
-        left_equal_properties.add_new_orderings(vec![vec![left_sorted_asc.clone()]]);
-        let mut right_equal_properties =
-            EquivalenceProperties::new(Arc::new(schema_left.clone()));
-        right_equal_properties.add_new_orderings(vec![vec![right_sorted_desc.clone()]]);
+        let mut left_eqp = EquivalenceProperties::new(Arc::new(schema_left.clone()));
+        let mut right_eqp = EquivalenceProperties::new(Arc::new(schema_left.clone()));
+        left_eqp.add_new_orderings(vec![vec![left_sorted_asc.clone()]]);
+        right_eqp.add_new_orderings(vec![vec![right_sorted_desc.clone()]]);
 
         // If we do not give any equivalence property to the schema, neither table can be pruned.
         assert_eq!(
-            is_filter_expr_prunable(
-                &filter,
-                Some(left_sorted_asc.clone()),
-                Some(right_sorted_desc.clone()),
-                &left_equal_properties,
-                &right_equal_properties,
-            )?,
+            is_filter_expr_prunable(&filter, &left_eqp, &right_eqp,)?,
             (false, false)
         );
 
-        let mut left_equivalence =
-            EquivalenceProperties::new(Arc::new(schema_left.clone()));
-        left_equivalence.add_equal_conditions(
+        let mut left_eqp = EquivalenceProperties::new(Arc::new(schema_left.clone()));
+        let mut right_eqp = EquivalenceProperties::new(Arc::new(schema_right.clone()));
+        left_eqp.add_equal_conditions(
             &col("left_column1", &schema_left)?,
             &col("left_column2", &schema_left)?,
         );
-        left_equivalence.add_new_orderings(vec![vec![left_sorted_asc.clone()]]);
+        left_eqp.add_new_orderings(vec![vec![left_sorted_asc.clone()]]);
+        right_eqp.add_new_orderings(vec![vec![right_sorted_desc.clone()]]);
         // If we declare an equivalence on left columns, we will be able to prune left table.
         assert_eq!(
-            is_filter_expr_prunable(
-                &filter,
-                Some(left_sorted_asc.clone()),
-                Some(right_sorted_desc.clone()),
-                &left_equivalence,
-                &right_equal_properties,
-            )?,
+            is_filter_expr_prunable(&filter, &left_eqp, &right_eqp,)?,
             (true, false)
         );
 
-        let mut right_equivalence =
-            EquivalenceProperties::new(Arc::new(schema_right.clone()));
-        right_equivalence.add_new_orderings(vec![
+        let mut left_eqp = EquivalenceProperties::new(Arc::new(schema_left.clone()));
+        let mut right_eqp = EquivalenceProperties::new(Arc::new(schema_right.clone()));
+        left_eqp.add_new_orderings(vec![vec![left_sorted_asc.clone()]]);
+        left_eqp.add_equal_conditions(
+            &col("left_column1", &schema_left)?,
+            &col("left_column2", &schema_left)?,
+        );
+        right_eqp.add_new_orderings(vec![
             vec![right_sorted_desc.clone()],
             vec![PhysicalSortExpr {
                 expr: col("right_column1", &schema_right)?,
@@ -1983,63 +1879,33 @@ mod tests {
         ]);
         // If we also add an ordering equivalence on right columns, then we get full prunability.
         assert_eq!(
-            is_filter_expr_prunable(
-                &filter,
-                Some(left_sorted_asc.clone()),
-                Some(right_sorted_desc.clone()),
-                &left_equivalence,
-                &right_equivalence,
-            )?,
+            is_filter_expr_prunable(&filter, &left_eqp, &right_eqp)?,
             (true, true)
         );
 
         // Other scenarios:
-        let mut left_eq = EquivalenceProperties::new(Arc::new(schema_left.clone()));
-        left_eq.add_new_orderings(vec![vec![left_sorted_asc.clone()]]);
+        let left_eqp = EquivalenceProperties::new(Arc::new(schema_left.clone()));
+        let mut right_eqp = EquivalenceProperties::new(Arc::new(schema_right.clone()));
+        right_eqp.add_new_orderings(vec![vec![right_sorted_desc.clone()]]);
         assert_eq!(
-            is_filter_expr_prunable(
-                &filter,
-                Some(left_sorted_asc.clone()),
-                Some(right_sorted_desc.clone()),
-                &left_eq,
-                &right_equivalence,
-            )?,
-            (false, true)
-        );
-        assert_eq!(
-            is_filter_expr_prunable(
-                &filter,
-                None,
-                Some(right_sorted_desc.clone()),
-                &EquivalenceProperties::new(Arc::new(schema_left.clone())),
-                &right_equivalence,
-            )?,
+            is_filter_expr_prunable(&filter, &left_eqp, &right_eqp,)?,
             (false, false)
         );
+
+        let mut left_eqp = EquivalenceProperties::new(Arc::new(schema_left.clone()));
+        let right_eqp = EquivalenceProperties::new(Arc::new(schema_right.clone()));
+        left_eqp.add_new_orderings(vec![vec![left_sorted_asc.clone()]]);
         assert_eq!(
-            is_filter_expr_prunable(
-                &filter,
-                Some(left_sorted_asc.clone()),
-                None,
-                &left_equivalence,
-                &EquivalenceProperties::new(Arc::new(schema_right.clone())),
-            )?,
+            is_filter_expr_prunable(&filter, &left_eqp, &right_eqp,)?,
             (false, false)
         );
-        let mut left_equivalence =
-            EquivalenceProperties::new(Arc::new(schema_left.clone()));
-        left_equivalence.add_new_orderings(vec![vec![left_sorted_asc.clone()]]);
-        let mut right_equivalence =
-            EquivalenceProperties::new(Arc::new(schema_right.clone()));
-        right_equivalence.add_new_orderings(vec![vec![right_sorted_desc.clone()]]);
+
+        let mut left_eqp = EquivalenceProperties::new(Arc::new(schema_left.clone()));
+        let mut right_eqp = EquivalenceProperties::new(Arc::new(schema_right.clone()));
+        left_eqp.add_new_orderings(vec![vec![left_sorted_asc.clone()]]);
+        right_eqp.add_new_orderings(vec![vec![right_sorted_desc.clone()]]);
         assert_eq!(
-            is_filter_expr_prunable(
-                &filter,
-                None,
-                None,
-                &left_equivalence,
-                &right_equivalence,
-            )?,
+            is_filter_expr_prunable(&filter, &right_eqp, &right_eqp,)?,
             (false, false)
         );
 
@@ -2050,8 +1916,7 @@ mod tests {
     fn test_monotonicity_complex() -> Result<()> {
         // left table has an increasing order wrt. left_increasing,
         // right table has an increasing order wrt. right_increasing
-        let (schema_left, schema_right, left_increasing, right_increasing) =
-            create_complex_schemas_and_sort_exprs();
+        let (schema_left, schema_right) = create_complex_schemas();
 
         let mut left_equivalence =
             EquivalenceProperties::new(Arc::new(schema_left.clone()));
@@ -2094,8 +1959,6 @@ mod tests {
         assert_eq!(
             is_filter_expr_prunable(
                 &prepare_join_filter_complex1(),
-                Some(left_increasing.clone()),
-                Some(right_increasing.clone()),
                 &left_equivalence,
                 &right_equivalence,
             )?,
@@ -2105,8 +1968,6 @@ mod tests {
         assert_eq!(
             is_filter_expr_prunable(
                 &prepare_join_filter_complex2(),
-                Some(left_increasing.clone()),
-                Some(right_increasing.clone()),
                 &left_equivalence,
                 &right_equivalence,
             )?,
@@ -2116,8 +1977,6 @@ mod tests {
         assert_eq!(
             is_filter_expr_prunable(
                 &prepare_join_filter_complex3(),
-                Some(left_increasing.clone()),
-                Some(right_increasing.clone()),
                 &left_equivalence,
                 &right_equivalence,
             )?,
@@ -2127,12 +1986,52 @@ mod tests {
         assert_eq!(
             is_filter_expr_prunable(
                 &prepare_join_filter_complex4(),
-                Some(left_increasing),
-                Some(right_increasing),
                 &left_equivalence,
                 &right_equivalence,
             )?,
             (false, true)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_monotonicity_more_columns_eq_oeq() -> Result<()> {
+        // left table has an increasing order wrt. left_column1 & left_column2 & left_column3,
+        // right table has a decreasing order wrt. right_column1
+        let (schema_left, schema_right) = create_three_column_schemas();
+
+        let filter = prepare_join_filter_three_columns();
+
+        let mut left_equal_properties = EquivalenceProperties::new(Arc::new(schema_left));
+        left_equal_properties.add_new_orderings(vec![
+            vec![PhysicalSortExpr {
+                expr: Arc::new(Column::new("left_column2", 1)),
+                options: SortOptions::default(),
+            }],
+            vec![PhysicalSortExpr {
+                expr: Arc::new(Column::new("left_column3", 2)),
+                options: SortOptions::default(),
+            }],
+        ]);
+        left_equal_properties.add_equal_conditions(
+            &(Arc::new(Column::new("left_column1", 0)) as _),
+            &(Arc::new(Column::new("left_column2", 1)) as _),
+        );
+        let mut right_equal_properties =
+            EquivalenceProperties::new(Arc::new(schema_right.clone()));
+        right_equal_properties.add_new_orderings(vec![vec![PhysicalSortExpr {
+            expr: Arc::new(Column::new("right_column1", 0)),
+            options: SortOptions::default(),
+        }]]);
+
+        assert_eq!(
+            is_filter_expr_prunable(
+                &filter,
+                &left_equal_properties,
+                &right_equal_properties,
+            )?,
+            (true, true)
         );
 
         Ok(())
@@ -2150,19 +2049,6 @@ mod tests {
             Field::new("x_right", DataType::Int32, true),
             Field::new("y_right", DataType::Int32, true),
         ]);
-
-        // a_left has a global increasing ordering.
-        // b_left has a global increasing ordering.
-        // x_right has a global increasing ordering.
-        // y_right has a global decreasing ordering.
-        let left_increasing_a = PhysicalSortExpr {
-            expr: col("a_left", &schema_left).unwrap(),
-            options: SortOptions::default(),
-        };
-        let right_increasing_x = PhysicalSortExpr {
-            expr: col("x_right", &schema_right).unwrap(),
-            options: SortOptions::default(),
-        };
 
         let mut left_equivalence =
             EquivalenceProperties::new(Arc::new(schema_left.clone()));
@@ -2255,13 +2141,7 @@ mod tests {
 
         // The predicate expression "a_left-x_right>10 AND y_right+b_left<=5" is expected to be not prunable from either side.
         assert_eq!(
-            is_filter_expr_prunable(
-                &filter,
-                Some(left_increasing_a.clone()),
-                Some(right_increasing_x.clone()),
-                &left_equivalence,
-                &right_equivalence,
-            )?,
+            is_filter_expr_prunable(&filter, &left_equivalence, &right_equivalence,)?,
             (false, false)
         );
 
@@ -2270,8 +2150,6 @@ mod tests {
         assert_eq!(
             is_filter_expr_prunable(
                 &modified_filter,
-                Some(left_increasing_a.clone()),
-                Some(right_increasing_x.clone()),
                 &left_equivalence,
                 &right_equivalence,
             )?,
@@ -2825,14 +2703,13 @@ mod tests {
             schema,
         };
 
+        let mut left_eqp = EquivalenceProperties::new(Arc::new(schema_left.clone()));
+        left_eqp.add_new_orderings(vec![vec![left_sorted_asc]]);
+        let mut right_eqp = EquivalenceProperties::new(Arc::new(schema_right.clone()));
+        right_eqp.add_new_orderings(vec![vec![right_sorted_asc]]);
+
         assert_eq!(
-            is_filter_expr_prunable(
-                &filter,
-                Some(left_sorted_asc.clone()),
-                Some(right_sorted_asc.clone()),
-                &EquivalenceProperties::new(Arc::new(schema_left.clone())),
-                &EquivalenceProperties::new(Arc::new(schema_right.clone())),
-            )?,
+            is_filter_expr_prunable(&filter, &left_eqp, &right_eqp,)?,
             (false, true)
         );
         Ok(())
@@ -2904,26 +2781,18 @@ mod tests {
             schema,
         };
 
-        let mut join_eq_properties =
-            EquivalenceProperties::new(Arc::new(schema_left.clone()));
-        join_eq_properties.add_equal_conditions(
+        let mut left_eqp = EquivalenceProperties::new(Arc::new(schema_left.clone()));
+        left_eqp.add_equal_conditions(
             &col("left_bool_column1", &schema_left)?,
             &col("left_bool_column2", &schema_left)?,
         );
-        join_eq_properties.add_new_orderings(vec![vec![left_sorted_asc.clone()]]);
+        left_eqp.add_new_orderings(vec![vec![left_sorted_asc.clone()]]);
 
-        let mut right_eq_properties =
-            EquivalenceProperties::new(Arc::new(schema_right.clone()));
-        right_eq_properties.add_new_orderings(vec![vec![right_sorted_asc.clone()]]);
+        let mut right_eqp = EquivalenceProperties::new(Arc::new(schema_right.clone()));
+        right_eqp.add_new_orderings(vec![vec![right_sorted_asc.clone()]]);
 
         assert_eq!(
-            is_filter_expr_prunable(
-                &filter,
-                Some(left_sorted_asc.clone()),
-                Some(right_sorted_asc.clone()),
-                &join_eq_properties,
-                &right_eq_properties,
-            )?,
+            is_filter_expr_prunable(&filter, &left_eqp, &right_eqp,)?,
             (true, true)
         );
 
@@ -3154,6 +3023,109 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_lex_oeq_suffix() -> Result<()> {
+        // intermediate schema: "c_left", "b_right", "e_left", "d_right"
+        let left_indices: [(usize, &ColumnIndex); 2] = [
+            (
+                0,
+                &ColumnIndex {
+                    index: 1,
+                    side: JoinSide::Left,
+                },
+            ),
+            (
+                2,
+                &ColumnIndex {
+                    index: 2,
+                    side: JoinSide::Left,
+                },
+            ),
+        ];
+        let right_indices: [(usize, &ColumnIndex); 2] = [
+            (
+                1,
+                &ColumnIndex {
+                    index: 0,
+                    side: JoinSide::Right,
+                },
+            ),
+            (
+                3,
+                &ColumnIndex {
+                    index: 1,
+                    side: JoinSide::Right,
+                },
+            ),
+        ];
+        let fields: Fields = ["a", "c", "e"]
+            .into_iter()
+            .map(|name| Field::new(name, DataType::Int32, true))
+            .collect();
+        let left_schema = Schema::new(fields);
+        let fields: Fields = ["b", "d"]
+            .into_iter()
+            .map(|name| Field::new(name, DataType::Int32, true))
+            .collect();
+        let right_schema = Schema::new(fields);
+        let fields: Fields = ["c_left", "b_right", "e_left", "d_right"]
+            .into_iter()
+            .map(|name| Field::new(name, DataType::Int32, true))
+            .collect();
+        let filter_schema = Schema::new(fields);
+
+        let mut left_equal_properties = EquivalenceProperties::new(Arc::new(left_schema));
+        left_equal_properties.add_new_orderings(vec![vec![
+            PhysicalSortExpr {
+                expr: Arc::new(Column::new("a", 0)),
+                options: SortOptions::default(),
+            },
+            PhysicalSortExpr {
+                expr: Arc::new(Column::new("c", 1)),
+                options: SortOptions::default(),
+            },
+        ]]);
+
+        let mut right_equal_properties =
+            EquivalenceProperties::new(Arc::new(right_schema));
+        right_equal_properties.add_new_orderings(vec![
+            vec![PhysicalSortExpr {
+                expr: Arc::new(Column::new("b", 0)),
+                options: SortOptions::default(),
+            }],
+            vec![PhysicalSortExpr {
+                expr: Arc::new(Column::new("d", 1)),
+                options: SortOptions::default(),
+            }],
+        ]);
+        let eq = merge_equivalence_classes_for_intermediate_schema(
+            &left_indices,
+            &right_indices,
+            &filter_schema,
+            &left_equal_properties,
+            &right_equal_properties,
+        );
+
+        let expected_oeq_classes = OrderingEquivalenceClass::new(vec![
+            vec![PhysicalSortExpr {
+                expr: Arc::new(Column::new("b_right", 1)),
+                options: SortOptions::default(),
+            }],
+            vec![PhysicalSortExpr {
+                expr: Arc::new(Column::new("d_right", 3)),
+                options: SortOptions::default(),
+            }],
+        ]);
+
+        assert_eq!(0, eq.eq_group().len());
+        let oeq_class = eq.oeq_class();
+        for item in expected_oeq_classes.iter() {
+            assert!(oeq_class.contains(item));
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn test_merge_equivalence_complex() -> Result<()> {
         // intermediate schema: a_left, b_left, c_right, d_left, e_right, f_left
         let left_indices: [(usize, &ColumnIndex); 4] = [
@@ -3299,6 +3271,56 @@ mod tests {
         for item in expected_oeq_classes.iter() {
             assert!(oeq_class.contains(item));
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_transform_orders() -> Result<()> {
+        let class = [
+            PhysicalSortExpr {
+                expr: Arc::new(BinaryExpr::new(
+                    Arc::new(Column::new("left_column1", 0)),
+                    Operator::Plus,
+                    Arc::new(Column::new("left_column2", 1)),
+                )),
+                options: SortOptions::default(),
+            },
+            PhysicalSortExpr {
+                expr: Arc::new(Column::new("left_column2", 1)),
+                options: SortOptions::default(),
+            },
+        ];
+        let indices = [(
+            0_usize,
+            &ColumnIndex {
+                index: 1,
+                side: JoinSide::Left,
+            },
+        )];
+        let fields: Fields = [
+            Field::new("inter_left_column2", DataType::Int32, true),
+            Field::new("inter_right_column1", DataType::Int32, true),
+        ]
+        .into_iter()
+        .collect();
+        let mut eq = EquivalenceProperties::new(Schema::new(fields.clone()).into());
+        eq.add_new_orderings(vec![vec![
+            PhysicalSortExpr {
+                expr: Arc::new(BinaryExpr::new(
+                    Arc::new(Column::new("left_column1", 0)),
+                    Operator::Plus,
+                    Arc::new(Column::new("left_column2", 1)),
+                )),
+                options: SortOptions::default(),
+            },
+            PhysicalSortExpr {
+                expr: Arc::new(Column::new("left_column2", 1)),
+                options: SortOptions::default(),
+            },
+        ]]);
+
+        assert_eq!(transform_orders(&class, &indices, &fields, &eq), vec![]);
 
         Ok(())
     }
