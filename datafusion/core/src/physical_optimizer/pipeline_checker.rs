@@ -1,3 +1,10 @@
+// This file contains both Apache Software Foundation (ASF) licensed code as
+// well as Synnada, Inc. extensions. Changes that constitute Synnada, Inc.
+// extensions are available in the SYNNADA-CONTRIBUTIONS.txt file. Synnada, Inc.
+// claims copyright only for Synnada, Inc. extensions. The license notice
+// applicable to non-Synnada sections of the file is given below.
+// --
+//
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -172,10 +179,6 @@ fn is_prunable(join: &SymmetricHashJoinExec, children_unbounded: &[bool]) -> boo
         }
         let prunable_sides = is_filter_expr_prunable(
             filter,
-            // Get the left leading order
-            join.left().output_ordering().map(|arr| arr[0].clone()),
-            // Get the right leading order
-            join.right().output_ordering().map(|arr| arr[0].clone()),
             &join.left().equivalence_properties(),
             &join.right().equivalence_properties(),
         )

@@ -43,7 +43,7 @@ use datafusion_execution::TaskContext;
 use datafusion_expr::Accumulator;
 use datafusion_physical_expr::{
     aggregate::is_order_sensitive,
-    equivalence::collapse_lex_req,
+    equivalence::{collapse_lex_req, ProjectionMapping},
     expressions::{Column, Max, Min, UnKnownColumn},
     physical_exprs_contains, AggregateExpr, EquivalenceProperties, LexOrdering,
     LexRequirement, PhysicalExpr, PhysicalSortExpr, PhysicalSortRequirement,
@@ -59,7 +59,6 @@ mod topk;
 mod topk_stream;
 
 pub use datafusion_expr::AggregateFunction;
-use datafusion_physical_expr::equivalence::ProjectionMapping;
 pub use datafusion_physical_expr::expressions::create_aggregate_expr;
 
 /// Hash aggregate modes
@@ -324,7 +323,7 @@ impl AggregateExec {
     pub fn try_new(
         mode: AggregateMode,
         group_by: PhysicalGroupBy,
-        mut aggr_expr: Vec<Arc<dyn AggregateExpr>>,
+        aggr_expr: Vec<Arc<dyn AggregateExpr>>,
         filter_expr: Vec<Option<Arc<dyn PhysicalExpr>>>,
         input: Arc<dyn ExecutionPlan>,
         input_schema: SchemaRef,
@@ -695,13 +694,15 @@ impl ExecutionPlan for AggregateExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let mut me = AggregateExec::try_new(
+        let mut me = AggregateExec::try_new_with_schema(
             self.mode,
             self.group_by.clone(),
             self.aggr_expr.clone(),
             self.filter_expr.clone(),
             children[0].clone(),
             self.input_schema.clone(),
+            self.schema.clone(),
+            self.original_schema.clone(),
         )?;
         me.limit = self.limit;
         Ok(Arc::new(me))

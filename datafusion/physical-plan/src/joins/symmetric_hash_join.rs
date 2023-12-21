@@ -1,3 +1,10 @@
+// This file contains both Apache Software Foundation (ASF) licensed code as
+// well as Synnada, Inc. extensions. Changes that constitute Synnada, Inc.
+// extensions are available in the SYNNADA-CONTRIBUTIONS.txt file. Synnada, Inc.
+// claims copyright only for Synnada, Inc. extensions. The license notice
+// applicable to non-Synnada sections of the file is given below.
+// --
+//
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -42,7 +49,7 @@ use crate::{
             combine_two_batches, get_pruning_anti_indices, get_pruning_semi_indices,
             prepare_sorted_exprs, record_visited_indices, EagerJoinStream,
             EagerJoinStreamState, PruningJoinHashMap, SortedFilterExpr,
-            StreamJoinStateResult,
+            StreamJoinMetrics, StreamJoinStateResult,
         },
         utils::{
             build_batch_from_indices, build_join_schema, check_join_is_valid,
@@ -1124,12 +1131,12 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::joins::test_utils::complicated_4_column_exprs;
     use crate::joins::test_utils::{
         aggregative_hash_join_with_filter, build_sides_record_batches, compare_batches,
-        complicated_filter, create_memory_table, join_expr_tests_fixture_f64,
-        join_expr_tests_fixture_i32, join_expr_tests_fixture_temporal,
-        partitioned_sym_join_with_filter, split_record_batches,
+        complicated_4_column_exprs, complicated_filter, create_memory_table,
+        join_expr_tests_fixture_f64, join_expr_tests_fixture_i32,
+        join_expr_tests_fixture_temporal, partitioned_sym_join_with_filter,
+        split_record_batches,
     };
 
     use arrow::compute::SortOptions;

@@ -1,3 +1,33 @@
+<!--
+Before opening a PR. Make sure following points are double-checked
+-- Make sure `cargo fmt` is done.
+-- Make sure `bash dev/rust_lint.sh` successfully runs.
+-- Make sure `cargo test` passes from all tests.
+-- Make sure there are wide-ranging unit tests, integration tests, end-to-end tests for the added functionality.
+-- Make sure there is no merge conflict with target branch.
+-- If there are sections in the code, that can be written as function do so
+     Especially, if these sections are 
+      - occur multiple times,
+      - line number is more than > 20 approximately.
+-- The code added doesn't contain unnecessary `.clone`s.
+-- The code added doesn't contain naked `unwrap`s.
+-- Make sure imports are consistent. Imports should be in following order
+    - Standart library imports (alphabetically ordered within this group)
+    - Arrow/ Datafusion imports (alphabetically ordered within this group)
+    - #rd Party libraries (alphabetically ordered within this group)
+    where each group is seperated by an empty line.
+    
+-- Inspect your attributes to what needs to be public, do not expose something if it is not used elsewhere.
+-- Make sure that the docstrings of the newly added code blocks are not missing.
+-- Read through comments whether they are clear, and grammatically correct.
+-- Look for whether for loops can be re-written as iterator. Be pro-functional style.
+-- Do not use short names such as `res`, `elem`, instead use `result`, `item`, etc.
+-- For short and common functions use namespace with it to be explicit.
+   (such as instead of `min`, `max`, use `std::cmp::min`, `std::cmp::max` etc.)
+-- Add necessary license notice for the added code that will remain in the Synnada repo.
+-- Make sure the PR body is understandable and summarizes the topic well.
+-- You can use CHATGPT to convert code to idimatic style, to generate documentation.
+-->
 ## Which issue does this PR close?
 
 <!--

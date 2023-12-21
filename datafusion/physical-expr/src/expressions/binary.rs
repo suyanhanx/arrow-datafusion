@@ -1,3 +1,10 @@
+// This file contains both Apache Software Foundation (ASF) licensed code as
+// well as Synnada, Inc. extensions. Changes that constitute Synnada, Inc.
+// extensions are available in the SYNNADA-CONTRIBUTIONS.txt file. Synnada, Inc.
+// claims copyright only for Synnada, Inc. extensions. The license notice
+// applicable to non-Synnada sections of the file is given below.
+// --
+//
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -14,11 +21,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-
-// This file contains both Apache Software Foundation copyrighted code
-// as well as Synnada, Inc. extensions.
-// Synnada, Inc. extensions start with commit 152a6e5df3d1528a81a1a9d7f103fd3646c2fb84.
-// Synnada, Inc. claims copyright only for Synnada, Inc. extensions.
 
 mod kernels;
 
