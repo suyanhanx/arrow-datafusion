@@ -31,9 +31,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::{fmt, usize};
 
-use crate::joins::utils::{JoinFilter, JoinHashMapType, StatefulStreamResult};
+use crate::joins::utils::{ColumnIndex, JoinFilter, JoinHashMapType};
 use crate::metrics::{ExecutionPlanMetricsSet, MetricBuilder};
-use crate::{handle_async_state, handle_state, metrics};
+use crate::{handle_async_state, metrics, ExecutionPlan};
 
 use arrow::compute::concat_batches;
 use arrow_array::{
@@ -55,671 +55,6 @@ use async_trait::async_trait;
 use futures::{ready, FutureExt, StreamExt};
 use hashbrown::raw::RawTable;
 use hashbrown::HashSet;
-
-/// Implementation of `JoinHashMapType` for `PruningJoinHashMap`.
-impl JoinHashMapType for PruningJoinHashMap {
-    type NextType = VecDeque<u64>;
-
-    // Extend with zero
-    fn extend_zero(&mut self, len: usize) {
-        self.next.resize(self.next.len() + len, 0)
-    }
-
-    /// Get mutable references to the hash map and the next.
-    fn get_mut(&mut self) -> (&mut RawTable<(u64, u64)>, &mut Self::NextType) {
-        (&mut self.map, &mut self.next)
-    }
-
-    /// Get a reference to the hash map.
-    fn get_map(&self) -> &RawTable<(u64, u64)> {
-        &self.map
-    }
-
-    /// Get a reference to the next.
-    fn get_list(&self) -> &Self::NextType {
-        &self.next
-    }
-}
-
-/// The `PruningJoinHashMap` is similar to a regular `JoinHashMap`, but with
-/// the capability of pruning elements in an efficient manner. This structure
-/// is particularly useful for cases where it's necessary to remove elements
-/// from the map based on their buffer order.
-///
-/// # Example
-///
-/// ``` text
-/// Let's continue the example of `JoinHashMap` and then show how `PruningJoinHashMap` would
-/// handle the pruning scenario.
-///
-/// Insert the pair (10,4) into the `PruningJoinHashMap`:
-/// map:
-/// ----------
-/// | 10 | 5 |
-/// | 20 | 3 |
-/// ----------
-/// list:
-/// ---------------------
-/// | 0 | 0 | 0 | 2 | 4 | <--- hash value 10 maps to 5,4,2 (which means indices values 4,3,1)
-/// ---------------------
-///
-/// Now, let's prune 3 rows from `PruningJoinHashMap`:
-/// map:
-/// ---------
-/// | 1 | 5 |
-/// ---------
-/// list:
-/// ---------
-/// | 2 | 4 | <--- hash value 10 maps to 2 (5 - 3), 1 (4 - 3), NA (2 - 3) (which means indices values 1,0)
-/// ---------
-///
-/// After pruning, the | 2 | 3 | entry is deleted from `PruningJoinHashMap` since
-/// there are no values left for this key.
-/// ```
-pub struct PruningJoinHashMap {
-    /// Stores hash value to last row index
-    pub map: RawTable<(u64, u64)>,
-    /// Stores indices in chained list data structure
-    pub next: VecDeque<u64>,
-}
-
-impl PruningJoinHashMap {
-    /// Constructs a new `PruningJoinHashMap` with the given capacity.
-    /// Both the map and the list are pre-allocated with the provided capacity.
-    ///
-    /// # Arguments
-    /// * `capacity`: The initial capacity of the hash map.
-    ///
-    /// # Returns
-    /// A new instance of `PruningJoinHashMap`.
-    pub(crate) fn with_capacity(capacity: usize) -> Self {
-        PruningJoinHashMap {
-            map: RawTable::with_capacity(capacity),
-            next: VecDeque::with_capacity(capacity),
-        }
-    }
-
-    /// Shrinks the capacity of the hash map, if necessary, based on the
-    /// provided scale factor.
-    ///
-    /// # Arguments
-    /// * `scale_factor`: The scale factor that determines how conservative the
-    ///   shrinking strategy is. The capacity will be reduced by 1/`scale_factor`
-    ///   when necessary.
-    ///
-    /// # Note
-    /// Increasing the scale factor results in less aggressive capacity shrinking,
-    /// leading to potentially higher memory usage but fewer resizes. Conversely,
-    /// decreasing the scale factor results in more aggressive capacity shrinking,
-    /// potentially leading to lower memory usage but more frequent resizing.
-    pub(crate) fn shrink_if_necessary(&mut self, scale_factor: usize) {
-        let capacity = self.map.capacity();
-
-        if capacity > scale_factor * self.map.len() {
-            let new_capacity = (capacity * (scale_factor - 1)) / scale_factor;
-            // Resize the map with the new capacity.
-            self.map.shrink_to(new_capacity, |(hash, _)| *hash)
-        }
-    }
-
-    /// Calculates the size of the `PruningJoinHashMap` in bytes.
-    ///
-    /// # Returns
-    /// The size of the hash map in bytes.
-    pub(crate) fn size(&self) -> usize {
-        self.map.allocation_info().1.size()
-            + self.next.capacity() * std::mem::size_of::<u64>()
-    }
-
-    /// Removes hash values from the map and the list based on the given pruning
-    /// length and deleting offset.
-    ///
-    /// # Arguments
-    /// * `prune_length`: The number of elements to remove from the list.
-    /// * `deleting_offset`: The offset used to determine which hash values to remove from the map.
-    ///
-    /// # Returns
-    /// A `Result` indicating whether the operation was successful.
-    pub(crate) fn prune_hash_values(
-        &mut self,
-        prune_length: usize,
-        deleting_offset: u64,
-        shrink_factor: usize,
-    ) -> Result<()> {
-        // Remove elements from the list based on the pruning length.
-        self.next.drain(0..prune_length);
-
-        // Calculate the keys that should be removed from the map.
-        let removable_keys = unsafe {
-            self.map
-                .iter()
-                .map(|bucket| bucket.as_ref())
-                .filter_map(|(hash, tail_index)| {
-                    (*tail_index < prune_length as u64 + deleting_offset).then_some(*hash)
-                })
-                .collect::<Vec<_>>()
-        };
-
-        // Remove the keys from the map.
-        removable_keys.into_iter().for_each(|hash_value| {
-            self.map
-                .remove_entry(hash_value, |(hash, _)| hash_value == *hash);
-        });
-
-        // Shrink the map if necessary.
-        self.shrink_if_necessary(shrink_factor);
-        Ok(())
-    }
-}
-
-pub fn check_filter_expr_contains_sort_information(
-    expr: &Arc<dyn PhysicalExpr>,
-    reference: &Arc<dyn PhysicalExpr>,
-) -> bool {
-    expr.eq(reference)
-        || expr
-            .children()
-            .iter()
-            .any(|e| check_filter_expr_contains_sort_information(e, reference))
-}
-
-/// Create a one to one mapping from main columns to filter columns using
-/// filter column indices. A column index looks like:
-/// ```text
-/// ColumnIndex {
-///     index: 0, // field index in main schema
-///     side: JoinSide::Left, // child side
-/// }
-/// ```
-pub fn map_origin_col_to_filter_col(
-    filter: &JoinFilter,
-    schema: &SchemaRef,
-    side: &JoinSide,
-) -> Result<HashMap<Column, Column>> {
-    let filter_schema = filter.schema();
-    let mut col_to_col_map: HashMap<Column, Column> = HashMap::new();
-    for (filter_schema_index, index) in filter.column_indices().iter().enumerate() {
-        if index.side.eq(side) {
-            // Get the main field from column index:
-            let main_field = schema.field(index.index);
-            // Create a column expression:
-            let main_col = Column::new_with_schema(main_field.name(), schema.as_ref())?;
-            // Since the order of by filter.column_indices() is the same with
-            // that of intermediate schema fields, we can get the column directly.
-            let filter_field = filter_schema.field(filter_schema_index);
-            let filter_col = Column::new(filter_field.name(), filter_schema_index);
-            // Insert mapping:
-            col_to_col_map.insert(main_col, filter_col);
-        }
-    }
-    Ok(col_to_col_map)
-}
-
-/// This function analyzes [`PhysicalSortExpr`] graphs with respect to monotonicity
-/// (sorting) properties. This is necessary since monotonically increasing and/or
-/// decreasing expressions are required when using join filter expressions for
-/// data pruning purposes.
-///
-/// The method works as follows:
-/// 1. Collect all globally ordered (the first expression in lexical ordering) expressions with
-/// [`EquivalenceProperties`]
-/// 2. Maps the original columns to the filter columns using the [`map_origin_col_to_filter_col`] function.
-/// 3. Constructs an intermediate schema from the filter columns included in the particular join side.
-/// For each [`PhysicalSortExpr`]
-///     1. Collects all columns in the sort expression using the [`collect_columns`] function.
-///     2. Checks if all columns are included in the map we obtain in the first step.
-///     3. If all columns are included, the sort expression is converted into a filter expression using
-///        the [`convert_filter_columns`] function.
-///     4. Searches for the converted filter expression in the filter expression using the
-///        [`check_filter_expr_contains_sort_information`] function.
-///     5. If an exact match is found,
-///         a. Convert the ordering into both filter schema and and intermediate schema columns.
-///         b. Returns the converted filter expressions as [`SortedFilterExpr`]
-///     6. If all columns are not included or an exact match is not found, returns [`None`].
-///
-/// Examples:
-/// Consider the filter expression "a + b > c + 10 AND a + b < c + 100".
-/// 1. If the expression "a@ + d@" is sorted, it will not be accepted since the "d@" column is not part of the filter.
-/// 2. If the expression "d@" is sorted, it will not be accepted since the "d@" column is not part of the filter.
-/// 3. If the expression "a@ + b@ + c@" is sorted, all columns are represented in the filter expression. However,
-///    there is no exact match, so this expression does not indicate pruning.
-pub fn build_filter_input_order(
-    side: JoinSide,
-    filter: &JoinFilter,
-    schema: &SchemaRef,
-    sort_expr: &PhysicalSortExpr,
-    equivalence_properties: &EquivalenceProperties,
-) -> Result<Vec<SortedFilterExpr>> {
-    let mut additional_sort_exprs: HashSet<PhysicalSortExpr> = HashSet::new();
-    additional_sort_exprs.insert(sort_expr.clone());
-
-    for ordering in equivalence_properties.oeq_class().iter() {
-        additional_sort_exprs.insert(ordering[0].clone());
-    }
-    let mut temp_sort_exprs = vec![];
-    for global_sort in &additional_sort_exprs {
-        for class in equivalence_properties.eq_group().iter() {
-            if class.contains(&global_sort.expr) {
-                let sort_exprs = class.iter().map(|expr| PhysicalSortExpr {
-                    expr: expr.clone(),
-                    options: global_sort.options,
-                });
-                temp_sort_exprs.extend(sort_exprs)
-            }
-        }
-    }
-
-    additional_sort_exprs.extend(temp_sort_exprs);
-
-    let column_map = map_origin_col_to_filter_col(filter, schema, &side)?;
-    let intermediate_schema = get_filter_representation_schema_of_build_side(
-        filter.schema(),
-        filter.column_indices(),
-        side,
-    )?;
-    let sorted_filter_exprs = additional_sort_exprs
-        .into_iter()
-        .map(|sort_expr| {
-            let expr = sort_expr.expr.clone();
-            // Get main schema columns:
-            let expr_columns = collect_columns(&expr);
-            // Calculation is possible with `column_map` since sort exprs belong to a child.
-            let all_columns_are_included =
-                expr_columns.iter().all(|col| column_map.contains_key(col));
-            if all_columns_are_included {
-                // Since we are sure that one to one column mapping includes all columns, we convert
-                // the sort expression into a filter expression.
-                let converted_filter_expr = expr.transform_up(&|p| {
-                    convert_filter_columns(p.as_ref(), &column_map).map(|transformed| {
-                        match transformed {
-                            Some(transformed) => Transformed::Yes(transformed),
-                            None => Transformed::No(p),
-                        }
-                    })
-                })?;
-                // Search the converted `PhysicalExpr` in filter expression; if an exact
-                // match is found, use this sorted expression in graph traversals.
-                if check_filter_expr_contains_sort_information(
-                    filter.expression(),
-                    &converted_filter_expr,
-                ) {
-                    let build_side_intermediate_expr =
-                        converted_filter_expr.clone().transform_up(&|expr| {
-                            if let Some(col) = expr.as_any().downcast_ref::<Column>() {
-                                let intermediate_expr = Arc::new(Column::new_with_schema(
-                                    col.name(),
-                                    &intermediate_schema,
-                                )?)
-                                    as _;
-                                Ok(Transformed::Yes(intermediate_expr))
-                            } else {
-                                Ok(Transformed::No(expr))
-                            }
-                        })?;
-                    return Ok(Some(SortedFilterExpr::new(
-                        PhysicalSortExpr {
-                            expr: converted_filter_expr.clone(),
-                            options: sort_expr.options,
-                        },
-                        build_side_intermediate_expr,
-                    )));
-                }
-            }
-            Ok(None)
-        })
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
-        .collect();
-
-    Ok(sorted_filter_exprs)
-}
-
-/// Convert a physical expression into a filter expression using the given
-/// column mapping information.
-fn convert_filter_columns(
-    input: &dyn PhysicalExpr,
-    column_map: &HashMap<Column, Column>,
-) -> Result<Option<Arc<dyn PhysicalExpr>>> {
-    // Attempt to downcast the input expression to a Column type.
-    Ok(if let Some(col) = input.as_any().downcast_ref::<Column>() {
-        // If the downcast is successful, retrieve the corresponding filter column.
-        column_map.get(col).map(|c| Arc::new(c.clone()) as _)
-    } else {
-        // If the downcast fails, return the input expression as is.
-        None
-    })
-}
-
-impl Display for SortedFilterExpr {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(
-            f,
-            "filter_expr: {}, int_filter_expr: {}, interval: {}",
-            self.filter_expr, self.intermediate_batch_filter_expr, self.interval
-        )
-    }
-}
-
-/// Represents an ordered expression within a filter expression.
-///
-/// `SortedFilterExpr` is used to manage details related to ordered expressions
-/// within filter expressions during a join operation. It consists of four main
-/// components:
-///
-/// 1. `filter_expr`: Represents the ordered expression within the filter. This is
-///    represented as a `PhysicalSortExpr` which specifies the column and the corresponding
-///    column index that are part of the expression, as well as any options associated with sorting.
-/// 2. `intermediate_batch_filter_expr`: This is an intermediate representation of the build-side
-///    expression that is derived from the original filter expression. The build-side expression
-///    is the version of the expression that is used to evaluate intermediate batches of data during
-///    the join operation. It specifies the column and the corresponding column index within
-///    the intermediate batch.
-/// 3. `interval`: This stores the interval associated with the filter expression.
-/// 4. `node_index`: This stores the node index of the filter expression within the `ExprIntervalGraph`.
-///
-/// It is important to note that the column index in `filter_expr` is based on the original
-/// schema, while the column index in `intermediate_batch_filter_expr` is based on the intermediate
-/// batch schema, which can differ from the original schema. The intermediate batch is created
-/// during the join operation, containing columns only from one side of the join. As a result,
-/// the column indexes in the intermediate batch may differ from those in the original schema.
-///
-/// This distinction is crucial because it ensures that the correct columns are referenced during
-/// the join operation, and that the intermediate batch correctly reflects the structure of the
-/// data at that stage of the join process.
-#[derive(Debug, Clone)]
-pub struct SortedFilterExpr {
-    /// Ordered filter expression
-    filter_expr: PhysicalSortExpr,
-    /// Expression adjusted for filter schema projected by build side.
-    /// Only the column indexes are changed.
-    intermediate_batch_filter_expr: Arc<dyn PhysicalExpr>,
-    /// Interval containing expression bounds
-    interval: Interval,
-    /// Node index in the expression DAG
-    node_index: usize,
-}
-
-impl SortedFilterExpr {
-    /// Constructor
-    pub fn new(
-        filter_expr: PhysicalSortExpr,
-        intermediate_batch_filter_expr: Arc<dyn PhysicalExpr>,
-    ) -> Self {
-        Self {
-            filter_expr,
-            intermediate_batch_filter_expr,
-            interval: Interval::default(),
-            node_index: 0,
-        })
-    }
-    /// Get intermediate_batch_filter_expr
-    pub fn intermediate_batch_filter_expr(&self) -> Arc<dyn PhysicalExpr> {
-        self.intermediate_batch_filter_expr.clone()
-    }
-
-    /// Get intermediate_batch_filter_expr
-    pub fn order(&self) -> SortOptions {
-        self.filter_expr.options
-    }
-
-    /// Get filter expr information
-    pub fn filter_expr(&self) -> &PhysicalSortExpr {
-        &self.filter_expr
-    }
-    /// Get interval information
-    pub fn interval(&self) -> &Interval {
-        &self.interval
-    }
-    /// Sets interval
-    pub fn set_interval(&mut self, interval: Interval) {
-        self.interval = interval;
-    }
-    /// Node index in ExprIntervalGraph
-    pub fn node_index(&self) -> usize {
-        self.node_index
-    }
-    /// Node index setter in ExprIntervalGraph
-    pub fn set_node_index(&mut self, node_index: usize) {
-        self.node_index = node_index;
-    }
-}
-
-/// Calculate the filter expression intervals.
-///
-/// This function updates the `interval` field of each `SortedFilterExpr` based
-/// on the first or the last value of the expression in `build_input_buffer`
-/// and `probe_batch`.
-///
-/// # Arguments
-///
-/// * `build_input_buffer` - The [RecordBatch] on the build side of the join.
-/// * `build_sorted_filter_expr` - Build side [SortedFilterExpr] to update.
-/// * `probe_batch` - The `RecordBatch` on the probe side of the join.
-/// * `probe_sorted_filter_expr` - Probe side `SortedFilterExpr` to update.
-///
-/// ### Note
-/// ```text
-///
-/// Interval arithmetic is used to calculate viable join ranges for build-side
-/// pruning. This is done by first creating an interval for join filter values in
-/// the build side of the join, which spans [-∞, FV] or [FV, ∞] depending on the
-/// ordering (descending/ascending) of the filter expression. Here, FV denotes the
-/// first value on the build side. This range is then compared with the probe side
-/// interval, which either spans [-∞, LV] or [LV, ∞] depending on the ordering
-/// (ascending/descending) of the probe side. Here, LV denotes the last value on
-/// the probe side.
-///
-/// As a concrete example, consider the following query:
-///
-///   SELECT * FROM left_table, right_table
-///   WHERE
-///     left_key = right_key AND
-///     a > b - 3 AND
-///     a < b + 10
-///
-/// where columns "a" and "b" come from tables "left_table" and "right_table",
-/// respectively. When a new `RecordBatch` arrives at the right side, the
-/// condition a > b - 3 will possibly indicate a prunable range for the left
-/// side. Conversely, when a new `RecordBatch` arrives at the left side, the
-/// condition a < b + 10 will possibly indicate prunability for the right side.
-/// Let’s inspect what happens when a new RecordBatch` arrives at the right
-/// side (i.e. when the left side is the build side):
-///
-///         Build      Probe
-///       +-------+  +-------+
-///       | a | z |  | b | y |
-///       |+--|--+|  |+--|--+|
-///       | 1 | 2 |  | 4 | 3 |
-///       |+--|--+|  |+--|--+|
-///       | 3 | 1 |  | 4 | 3 |
-///       |+--|--+|  |+--|--+|
-///       | 5 | 7 |  | 6 | 1 |
-///       |+--|--+|  |+--|--+|
-///       | 7 | 1 |  | 6 | 3 |
-///       +-------+  +-------+
-///
-/// In this case, the interval representing viable (i.e. joinable) values for
-/// column "a" is [1, ∞], and the interval representing possible future values
-/// for column "b" is [6, ∞]. With these intervals at hand, we next calculate
-/// intervals for the whole filter expression and propagate join constraint by
-/// traversing the expression graph.
-/// ```
-pub fn calculate_filter_expr_intervals(
-    filter: &JoinFilter,
-    build_input_buffer: &RecordBatch,
-    build_sorted_filter_exprs: &mut [SortedFilterExpr],
-    probe_batch: &RecordBatch,
-    probe_sorted_filter_exprs: &mut [SortedFilterExpr],
-    build_side: JoinSide,
-) -> Result<()> {
-    // If either build or probe side has no data, return early:
-    if build_input_buffer.num_rows() == 0 || probe_batch.num_rows() == 0 {
-        return Ok(());
-    }
-    let build_intermediate_batch = get_filter_representation_of_build_side(
-        filter.schema(),
-        &build_input_buffer.slice(0, 1),
-        filter.column_indices(),
-        build_side,
-    )?;
-    // println!("++++ Build side");
-    // print_batches(&[build_intermediate_batch.clone()])?;
-    // println!("build_sorted_filter_exprs {:?}", build_sorted_filter_exprs[0].intermediate_batch_filter_expr);
-    // Calculate the interval for the build side filter expression (if present):
-    update_filter_expr_interval(&build_intermediate_batch, build_sorted_filter_exprs)?;
-    let probe_intermediate_batch = get_filter_representation_of_build_side(
-        filter.schema(),
-        &probe_batch.slice(probe_batch.num_rows() - 1, 1),
-        filter.column_indices(),
-        build_side.negate(),
-    )?;
-    // println!("++++ Probe side");
-    // print_batches(&[probe_intermediate_batch.clone()])?;
-    // println!("probe_sorted_filter_exprs {:?}", probe_sorted_filter_exprs[0].intermediate_batch_filter_expr);
-    // Calculate the interval for the probe side filter expression (if present):
-    update_filter_expr_interval(&probe_intermediate_batch, probe_sorted_filter_exprs)
-}
-
-/// This is a subroutine of the function [`calculate_filter_expr_intervals`].
-/// It constructs the current interval using the given `batch` and updates
-/// the filter expression (i.e. `sorted_expr`) with this interval.
-pub fn update_filter_expr_interval(
-    batch: &RecordBatch,
-    sorted_exprs: &mut [SortedFilterExpr],
-) -> Result<()> {
-    sorted_exprs.iter_mut().try_for_each(|sorted_expr| {
-        // Evaluate the filter expression and convert the result to an array:
-        let array = sorted_expr
-            .intermediate_batch_filter_expr()
-            .evaluate(batch)?
-            .into_array(1)?;
-        // Convert the array to a ScalarValue:
-        let value = ScalarValue::try_from_array(&array, 0)?;
-        // Create a ScalarValue representing positive or negative infinity for the same data type:
-        let unbounded = IntervalBound::make_unbounded(value.data_type())?;
-        // Update the interval with lower and upper bounds based on the sort option:
-        let interval = if sorted_expr.order().descending {
-            Interval::new(unbounded, IntervalBound::new(value, false))
-        } else {
-            Interval::new(IntervalBound::new(value, false), unbounded)
-        };
-        // Set the calculated interval for the sorted filter expression:
-        sorted_expr.set_interval(interval);
-        Ok(())
-    })
-}
-
-/// Get the anti join indices from the visited hash set.
-///
-/// This method returns the indices from the original input that were not present in the visited hash set.
-///
-/// # Arguments
-///
-/// * `prune_length` - The length of the pruned record batch.
-/// * `deleted_offset` - The offset to the indices.
-/// * `visited_rows` - The hash set of visited indices.
-///
-/// # Returns
-///
-/// A `PrimitiveArray` of the anti join indices.
-pub fn get_pruning_anti_indices<T: ArrowPrimitiveType>(
-    prune_length: usize,
-    deleted_offset: usize,
-    visited_rows: &HashSet<usize>,
-) -> PrimitiveArray<T>
-where
-    NativeAdapter<T>: From<<T as ArrowPrimitiveType>::Native>,
-{
-    let mut bitmap = BooleanBufferBuilder::new(prune_length);
-    bitmap.append_n(prune_length, false);
-    // mark the indices as true if they are present in the visited hash set
-    for v in 0..prune_length {
-        let row = v + deleted_offset;
-        bitmap.set_bit(v, visited_rows.contains(&row));
-    }
-    // get the anti index
-    (0..prune_length)
-        .filter_map(|idx| (!bitmap.get_bit(idx)).then_some(T::Native::from_usize(idx)))
-        .collect()
-}
-
-/// This method creates a boolean buffer from the visited rows hash set
-/// and the indices of the pruned record batch slice.
-///
-/// It gets the indices from the original input that were present in the visited hash set.
-///
-/// # Arguments
-///
-/// * `prune_length` - The length of the pruned record batch.
-/// * `deleted_offset` - The offset to the indices.
-/// * `visited_rows` - The hash set of visited indices.
-///
-/// # Returns
-///
-/// A [PrimitiveArray] of the specified type T, containing the semi indices.
-pub fn get_pruning_semi_indices<T: ArrowPrimitiveType>(
-    prune_length: usize,
-    deleted_offset: usize,
-    visited_rows: &HashSet<usize>,
-) -> PrimitiveArray<T>
-where
-    NativeAdapter<T>: From<<T as ArrowPrimitiveType>::Native>,
-{
-    let mut bitmap = BooleanBufferBuilder::new(prune_length);
-    bitmap.append_n(prune_length, false);
-    // mark the indices as true if they are present in the visited hash set
-    (0..prune_length).for_each(|v| {
-        let row = &(v + deleted_offset);
-        bitmap.set_bit(v, visited_rows.contains(row));
-    });
-    // get the semi index
-    (0..prune_length)
-        .filter_map(|idx| (bitmap.get_bit(idx)).then_some(T::Native::from_usize(idx)))
-        .collect::<PrimitiveArray<T>>()
-}
-
-pub fn combine_two_batches(
-    output_schema: &SchemaRef,
-    left_batch: Option<RecordBatch>,
-    right_batch: Option<RecordBatch>,
-) -> Result<Option<RecordBatch>> {
-    match (left_batch, right_batch) {
-        (Some(batch), None) | (None, Some(batch)) => {
-            // If only one of the batches are present, return it:
-            Ok(Some(batch))
-        }
-        (Some(left_batch), Some(right_batch)) => {
-            // If both batches are present, concatenate them:
-            concat_batches(output_schema, &[left_batch, right_batch])
-                .map_err(DataFusionError::ArrowError)
-                .map(Some)
-        }
-        (None, None) => {
-            // If neither is present, return an empty batch:
-            Ok(None)
-        }
-    }
-}
-
-/// Records the visited indices from the input `PrimitiveArray` of type `T` into the given hash set `visited`.
-/// This function will insert the indices (offset by `offset`) into the `visited` hash set.
-///
-/// # Arguments
-///
-/// * `visited` - A hash set to store the visited indices.
-/// * `offset` - An offset to the indices in the `PrimitiveArray`.
-/// * `indices` - The input `PrimitiveArray` of type `T` which stores the indices to be recorded.
-///
-pub fn record_visited_indices<T: ArrowPrimitiveType>(
-    visited: &mut HashSet<usize>,
-    offset: usize,
-    indices: &PrimitiveArray<T>,
-) {
-    for i in indices.values() {
-        visited.insert(i.as_usize() + offset);
-    }
-}
 
 /// The `handle_state` macro is designed to process the result of a state-changing
 /// operation, typically encountered in implementations of `EagerJoinStream`. It
@@ -916,14 +251,14 @@ pub trait EagerJoinStream {
     ///
     /// # Returns
     ///
-    /// * `Result<StatefulStreamResult<Option<RecordBatch>>>` - The state result after pulling the batch.
+    /// * `Result<StreamJoinStateResult<Option<RecordBatch>>>` - The state result after pulling the batch.
     async fn fetch_next_from_right_stream(
         &mut self,
-    ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
+    ) -> Result<StreamJoinStateResult<Option<RecordBatch>>> {
         match self.right_stream().next().await {
             Some(Ok(batch)) => {
                 if batch.num_rows() == 0 {
-                    return Ok(StatefulStreamResult::Continue);
+                    return Ok(StreamJoinStateResult::Continue);
                 }
                 self.set_state(EagerJoinStreamState::PullLeft);
                 self.process_batch_from_right(batch)
@@ -931,7 +266,7 @@ pub trait EagerJoinStream {
             Some(Err(e)) => Err(e),
             None => {
                 self.set_state(EagerJoinStreamState::RightExhausted);
-                Ok(StatefulStreamResult::Continue)
+                Ok(StreamJoinStateResult::Continue)
             }
         }
     }
@@ -944,14 +279,14 @@ pub trait EagerJoinStream {
     ///
     /// # Returns
     ///
-    /// * `Result<StatefulStreamResult<Option<RecordBatch>>>` - The state result after pulling the batch.
+    /// * `Result<StreamJoinStateResult<Option<RecordBatch>>>` - The state result after pulling the batch.
     async fn fetch_next_from_left_stream(
         &mut self,
-    ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
+    ) -> Result<StreamJoinStateResult<Option<RecordBatch>>> {
         match self.left_stream().next().await {
             Some(Ok(batch)) => {
                 if batch.num_rows() == 0 {
-                    return Ok(StatefulStreamResult::Continue);
+                    return Ok(StreamJoinStateResult::Continue);
                 }
                 self.set_state(EagerJoinStreamState::PullRight);
                 self.process_batch_from_left(batch)
@@ -959,7 +294,7 @@ pub trait EagerJoinStream {
             Some(Err(e)) => Err(e),
             None => {
                 self.set_state(EagerJoinStreamState::LeftExhausted);
-                Ok(StatefulStreamResult::Continue)
+                Ok(StreamJoinStateResult::Continue)
             }
         }
     }
@@ -973,14 +308,14 @@ pub trait EagerJoinStream {
     ///
     /// # Returns
     ///
-    /// * `Result<StatefulStreamResult<Option<RecordBatch>>>` - The state result after checking the exhaustion state.
+    /// * `Result<StreamJoinStateResult<Option<RecordBatch>>>` - The state result after checking the exhaustion state.
     async fn handle_right_stream_end(
         &mut self,
-    ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
+    ) -> Result<StreamJoinStateResult<Option<RecordBatch>>> {
         match self.left_stream().next().await {
             Some(Ok(batch)) => {
                 if batch.num_rows() == 0 {
-                    return Ok(StatefulStreamResult::Continue);
+                    return Ok(StreamJoinStateResult::Continue);
                 }
                 self.process_batch_after_right_end(batch)
             }
@@ -989,7 +324,7 @@ pub trait EagerJoinStream {
                 self.set_state(EagerJoinStreamState::BothExhausted {
                     final_result: false,
                 });
-                Ok(StatefulStreamResult::Continue)
+                Ok(StreamJoinStateResult::Continue)
             }
         }
     }
@@ -1003,14 +338,14 @@ pub trait EagerJoinStream {
     ///
     /// # Returns
     ///
-    /// * `Result<StatefulStreamResult<Option<RecordBatch>>>` - The state result after checking the exhaustion state.
+    /// * `Result<StreamJoinStateResult<Option<RecordBatch>>>` - The state result after checking the exhaustion state.
     async fn handle_left_stream_end(
         &mut self,
-    ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
+    ) -> Result<StreamJoinStateResult<Option<RecordBatch>>> {
         match self.right_stream().next().await {
             Some(Ok(batch)) => {
                 if batch.num_rows() == 0 {
-                    return Ok(StatefulStreamResult::Continue);
+                    return Ok(StreamJoinStateResult::Continue);
                 }
                 self.process_batch_after_left_end(batch)
             }
@@ -1019,7 +354,7 @@ pub trait EagerJoinStream {
                 self.set_state(EagerJoinStreamState::BothExhausted {
                     final_result: false,
                 });
-                Ok(StatefulStreamResult::Continue)
+                Ok(StreamJoinStateResult::Continue)
             }
         }
     }
@@ -1032,10 +367,10 @@ pub trait EagerJoinStream {
     ///
     /// # Returns
     ///
-    /// * `Result<StatefulStreamResult<Option<RecordBatch>>>` - The state result after both streams are exhausted.
+    /// * `Result<StreamJoinStateResult<Option<RecordBatch>>>` - The state result after both streams are exhausted.
     fn prepare_for_final_results_after_exhaustion(
         &mut self,
-    ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
+    ) -> Result<StreamJoinStateResult<Option<RecordBatch>>> {
         self.set_state(EagerJoinStreamState::BothExhausted { final_result: true });
         self.process_batches_before_finalization()
     }
@@ -1048,11 +383,11 @@ pub trait EagerJoinStream {
     ///
     /// # Returns
     ///
-    /// * `Result<StatefulStreamResult<Option<RecordBatch>>>` - The state result after processing the batch.
+    /// * `Result<StreamJoinStateResult<Option<RecordBatch>>>` - The state result after processing the batch.
     fn process_batch_from_right(
         &mut self,
         batch: RecordBatch,
-    ) -> Result<StatefulStreamResult<Option<RecordBatch>>>;
+    ) -> Result<StreamJoinStateResult<Option<RecordBatch>>>;
 
     /// Handles a pulled batch from the left stream.
     ///
@@ -1062,11 +397,11 @@ pub trait EagerJoinStream {
     ///
     /// # Returns
     ///
-    /// * `Result<StatefulStreamResult<Option<RecordBatch>>>` - The state result after processing the batch.
+    /// * `Result<StreamJoinStateResult<Option<RecordBatch>>>` - The state result after processing the batch.
     fn process_batch_from_left(
         &mut self,
         batch: RecordBatch,
-    ) -> Result<StatefulStreamResult<Option<RecordBatch>>>;
+    ) -> Result<StreamJoinStateResult<Option<RecordBatch>>>;
 
     /// Handles the situation when only the left stream is exhausted.
     ///
@@ -1076,11 +411,11 @@ pub trait EagerJoinStream {
     ///
     /// # Returns
     ///
-    /// * `Result<StatefulStreamResult<Option<RecordBatch>>>` - The state result after the left stream is exhausted.
+    /// * `Result<StreamJoinStateResult<Option<RecordBatch>>>` - The state result after the left stream is exhausted.
     fn process_batch_after_left_end(
         &mut self,
         right_batch: RecordBatch,
-    ) -> Result<StatefulStreamResult<Option<RecordBatch>>>;
+    ) -> Result<StreamJoinStateResult<Option<RecordBatch>>>;
 
     /// Handles the situation when only the right stream is exhausted.
     ///
@@ -1090,20 +425,20 @@ pub trait EagerJoinStream {
     ///
     /// # Returns
     ///
-    /// * `Result<StatefulStreamResult<Option<RecordBatch>>>` - The state result after the right stream is exhausted.
+    /// * `Result<StreamJoinStateResult<Option<RecordBatch>>>` - The state result after the right stream is exhausted.
     fn process_batch_after_right_end(
         &mut self,
         left_batch: RecordBatch,
-    ) -> Result<StatefulStreamResult<Option<RecordBatch>>>;
+    ) -> Result<StreamJoinStateResult<Option<RecordBatch>>>;
 
     /// Handles the final state after both streams are exhausted.
     ///
     /// # Returns
     ///
-    /// * `Result<StatefulStreamResult<Option<RecordBatch>>>` - The final state result after processing.
+    /// * `Result<StreamJoinStateResult<Option<RecordBatch>>>` - The final state result after processing.
     fn process_batches_before_finalization(
         &mut self,
-    ) -> Result<StatefulStreamResult<Option<RecordBatch>>>;
+    ) -> Result<StreamJoinStateResult<Option<RecordBatch>>>;
 
     /// Provides mutable access to the right stream.
     ///

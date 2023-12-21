@@ -778,14 +778,14 @@ impl ExecutionPlan for AggregativeHashJoinExec {
         reservation.lock().try_grow(graph.size())?;
         let join_data = AggregativeHashJoinData {
             common_data: CommonJoinData {
+                left_sorted_filter_expr,
+                right_sorted_filter_expr,
                 probe_buffer: ProbeBuffer::new(self.right.schema(), on_right),
                 schema: self.schema(),
                 filter: self.filter.clone(),
                 join_type: self.join_type,
                 column_indices: self.column_indices.clone(),
                 graph,
-                left_sorted_filter_expr,
-                right_sorted_filter_expr,
                 reservation,
                 metrics,
             },

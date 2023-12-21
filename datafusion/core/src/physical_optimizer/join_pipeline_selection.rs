@@ -4339,12 +4339,13 @@ mod order_preserving_join_swap_tests {
 #[cfg(test)]
 mod sql_fuzzy_tests {
     use crate::common::Result;
+    use crate::datasource::stream::{StreamConfig, StreamTable};
     use crate::physical_plan::displayable;
     use crate::physical_plan::{collect, ExecutionPlan};
     use crate::prelude::{CsvReadOptions, SessionContext};
     use arrow::util::pretty::pretty_format_batches;
     use arrow_array::RecordBatch;
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use datafusion_execution::config::SessionConfig;
     use datafusion_expr::expr::Sort;
     use datafusion_expr::{col, Expr};
@@ -4409,6 +4410,44 @@ mod sql_fuzzy_tests {
             ]),
             _ => unimplemented!(),
         }
+    }
+
+    async fn register_current_csv(
+        ctx: &SessionContext,
+        table_name: &str,
+        table_path: &str,
+        ordered_col: &str,
+        infinite: bool,
+    ) -> Result<()> {
+        let schema = Arc::new(get_tpch_table_schema(table_name)) as SchemaRef;
+        let sort_exprs = vec![vec![Expr::Sort(Sort::new(
+            Box::new(col(ordered_col)),
+            true,
+            false,
+        ))]];
+        match infinite {
+            true => {
+                let config = StreamConfig::new_file(schema, table_path.into())
+                    .with_order(sort_exprs)
+                    .with_header(true);
+                ctx.register_table(
+                    table_name,
+                    Arc::new(StreamTable::new(Arc::new(config))),
+                )?;
+            }
+            false => {
+                ctx.register_csv(
+                    table_name,
+                    table_path,
+                    CsvReadOptions::new()
+                        .schema(&schema)
+                        .file_sort_order(sort_exprs),
+                )
+                .await?;
+            }
+        }
+
+        Ok(())
     }
 
     fn workspace_dir() -> String {
@@ -4484,17 +4523,13 @@ mod sql_fuzzy_tests {
         ];
 
         for (table, inf, ordered_col) in izip!(tables, can_be_infinite, ordered_columns) {
-            ctx.register_csv(
+            let table_path = format!("{}/{}.csv", abs_path, table);
+            register_current_csv(
+                &ctx,
                 table,
-                &format!("{}/{}.csv", abs_path, table),
-                CsvReadOptions::new()
-                    .schema(&get_tpch_table_schema(table))
-                    .mark_infinite(mark_infinite && inf)
-                    .file_sort_order(vec![vec![Expr::Sort(Sort::new(
-                        Box::new(col(ordered_col)),
-                        true,
-                        false,
-                    ))]]),
+                &table_path,
+                ordered_col,
+                mark_infinite && inf,
             )
             .await?;
         }
@@ -4584,14 +4619,14 @@ mod sql_fuzzy_tests {
             "        ProjectionExec: expr=[l_orderkey@0 as l_orderkey, l_suppkey@1 as l_suppkey, l_shipdate@3 as l_shipdate]",
             "          CoalesceBatchesExec: target_batch_size=8192",
             "            FilterExec: l_returnflag@2 = R",
-            "              CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/lineitem.csv]]}, projection=[l_orderkey, l_suppkey, l_returnflag, l_shipdate], infinite_source=true, output_ordering=[l_orderkey@0 ASC NULLS LAST], has_header=true",
+            "              StreamingTableExec: partition_sizes=1, projection=[l_orderkey, l_suppkey, l_returnflag, l_shipdate], infinite_source=true, output_ordering=[l_orderkey@0 ASC NULLS LAST]",
             "        ProjectionExec: expr=[o_orderkey@1 as o_orderkey, o_orderdate@2 as o_orderdate]",
             "          SortMergeJoin: join_type=Inner, on=[(c_custkey@0, o_orderkey@0)]",
             "            ProjectionExec: expr=[c_custkey@2 as c_custkey]",
             "              SlidingHashJoinExec: join_type=Inner, on=[(n_regionkey@1, c_nationkey@1)], filter=n_nationkey@1 > c_custkey@0 AND n_nationkey@1 < c_custkey@0 + 20",
-            "                CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/nation.csv]]}, projection=[n_nationkey, n_regionkey], infinite_source=true, output_ordering=[n_nationkey@0 ASC NULLS LAST], has_header=true",
-            "                CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/customer.csv]]}, projection=[c_custkey, c_nationkey], infinite_source=true, output_ordering=[c_custkey@0 ASC NULLS LAST], has_header=true",
-            "            CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/orders.csv]]}, projection=[o_orderkey, o_orderdate], infinite_source=true, output_ordering=[o_orderkey@0 ASC NULLS LAST], has_header=true",
+            "                StreamingTableExec: partition_sizes=1, projection=[n_nationkey, n_regionkey], infinite_source=true, output_ordering=[n_nationkey@0 ASC NULLS LAST]",
+            "                StreamingTableExec: partition_sizes=1, projection=[c_custkey, c_nationkey], infinite_source=true, output_ordering=[c_custkey@0 ASC NULLS LAST]",
+            "            StreamingTableExec: partition_sizes=1, projection=[o_orderkey, o_orderdate], infinite_source=true, output_ordering=[o_orderkey@0 ASC NULLS LAST]",
         ];
 
         experiment(&expected_plan, sql).await?;
@@ -4625,10 +4660,10 @@ mod sql_fuzzy_tests {
             "          SortMergeJoin: join_type=Inner, on=[(o_orderkey@0, c_custkey@0)]",
             "            ProjectionExec: expr=[o_orderkey@2 as o_orderkey]",
             "              SlidingHashJoinExec: join_type=Inner, on=[(l_shipdate@1, o_orderdate@1)], filter=l_orderkey@1 < o_orderkey@0 - 10 AND l_orderkey@1 > o_orderkey@0 + 10",
-            "                CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/lineitem.csv]]}, projection=[l_orderkey, l_shipdate], infinite_source=true, output_ordering=[l_orderkey@0 ASC NULLS LAST], has_header=true",
-            "                CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/orders.csv]]}, projection=[o_orderkey, o_orderdate], infinite_source=true, output_ordering=[o_orderkey@0 ASC NULLS LAST], has_header=true",
-            "            CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/customer.csv]]}, projection=[c_custkey, c_nationkey], infinite_source=true, output_ordering=[c_custkey@0 ASC NULLS LAST], has_header=true",
-            "        CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/nation.csv]]}, projection=[n_nationkey, n_regionkey], infinite_source=true, output_ordering=[n_nationkey@0 ASC NULLS LAST], has_header=true",
+            "                StreamingTableExec: partition_sizes=1, projection=[l_orderkey, l_shipdate], infinite_source=true, output_ordering=[l_orderkey@0 ASC NULLS LAST]",
+            "                StreamingTableExec: partition_sizes=1, projection=[o_orderkey, o_orderdate], infinite_source=true, output_ordering=[o_orderkey@0 ASC NULLS LAST]",
+            "            StreamingTableExec: partition_sizes=1, projection=[c_custkey, c_nationkey], infinite_source=true, output_ordering=[c_custkey@0 ASC NULLS LAST]",
+            "        StreamingTableExec: partition_sizes=1, projection=[n_nationkey, n_regionkey], infinite_source=true, output_ordering=[n_nationkey@0 ASC NULLS LAST]",
         ];
 
         experiment(&expected_plan, sql).await?;
@@ -4671,10 +4706,10 @@ mod sql_fuzzy_tests {
             "            SortMergeJoin: join_type=Inner, on=[(o_orderkey@0, c_custkey@0)]",
             "              ProjectionExec: expr=[o_orderkey@2 as o_orderkey]",
             "                SlidingHashJoinExec: join_type=Inner, on=[(l_shipdate@1, o_orderdate@1)], filter=l_orderkey@1 < o_orderkey@0 - 10 AND l_orderkey@1 > o_orderkey@0 + 10",
-            "                  CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/lineitem.csv]]}, projection=[l_orderkey, l_shipdate], infinite_source=true, output_ordering=[l_orderkey@0 ASC NULLS LAST], has_header=true",
-            "                  CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/orders.csv]]}, projection=[o_orderkey, o_orderdate], infinite_source=true, output_ordering=[o_orderkey@0 ASC NULLS LAST], has_header=true",
-            "              CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/customer.csv]]}, projection=[c_custkey, c_nationkey], infinite_source=true, output_ordering=[c_custkey@0 ASC NULLS LAST], has_header=true",
-            "          CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/nation.csv]]}, projection=[n_nationkey, n_regionkey], infinite_source=true, output_ordering=[n_nationkey@0 ASC NULLS LAST], has_header=true",
+            "                  StreamingTableExec: partition_sizes=1, projection=[l_orderkey, l_shipdate], infinite_source=true, output_ordering=[l_orderkey@0 ASC NULLS LAST]",
+            "                  StreamingTableExec: partition_sizes=1, projection=[o_orderkey, o_orderdate], infinite_source=true, output_ordering=[o_orderkey@0 ASC NULLS LAST]",
+            "              StreamingTableExec: partition_sizes=1, projection=[c_custkey, c_nationkey], infinite_source=true, output_ordering=[c_custkey@0 ASC NULLS LAST]",
+            "          StreamingTableExec: partition_sizes=1, projection=[n_nationkey, n_regionkey], infinite_source=true, output_ordering=[n_nationkey@0 ASC NULLS LAST]",
         ];
 
         experiment(&expected_plan, sql).await?;
@@ -4702,8 +4737,8 @@ mod sql_fuzzy_tests {
             "        ProjectionExec: expr=[l_orderkey@0 as l_orderkey, l_suppkey@1 as l_suppkey, l_shipdate@3 as l_shipdate]",
             "          CoalesceBatchesExec: target_batch_size=8192",
             "            FilterExec: l_returnflag@2 = R",
-            "              CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/lineitem.csv]]}, projection=[l_orderkey, l_suppkey, l_returnflag, l_shipdate], infinite_source=true, output_ordering=[l_orderkey@0 ASC NULLS LAST], has_header=true",
-            "        CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/orders.csv]]}, projection=[o_orderkey, o_orderdate], infinite_source=true, output_ordering=[o_orderkey@0 ASC NULLS LAST], has_header=true",
+            "              StreamingTableExec: partition_sizes=1, projection=[l_orderkey, l_suppkey, l_returnflag, l_shipdate], infinite_source=true, output_ordering=[l_orderkey@0 ASC NULLS LAST]",
+            "        StreamingTableExec: partition_sizes=1, projection=[o_orderkey, o_orderdate], infinite_source=true, output_ordering=[o_orderkey@0 ASC NULLS LAST]",
         ];
 
         experiment(&expected_plan, sql).await?;
@@ -4732,8 +4767,8 @@ mod sql_fuzzy_tests {
             "        ProjectionExec: expr=[l_orderkey@0 as l_orderkey, l_suppkey@1 as l_suppkey, l_shipdate@3 as l_shipdate]",
             "          CoalesceBatchesExec: target_batch_size=8192",
             "            FilterExec: l_returnflag@2 = R",
-            "              CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/lineitem.csv]]}, projection=[l_orderkey, l_suppkey, l_returnflag, l_shipdate], infinite_source=true, output_ordering=[l_orderkey@0 ASC NULLS LAST], has_header=true",
-            "        CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/orders.csv]]}, projection=[o_orderkey, o_orderdate], infinite_source=true, output_ordering=[o_orderkey@0 ASC NULLS LAST], has_header=true",
+            "              StreamingTableExec: partition_sizes=1, projection=[l_orderkey, l_suppkey, l_returnflag, l_shipdate], infinite_source=true, output_ordering=[l_orderkey@0 ASC NULLS LAST]",
+            "        StreamingTableExec: partition_sizes=1, projection=[o_orderkey, o_orderdate], infinite_source=true, output_ordering=[o_orderkey@0 ASC NULLS LAST]",
         ];
 
         experiment(&expected_plan, sql).await?;
@@ -4762,8 +4797,8 @@ mod sql_fuzzy_tests {
             "        ProjectionExec: expr=[l_orderkey@0 as l_orderkey, l_suppkey@1 as l_suppkey, l_shipdate@3 as l_shipdate]",
             "          CoalesceBatchesExec: target_batch_size=8192",
             "            FilterExec: l_returnflag@2 = R",
-            "              CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/lineitem.csv]]}, projection=[l_orderkey, l_suppkey, l_returnflag, l_shipdate], infinite_source=true, output_ordering=[l_orderkey@0 ASC NULLS LAST], has_header=true",
-            "        CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/orders.csv]]}, projection=[o_orderkey, o_orderdate], infinite_source=true, output_ordering=[o_orderkey@0 ASC NULLS LAST], has_header=true",
+            "              StreamingTableExec: partition_sizes=1, projection=[l_orderkey, l_suppkey, l_returnflag, l_shipdate], infinite_source=true, output_ordering=[l_orderkey@0 ASC NULLS LAST]",
+            "        StreamingTableExec: partition_sizes=1, projection=[o_orderkey, o_orderdate], infinite_source=true, output_ordering=[o_orderkey@0 ASC NULLS LAST]",
         ];
 
         experiment(&expected_plan, sql).await?;
@@ -4787,7 +4822,7 @@ mod sql_fuzzy_tests {
             "    CoalesceBatchesExec: target_batch_size=8192",
             "      HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(r_comment@0, o_comment@1)]",
             "        CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/region.csv]]}, projection=[r_comment], has_header=true",
-            "        CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/orders.csv]]}, projection=[o_orderkey, o_comment], infinite_source=true, output_ordering=[o_orderkey@0 ASC NULLS LAST], has_header=true",
+            "        StreamingTableExec: partition_sizes=1, projection=[o_orderkey, o_comment], infinite_source=true, output_ordering=[o_orderkey@0 ASC NULLS LAST]",
         ];
 
         experiment(&expected_plan, sql).await?;
@@ -4809,11 +4844,11 @@ mod sql_fuzzy_tests {
         let expected_plan = [
             "ProjectionExec: expr=[o_orderkey@0 as o_orderkey, l_suppkey@3 as l_suppkey]",
             "  SlidingHashJoinExec: join_type=Left, on=[(o_orderdate@1, l_shipdate@2)], filter=l_orderkey@1 < o_orderkey@0 - 10 AND l_orderkey@1 > o_orderkey@0 + 10",
-            "    CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/orders.csv]]}, projection=[o_orderkey, o_orderdate], infinite_source=true, output_ordering=[o_orderkey@0 ASC NULLS LAST], has_header=true",
+            "    StreamingTableExec: partition_sizes=1, projection=[o_orderkey, o_orderdate], infinite_source=true, output_ordering=[o_orderkey@0 ASC NULLS LAST]",
             "    ProjectionExec: expr=[l_orderkey@0 as l_orderkey, l_suppkey@1 as l_suppkey, l_shipdate@3 as l_shipdate]",
             "      CoalesceBatchesExec: target_batch_size=8192",
             "        FilterExec: l_returnflag@2 = R",
-            "          CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/lineitem.csv]]}, projection=[l_orderkey, l_suppkey, l_returnflag, l_shipdate], infinite_source=true, output_ordering=[l_orderkey@0 ASC NULLS LAST], has_header=true",
+            "          StreamingTableExec: partition_sizes=1, projection=[l_orderkey, l_suppkey, l_returnflag, l_shipdate], infinite_source=true, output_ordering=[l_orderkey@0 ASC NULLS LAST]",
         ];
 
         experiment(&expected_plan, sql).await?;

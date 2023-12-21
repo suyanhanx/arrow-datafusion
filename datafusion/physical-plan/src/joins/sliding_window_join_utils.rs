@@ -7,7 +7,6 @@ use std::{mem, usize};
 use crate::common::SharedMemoryReservation;
 use crate::joins::{
     stream_join_utils::{
-        calculate_side_prune_length_helper, get_build_side_pruned_exprs,
         get_filter_representation_of_join_side,
         get_filter_representation_schema_of_build_side, get_pruning_anti_indices,
         get_pruning_semi_indices, SortedFilterExpr, StreamJoinMetrics,
@@ -33,6 +32,9 @@ use datafusion_expr::interval_arithmetic::Interval;
 use datafusion_physical_expr::expressions::{Column, PhysicalSortExpr};
 use datafusion_physical_expr::intervals::cp_solver::ExprIntervalGraph;
 
+use crate::joins::stream_join_utils::{
+    calculate_side_prune_length_helper, get_build_side_pruned_exprs,
+};
 use async_trait::async_trait;
 use futures::{ready, FutureExt, StreamExt};
 use hashbrown::HashSet;
@@ -220,7 +222,7 @@ pub trait LazyJoinStream {
     ///
     /// # Returns
     ///
-    /// * `Result<StreamJoinStateResult<Option<RecordBatch>>>` - The state result after processing the probe batch.
+    /// * `Result<StatefulStreamResult<Option<RecordBatch>>>` - The state result after processing the probe batch.
     async fn fetch_and_process_next_from_probe_stream(
         &mut self,
     ) -> Result<StreamJoinStateResult<Option<RecordBatch>>> {
@@ -284,7 +286,7 @@ pub trait LazyJoinStream {
     ///
     /// # Returns
     ///
-    /// * `Result<StreamJoinStateResult<Option<RecordBatch>>>` - The state result after processing
+    /// * `Result<StatefulStreamResult<Option<RecordBatch>>>` - The state result after processing
     ///    the build batch.
     async fn fetch_and_process_build_batches_by_interval(
         &mut self,
@@ -326,7 +328,7 @@ pub trait LazyJoinStream {
     ///
     /// # Returns
     ///
-    /// * `Result<StreamJoinStateResult<Option<RecordBatch>>>` - The result after performing the join.
+    /// * `Result<StatefulStreamResult<Option<RecordBatch>>>` - The result after performing the join.
     fn handle_join_operation(
         &mut self,
     ) -> Result<StreamJoinStateResult<Option<RecordBatch>>> {
@@ -340,7 +342,7 @@ pub trait LazyJoinStream {
     ///
     /// # Returns
     ///
-    /// * `Result<StreamJoinStateResult<Option<RecordBatch>>>` - The result after performing the join.
+    /// * `Result<StatefulStreamResult<Option<RecordBatch>>>` - The result after performing the join.
     fn process_join_operation(
         &mut self,
     ) -> Result<StreamJoinStateResult<Option<RecordBatch>>>;
@@ -355,7 +357,7 @@ pub trait LazyJoinStream {
     ///
     /// # Returns
     ///
-    /// * `Result<StreamJoinStateResult<Option<RecordBatch>>>` - The state result after checking
+    /// * `Result<StatefulStreamResult<Option<RecordBatch>>>` - The state result after checking
     ///   the exhaustion state.
     async fn handle_probe_stream_end(
         &mut self,
@@ -384,7 +386,7 @@ pub trait LazyJoinStream {
     ///
     /// # Returns
     ///
-    /// * `Result<StreamJoinStateResult<Option<RecordBatch>>>` - The state result after
+    /// * `Result<StatefulStreamResult<Option<RecordBatch>>>` - The state result after
     ///   handling the exhaustion of the probe stream.
     fn process_probe_stream_end(
         &mut self,
@@ -400,7 +402,7 @@ pub trait LazyJoinStream {
     ///
     /// # Returns
     ///
-    /// * `Result<StreamJoinStateResult<Option<RecordBatch>>>` - The state result after both
+    /// * `Result<StatefulStreamResult<Option<RecordBatch>>>` - The state result after both
     ///   streams are exhausted.
     fn prepare_for_final_results_after_exhaustion(
         &mut self,
@@ -421,7 +423,7 @@ pub trait LazyJoinStream {
     ///
     /// # Returns
     ///
-    /// * `Result<StreamJoinStateResult<Option<RecordBatch>>>` - The state result containing
+    /// * `Result<StatefulStreamResult<Option<RecordBatch>>>` - The state result containing
     ///   the final results or indicating continuation.
     fn process_batches_before_finalization(
         &mut self,
@@ -675,9 +677,9 @@ pub trait EagerWindowJoinOperations {
     ///
     /// # Returns
     ///
-    /// * `Result<StreamJoinStateResult<Option<RecordBatch>>>`: A result wrapping the state result. This can be:
-    ///     - `StreamJoinStateResult::Ready(Some(batch))`: If there is a resultant batch from the join operation.
-    ///     - `StreamJoinStateResult::Continue`: If there is no resultant batch, but the operation was successful.
+    /// * `Result<StatefulStreamResult<Option<RecordBatch>>>`: A result wrapping the state result. This can be:
+    ///     - `StatefulStreamResult::Ready(Some(batch))`: If there is a resultant batch from the join operation.
+    ///     - `StatefulStreamResult::Continue`: If there is no resultant batch, but the operation was successful.
     ///     - An `Err` variant: If any error occurs during the process.
     ///
     /// # Description
@@ -688,11 +690,11 @@ pub trait EagerWindowJoinOperations {
     /// Next, it attempts to identify a joinable batch from the probe side using `identify_joinable_probe_batch`. If a joinable
     /// batch is found, it proceeds to join this batch with the current state of the build buffer using `join_using_joinable_probe_batch`.
     ///
-    /// The function returns `StreamJoinStateResult::Continue` if no joinable batch is identified, signaling the caller to continue pulling
+    /// The function returns `StatefulStreamResult::Continue` if no joinable batch is identified, signaling the caller to continue pulling
     /// more batches.
     ///
-    /// If a join is performed, the function checks if the result is a non-empty batch. If so, it returns `StreamJoinStateResult::Ready(Some(batch))`,
-    /// wrapping the resultant batch. If the join result is empty, it returns `StreamJoinStateResult::Continue`, signaling that the join was
+    /// If a join is performed, the function checks if the result is a non-empty batch. If so, it returns `StatefulStreamResult::Ready(Some(batch))`,
+    /// wrapping the resultant batch. If the join result is empty, it returns `StatefulStreamResult::Continue`, signaling that the join was
     /// successful but did not produce any output rows.
     ///
     /// This function ensures that the join operation is consistently applied to batches from the left stream as they arrive,
@@ -752,9 +754,9 @@ pub trait EagerWindowJoinOperations {
     ///
     /// # Returns
     ///
-    /// * `Result<StreamJoinStateResult<Option<RecordBatch>>>`: A result wrapping the state result. This can be:
-    ///     - `StreamJoinStateResult::Ready(Some(batch))`: If there is a resultant batch from the join operation.
-    ///     - `StreamJoinStateResult::Continue`: If there is no resultant batch, but the operation was successful, indicating
+    /// * `Result<StatefulStreamResult<Option<RecordBatch>>>`: A result wrapping the state result. This can be:
+    ///     - `StatefulStreamResult::Ready(Some(batch))`: If there is a resultant batch from the join operation.
+    ///     - `StatefulStreamResult::Continue`: If there is no resultant batch, but the operation was successful, indicating
     ///       continue on the stream.
     ///     - An `Err` variant: If any error occurs during the process.
     ///

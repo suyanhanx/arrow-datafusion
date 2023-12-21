@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::{any::Any, usize, vec};
 
+use crate::joins::stream_join_utils::StreamJoinStateResult;
 use crate::joins::utils::{
     adjust_indices_by_join_type, apply_join_filter_to_indices, build_batch_from_indices,
     calculate_join_output_ordering, get_final_indices_from_bit_map,
@@ -37,7 +38,7 @@ use crate::{
     joins::utils::{
         adjust_right_output_partitioning, build_join_schema, check_join_is_valid,
         estimate_join_statistics, partitioned_join_output_partitioning,
-        BuildProbeJoinMetrics, ColumnIndex, JoinFilter, JoinOn, StatefulStreamResult,
+        BuildProbeJoinMetrics, ColumnIndex, JoinFilter, JoinOn,
     },
     metrics::{ExecutionPlanMetricsSet, MetricsSet},
     DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PhysicalExpr,
@@ -1185,7 +1186,7 @@ impl HashJoinStream {
     fn collect_build_side(
         &mut self,
         cx: &mut std::task::Context<'_>,
-    ) -> Poll<Result<StatefulStreamResult<Option<RecordBatch>>>> {
+    ) -> Poll<Result<StreamJoinStateResult<Option<RecordBatch>>>> {
         let build_timer = self.join_metrics.build_time.timer();
         // build hash table from left (build) side, if not yet done
         let left_data = ready!(self
@@ -1225,7 +1226,7 @@ impl HashJoinStream {
             visited_left_side,
         });
 
-        Poll::Ready(Ok(StatefulStreamResult::Continue))
+        Poll::Ready(Ok(StreamJoinStateResult::Continue))
     }
 
     /// Fetches next batch from probe-side
@@ -1235,7 +1236,7 @@ impl HashJoinStream {
     fn fetch_probe_batch(
         &mut self,
         cx: &mut std::task::Context<'_>,
-    ) -> Poll<Result<StatefulStreamResult<Option<RecordBatch>>>> {
+    ) -> Poll<Result<StreamJoinStateResult<Option<RecordBatch>>>> {
         match ready!(self.right.poll_next_unpin(cx)) {
             None => {
                 self.state = HashJoinStreamState::ExhaustedProbeSide;
@@ -1249,7 +1250,7 @@ impl HashJoinStream {
             Some(Err(err)) => return Poll::Ready(Err(err)),
         };
 
-        Poll::Ready(Ok(StatefulStreamResult::Continue))
+        Poll::Ready(Ok(StreamJoinStateResult::Continue))
     }
 
     /// Joins current probe batch with build-side data and produces batch with matched output
@@ -1257,7 +1258,7 @@ impl HashJoinStream {
     /// Updates state to `FetchProbeBatch`
     fn process_probe_batch(
         &mut self,
-    ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
+    ) -> Result<StreamJoinStateResult<Option<RecordBatch>>> {
         let state = self.state.try_as_process_probe_batch()?;
         let build_side = self.build_side.try_as_ready_mut()?;
 
@@ -1320,7 +1321,7 @@ impl HashJoinStream {
 
         self.state = HashJoinStreamState::FetchProbeBatch;
 
-        Ok(StatefulStreamResult::Ready(Some(result?)))
+        Ok(StreamJoinStateResult::Ready(Some(result?)))
     }
 
     /// Processes unmatched build-side rows for certain join types and produces output batch
@@ -1328,13 +1329,13 @@ impl HashJoinStream {
     /// Updates state to `Completed`
     fn process_unmatched_build_batch(
         &mut self,
-    ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
+    ) -> Result<StreamJoinStateResult<Option<RecordBatch>>> {
         let timer = self.join_metrics.join_time.timer();
 
         if !need_produce_result_in_final(self.join_type) {
             self.state = HashJoinStreamState::Completed;
 
-            return Ok(StatefulStreamResult::Continue);
+            return Ok(StreamJoinStateResult::Continue);
         }
 
         let build_side = self.build_side.try_as_ready()?;
@@ -1365,7 +1366,7 @@ impl HashJoinStream {
 
         self.state = HashJoinStreamState::Completed;
 
-        Ok(StatefulStreamResult::Ready(Some(result?)))
+        Ok(StreamJoinStateResult::Ready(Some(result?)))
     }
 }
 

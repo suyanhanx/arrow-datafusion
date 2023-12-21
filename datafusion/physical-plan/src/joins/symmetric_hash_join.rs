@@ -40,26 +40,14 @@ use std::{usize, vec};
 
 use crate::common::SharedMemoryReservation;
 use crate::joins::hash_join::{build_equal_condition_join_indices, update_hash};
-use crate::joins::stream_join_utils::{
-    calculate_filter_expr_intervals, combine_two_batches, build_filter_input_order,
-    convert_sort_expr_with_filter_schema, get_pruning_anti_indices,
-    get_pruning_semi_indices, record_visited_indices, EagerJoinStream,
-    EagerJoinStreamState, PruningJoinHashMap, SortedFilterExpr, StreamJoinMetrics,
-};
-use crate::joins::utils::{
-    build_batch_from_indices, build_join_schema, check_join_is_valid,
-    partitioned_join_output_partitioning, prepare_sorted_exprs, ColumnIndex, JoinFilter,
-    JoinOn, StatefulStreamResult,
-};
 use crate::{
     expressions::{Column, PhysicalSortExpr},
     joins::StreamJoinPartitionMode,
     joins::{
         stream_join_utils::{
-            build_filter_input_order, calculate_side_prune_length_helper,
-            combine_two_batches, get_pruning_anti_indices, get_pruning_semi_indices,
-            prepare_sorted_exprs, record_visited_indices, EagerJoinStream,
-            EagerJoinStreamState, PruningJoinHashMap, SortedFilterExpr,
+            build_filter_input_order, combine_two_batches, get_pruning_anti_indices,
+            get_pruning_semi_indices, prepare_sorted_exprs, record_visited_indices,
+            EagerJoinStream, EagerJoinStreamState, PruningJoinHashMap, SortedFilterExpr,
             StreamJoinMetrics, StreamJoinStateResult,
         },
         utils::{
@@ -84,6 +72,7 @@ use datafusion_execution::TaskContext;
 use datafusion_physical_expr::equivalence::join_equivalence_properties;
 use datafusion_physical_expr::intervals::cp_solver::ExprIntervalGraph;
 
+use crate::joins::stream_join_utils::calculate_side_prune_length_helper;
 use ahash::RandomState;
 use futures::Stream;
 use hashbrown::HashSet;
@@ -924,13 +913,13 @@ impl EagerJoinStream for SymmetricHashJoinStream {
     fn process_batch_from_right(
         &mut self,
         batch: RecordBatch,
-    ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
+    ) -> Result<StreamJoinStateResult<Option<RecordBatch>>> {
         self.perform_join_for_given_side(batch, JoinSide::Right)
             .map(|maybe_batch| {
                 if maybe_batch.is_some() {
-                    StatefulStreamResult::Ready(maybe_batch)
+                    StreamJoinStateResult::Ready(maybe_batch)
                 } else {
-                    StatefulStreamResult::Continue
+                    StreamJoinStateResult::Continue
                 }
             })
     }
@@ -938,13 +927,13 @@ impl EagerJoinStream for SymmetricHashJoinStream {
     fn process_batch_from_left(
         &mut self,
         batch: RecordBatch,
-    ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
+    ) -> Result<StreamJoinStateResult<Option<RecordBatch>>> {
         self.perform_join_for_given_side(batch, JoinSide::Left)
             .map(|maybe_batch| {
                 if maybe_batch.is_some() {
-                    StatefulStreamResult::Ready(maybe_batch)
+                    StreamJoinStateResult::Ready(maybe_batch)
                 } else {
-                    StatefulStreamResult::Continue
+                    StreamJoinStateResult::Continue
                 }
             })
     }
@@ -952,20 +941,20 @@ impl EagerJoinStream for SymmetricHashJoinStream {
     fn process_batch_after_left_end(
         &mut self,
         right_batch: RecordBatch,
-    ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
+    ) -> Result<StreamJoinStateResult<Option<RecordBatch>>> {
         self.process_batch_from_right(right_batch)
     }
 
     fn process_batch_after_right_end(
         &mut self,
         left_batch: RecordBatch,
-    ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
+    ) -> Result<StreamJoinStateResult<Option<RecordBatch>>> {
         self.process_batch_from_left(left_batch)
     }
 
     fn process_batches_before_finalization(
         &mut self,
-    ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
+    ) -> Result<StreamJoinStateResult<Option<RecordBatch>>> {
         // Get the left side results:
         let left_result = build_side_determined_results(
             &self.left,
@@ -993,9 +982,9 @@ impl EagerJoinStream for SymmetricHashJoinStream {
             // Update the metrics:
             self.metrics.output_batches.add(1);
             self.metrics.output_rows.add(batch.num_rows());
-            return Ok(StatefulStreamResult::Ready(result));
+            return Ok(StreamJoinStateResult::Ready(result));
         }
-        Ok(StatefulStreamResult::Continue)
+        Ok(StreamJoinStateResult::Continue)
     }
 
     fn right_stream(&mut self) -> &mut SendableRecordBatchStream {
