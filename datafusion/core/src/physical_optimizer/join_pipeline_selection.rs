@@ -1130,8 +1130,6 @@ fn replace_shj_with_ahj(
             // Check if filter expressions can be pruned based on the data orders
             let (build_prunable, probe_prunable) = is_filter_expr_prunable(
                 &filter,
-                Some(left_order[0].clone()),
-                Some(right_order[0].clone()),
                 &left_child.equivalence_properties(),
                 &right_child.equivalence_properties(),
             )?;
@@ -1370,8 +1368,6 @@ fn handle_sliding_hash_conversion(
 ) -> Result<Vec<Arc<dyn ExecutionPlan>>> {
     let (left_prunable, right_prunable) = is_filter_expr_prunable(
         filter,
-        Some(left_order[0].clone()),
-        Some(right_order[0].clone()),
         &hash_join.left().equivalence_properties(),
         &hash_join.right().equivalence_properties(),
     )?;
@@ -1625,8 +1621,6 @@ fn handle_nested_loop_join(
             (true, true, Some(filter), Some(left_order), Some(right_order)) => {
                 let (left_prunable, right_prunable) = is_filter_expr_prunable(
                     &filter,
-                    Some(left_order[0].clone()),
-                    Some(right_order[0].clone()),
                     &nested_loop_join.left().equivalence_properties(),
                     &nested_loop_join.right().equivalence_properties(),
                 )?;

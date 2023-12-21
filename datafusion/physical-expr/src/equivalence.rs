@@ -556,6 +556,23 @@ impl EquivalenceGroup {
             JoinType::RightSemi | JoinType::RightAnti => right_equivalences.clone(),
         }
     }
+
+    /// Determine whether fields at indices lhs, and rhs are equal.
+    pub fn fields_equal(&self, lhs: usize, rhs: usize) -> bool {
+        (lhs == rhs)
+            || self.classes.iter().any(|cls| {
+                let group_indices = cls
+                    .iter()
+                    .filter_map(|item| {
+                        item.as_any()
+                            .downcast_ref::<Column>()
+                            .map(|col| col.index())
+                    })
+                    .collect::<Vec<_>>();
+                // Equal fields contains both left and right field indices
+                [lhs, rhs].iter().all(|idx| group_indices.contains(idx))
+            })
+    }
 }
 
 /// This function constructs a duplicate-free `LexOrderingReq` by filtering out
@@ -5347,6 +5364,40 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_fields_equal() -> Result<()> {
+        let schema = create_test_schema()?;
+        let col_a = &col("a", &schema)?;
+        let _col_b = &col("b", &schema)?;
+        let col_c = &col("c", &schema)?;
+        let col_d = &col("d", &schema)?;
+        let col_e = &col("e", &schema)?;
+        // Field indices are 0, 1, 2, 3, 4 respectively
+
+        let test_cases = vec![
+            // --------- TEST CASE 1 ------------
+            (
+                // Equal expressions a=c
+                vec![vec![col_a, col_c], vec![col_d, col_e]],
+                // first two entry field indices to compare third is expected result
+                // of fields equal check.
+                vec![(0, 1, false), (0, 2, true), (2, 4, false), (3, 4, true)],
+            ),
+        ];
+        for (eq_classes, expected) in test_cases {
+            let eq_classes = eq_classes
+                .into_iter()
+                .map(|cls| EquivalenceClass::new(cls.into_iter().cloned().collect()))
+                .collect::<Vec<_>>();
+            let eq_group = EquivalenceGroup::new(eq_classes);
+            for (left_idx, right_idx, expected) in expected {
+                assert_eq!(eq_group.fields_equal(left_idx, right_idx), expected);
+            }
+        }
+
         Ok(())
     }
 }
