@@ -354,6 +354,7 @@ impl AggregateExec {
     }
 
     /// Create a new hash aggregate execution plan
+    #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_schema(
         mode: AggregateMode,
         group_by: PhysicalGroupBy,

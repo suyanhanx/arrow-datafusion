@@ -213,7 +213,7 @@ fn generate_joins(mut join_inputs: Vec<LogicalPlan>) -> Result<LogicalPlan> {
     let right = join_inputs.pop().unwrap();
     let left = join_inputs.pop().unwrap();
     let cross_join = LogicalPlanBuilder::from(right).cross_join(left)?.build()?;
-    if join_inputs.len() > 0 {
+    if !join_inputs.is_empty() {
         join_inputs.push(cross_join);
         generate_joins(join_inputs)
     } else {

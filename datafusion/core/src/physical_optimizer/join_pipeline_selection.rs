@@ -14,7 +14,7 @@ use crate::physical_optimizer::projection_pushdown::update_expr;
 use crate::physical_optimizer::utils::{
     is_aggregate, is_cross_join, is_hash_join, is_nested_loop_join, is_sort, is_window,
 };
-use crate::physical_plan::aggregates::{AggregateExec, PhysicalGroupBy};
+use crate::physical_plan::aggregates::AggregateExec;
 use crate::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use crate::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use crate::physical_plan::joins::utils::{swap_filter, JoinFilter};
@@ -45,7 +45,7 @@ use datafusion_physical_expr::{
 use datafusion_physical_plan::joins::prunability::{
     is_filter_expr_prunable, separate_columns_of_filter_expression,
 };
-use datafusion_physical_plan::joins::utils::{swap_join_on, ColumnIndex, JoinOn};
+use datafusion_physical_plan::joins::utils::{swap_join_on, JoinOn};
 use datafusion_physical_plan::joins::{
     swap_sliding_hash_join, swap_sliding_nested_loop_join, AggregativeNestedLoopJoinExec,
     SlidingWindowWorkingMode,
@@ -54,8 +54,7 @@ use datafusion_physical_plan::windows::{
     get_best_fitting_window, get_window_mode, BoundedWindowAggExec, WindowAggExec,
 };
 
-use datafusion_physical_plan::DisplayAs;
-use itertools::{iproduct, izip, Itertools};
+use itertools::{iproduct, Itertools};
 
 #[derive(Debug, Clone)]
 pub struct PlanMetadata {
@@ -1988,14 +1987,6 @@ fn handle_cross_join(plan_metadata: PlanMetadata) -> Result<Vec<PlanMetadata>> {
         }
     }
     Ok(vec![plan_metadata])
-}
-
-fn print_plan(plan: &Arc<dyn ExecutionPlan>) {
-    let formatted = datafusion_physical_plan::displayable(plan.as_ref())
-        .indent(true)
-        .to_string();
-    let actual: Vec<&str> = formatted.trim().lines().collect();
-    println!("{:#?}", actual);
 }
 
 /// Optimizes a NestedLoopJoinExec into a more efficient join plan based on prunability and join type.
@@ -5878,9 +5869,9 @@ mod sql_fuzzy_tests {
     use crate::physical_plan::displayable;
     use crate::physical_plan::{collect, ExecutionPlan};
     use crate::prelude::{CsvReadOptions, SessionContext};
-    use arrow::util::pretty::{pretty_format_batches, print_batches};
+    use arrow::util::pretty::pretty_format_batches;
     use arrow_array::RecordBatch;
-    use arrow_schema::{DataType, Field, Schema, SchemaBuilder};
+    use arrow_schema::{DataType, Field, Schema};
     use datafusion_execution::config::SessionConfig;
     use datafusion_expr::expr::Sort;
     use datafusion_expr::{col, Expr};
@@ -6046,7 +6037,6 @@ mod sql_fuzzy_tests {
         let ctx = setup_context(true).await?;
         let dataframe = ctx.sql(sql).await?;
         let physical_plan = dataframe.create_physical_plan().await?;
-        // print_plan(&physical_plan);
         assert_original_plan(physical_plan.clone(), expected_input);
         let batches = collect(physical_plan, ctx.task_ctx()).await?;
         Ok(batches)

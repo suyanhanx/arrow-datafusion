@@ -611,7 +611,7 @@ pub async fn partitioned_sliding_nested_join_with_filter(
     context: Arc<TaskContext>,
     working_mode: SlidingWindowWorkingMode,
 ) -> Result<Vec<RecordBatch>> {
-    let partition_count = 2;
+    let partition_count = 1;
     let mut output_partition = 1;
     let distribution = distribution_from_join_type(join_type);
     // left

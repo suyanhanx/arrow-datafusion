@@ -2668,12 +2668,11 @@ Projection: a, b
             .build()?;
 
         let expected = "\
-        Filter: test.a = d AND test.b > UInt32(1) OR test.b = e AND test.c < UInt32(10)\
-        \n  CrossJoin:\
-        \n    Projection: test.a, test.b, test.c\
-        \n      TableScan: test, full_filters=[test.b > UInt32(1) OR test.c < UInt32(10)]\
-        \n    Projection: test1.a AS d, test1.a AS e\
-        \n      TableScan: test1";
+        Inner Join:  Filter: test.a = d AND test.b > UInt32(1) OR test.b = e AND test.c < UInt32(10)\
+        \n  Projection: test.a, test.b, test.c\
+        \n    TableScan: test, full_filters=[test.b > UInt32(1) OR test.c < UInt32(10)]\
+        \n  Projection: test1.a AS d, test1.a AS e\
+        \n    TableScan: test1";
         assert_optimized_plan_eq_with_rewrite_predicate(&plan, expected)?;
 
         // Originally global state which can help to avoid duplicate Filters been generated and pushed down.
