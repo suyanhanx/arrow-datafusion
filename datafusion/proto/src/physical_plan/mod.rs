@@ -1176,7 +1176,7 @@ impl AsExecutionPlan for PhysicalPlanNode {
                     aggregative_hash_join.null_equals_null,
                     left_sort_exprs,
                     right_sort_exprs,
-                    aggregative_hash_join.fetch_per_key as usize,
+                    Some(aggregative_hash_join.fetch_per_key as usize),
                     partition_mode,
                     working_mode,
                 )
@@ -1330,7 +1330,7 @@ impl AsExecutionPlan for PhysicalPlanNode {
                     &join_type.into(),
                     left_sort_exprs,
                     right_sort_exprs,
-                    aggregative_nested_loop_join.fetch_per_key as usize,
+                    Some(aggregative_nested_loop_join.fetch_per_key as usize),
                     working_mode,
                 )
                 .map(|e| Arc::new(e) as _)
@@ -2036,6 +2036,14 @@ impl AsExecutionPlan for PhysicalPlanNode {
                 }
             };
 
+            let fetch_per_key = if let Some(fetch_per_key) = exec.fetch_per_key() {
+                fetch_per_key
+            } else {
+                return internal_err!(
+                    "Unsupported placeholder AggregativeHashJoin plan."
+                );
+            };
+
             return Ok(protobuf::PhysicalPlanNode {
                 physical_plan_type: Some(PhysicalPlanType::AggregativeHashJoin(
                     Box::new(protobuf::AggregativeHashJoinExecNode {
@@ -2048,7 +2056,7 @@ impl AsExecutionPlan for PhysicalPlanNode {
                         filter: Some(filter),
                         left_sort_exprs,
                         right_sort_exprs,
-                        fetch_per_key: exec.fetch_per_key() as u32,
+                        fetch_per_key: fetch_per_key as u32,
                         working_mode: working_mode.into(),
                     }),
                 )),
@@ -2127,6 +2135,14 @@ impl AsExecutionPlan for PhysicalPlanNode {
                 }
             };
 
+            let fetch_per_key = if let Some(fetch_per_key) = exec.fetch_per_key() {
+                fetch_per_key
+            } else {
+                return internal_err!(
+                    "Unsupported placeholder AggregativeNestedLoopJoin plan."
+                );
+            };
+
             return Ok(protobuf::PhysicalPlanNode {
                 physical_plan_type: Some(PhysicalPlanType::AggregativeNestedLoopJoin(
                     Box::new(protobuf::AggregativeNestedLoopJoinExecNode {
@@ -2136,7 +2152,7 @@ impl AsExecutionPlan for PhysicalPlanNode {
                         filter: Some(filter),
                         left_sort_exprs,
                         right_sort_exprs,
-                        fetch_per_key: exec.fetch_per_key() as u32,
+                        fetch_per_key: fetch_per_key as u32,
                         working_mode: working_mode.into(),
                     }),
                 )),

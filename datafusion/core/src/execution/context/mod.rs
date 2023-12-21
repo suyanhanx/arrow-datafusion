@@ -35,9 +35,16 @@ use crate::{
     optimizer::optimizer::Optimizer,
     physical_optimizer::optimizer::{PhysicalOptimizer, PhysicalOptimizerRule},
 };
-use datafusion_common::{alias::AliasGenerator, exec_err, internal_err, not_impl_err, plan_datafusion_err, plan_err, tree_node::{TreeNode, TreeNodeVisitor, VisitRecursion}};
+use datafusion_common::{
+    alias::AliasGenerator,
+    exec_err, not_impl_err, plan_datafusion_err, plan_err,
+    tree_node::{TreeNode, TreeNodeVisitor, VisitRecursion},
+};
 use datafusion_execution::registry::SerializerRegistry;
-use datafusion_expr::{logical_plan::{DdlStatement, Statement}, Expr, StringifiedPlan, UserDefinedLogicalNode, WindowUDF, TableScan};
+use datafusion_expr::{
+    logical_plan::{DdlStatement, Statement},
+    Expr, StringifiedPlan, UserDefinedLogicalNode, WindowUDF,
+};
 pub use datafusion_physical_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::var_provider::is_system_variables;
 use parking_lot::RwLock;
@@ -86,12 +93,12 @@ use crate::physical_planner::PhysicalPlanner;
 use crate::variable::{VarProvider, VarType};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use itertools::Itertools;
 use datafusion_common::{OwnedTableReference, SchemaReference};
 use datafusion_sql::{
     parser::DFParser,
     planner::{ContextProvider, SqlToRel},
 };
+use itertools::Itertools;
 use url::Url;
 
 use crate::catalog::information_schema::{InformationSchemaProvider, INFORMATION_SCHEMA};
@@ -103,7 +110,6 @@ use datafusion_optimizer::{
 };
 use datafusion_sql::planner::object_name_to_table_reference;
 use uuid::Uuid;
-use datafusion_common::tree_node::TreeNodeRewriter;
 
 // backwards compatibility
 use crate::datasource::provider::DefaultTableFactory;
@@ -1798,28 +1804,23 @@ impl SessionState {
         &self,
         logical_plan: &LogicalPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        println!("{}", logical_plan.display_indent());
         let o_logical_plan = self.optimize(logical_plan)?;
-        println!("Optimize");
-        println!("{}", o_logical_plan.display_indent());
-        match self.query_planner
+        match self
+            .query_planner
             .create_physical_plan(&o_logical_plan, self)
-            .await {
-            Ok(plan) => {
-                Ok(plan)
-            },
+            .await
+        {
+            Ok(plan) => Ok(plan),
             Err(e) => {
-                println!("Trying");
                 let possible_plans = generate_possible_join_orders(logical_plan)?;
-                for (idx, plan) in possible_plans.iter().enumerate() {
-                    println!("Trying Plan {}", idx);
-                    println!("{}", plan.display_indent());
+                for plan in possible_plans {
                     let logical_plan = self.optimize(&plan)?;
-                    println!("{}", logical_plan.display_indent());
-                    if let Ok(plan) = self.query_planner
+                    if let Ok(plan) = self
+                        .query_planner
                         .create_physical_plan(&logical_plan, self)
-                        .await {
-                        return Ok(plan)
+                        .await
+                    {
+                        return Ok(plan);
                     }
                 }
                 Err(e)

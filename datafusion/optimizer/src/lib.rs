@@ -72,7 +72,7 @@ pub fn generate_possible_join_orders(plan: &LogicalPlan) -> Result<Vec<LogicalPl
         println!("{:#?}", plan);
     }
     let children = plan.inputs();
-    if children.is_empty(){
+    if children.is_empty() {
         return Ok(vec![plan.clone()]);
     }
     let mut res = vec![];
@@ -124,12 +124,13 @@ pub fn generate_possible_join_orders(plan: &LogicalPlan) -> Result<Vec<LogicalPl
                         if new_back_indices.is_empty() {
                             // Finalized
                             // assert_eq!(results[0].len(), join_inputs.len());
-                            if results[0].len() < join_inputs.len(){
+                            if results[0].len() < join_inputs.len() {
                                 // There are missing entries
                                 // Can occur when filter conditions are disjoint
                                 println!("dis joint set");
                                 assert_eq!(results[0].len(), join_inputs.len());
-                                let missing_indices = set_difference_vec(&all_indices, &results[0]);
+                                let missing_indices =
+                                    set_difference_vec(&all_indices, &results[0]);
                                 forward_indices = HashSet::new();
                                 forward_indices.insert(missing_indices[0]);
                                 break;
@@ -182,7 +183,7 @@ pub fn generate_possible_join_orders(plan: &LogicalPlan) -> Result<Vec<LogicalPl
                     .map(|idx| join_inputs[idx].clone())
                     .collect::<Vec<_>>();
                 let cross_join = generate_joins(join_inputs)?;
-                if PRINT_ON{
+                if PRINT_ON {
                     println!("{:#?}", cross_join);
                 }
                 let filter = LogicalPlan::Filter(Filter::try_new(
@@ -250,7 +251,8 @@ fn set_difference(items: HashSet<usize>, subtract: &[usize]) -> HashSet<usize> {
 }
 
 fn set_difference_vec(items: &[usize], subtract: &[usize]) -> Vec<usize> {
-    items.iter()
+    items
+        .iter()
         .filter_map(|&item| {
             if subtract.contains(&item) {
                 None

@@ -47,7 +47,7 @@ use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_expr::{AggregateFunction, Operator, WindowFrame, WindowFunction};
 use datafusion_physical_expr::expressions::{col, BinaryExpr, Literal};
 use datafusion_physical_expr::intervals::test_utils::gen_conjunctive_numerical_expr;
-use datafusion_physical_expr::{PhysicalExpr, PhysicalSortExpr};
+use datafusion_physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
 
 use async_trait::async_trait;
 
@@ -416,11 +416,39 @@ pub fn partial_prunable_filter(
     JoinFilter::new(filter_expr, column_indices, intermediate_schema)
 }
 
+pub fn partial_prunable_filter_with_and(
+    first_index: ColumnIndex,
+    second_index: ColumnIndex,
+    third_index: ColumnIndex,
+) -> JoinFilter {
+    // Filter columns, ensure first batches will have matching rows.
+    let intermediate_schema = Schema::new(vec![
+        Field::new("0", DataType::Int32, true),
+        Field::new("1", DataType::Int32, true),
+        Field::new("2", DataType::Int32, true),
+    ]);
+    let column_indices = vec![first_index, second_index, third_index];
+    let left = Arc::new(BinaryExpr::new(
+        col("0", &intermediate_schema).unwrap(),
+        Operator::Gt,
+        col("1", &intermediate_schema).unwrap(),
+    ));
+
+    let right = Arc::new(BinaryExpr::new(
+        col("0", &intermediate_schema).unwrap(),
+        Operator::Gt,
+        col("2", &intermediate_schema).unwrap(),
+    ));
+
+    let filter_expr = Arc::new(BinaryExpr::new(left, Operator::And, right));
+
+    JoinFilter::new(filter_expr, column_indices, intermediate_schema)
+}
+
 pub fn not_prunable_filter(
     left_index: ColumnIndex,
     right_index: ColumnIndex,
 ) -> JoinFilter {
-    // Filter columns, ensure first batches will have matching rows.
     let intermediate_schema = Schema::new(vec![
         Field::new("0", DataType::Int32, true),
         Field::new("1", DataType::Int32, true),
@@ -450,6 +478,15 @@ pub fn memory_exec_with_sort(
 pub fn streaming_table_exec(
     schema: &SchemaRef,
     sort: Option<Vec<PhysicalSortExpr>>,
+) -> Arc<dyn ExecutionPlan> {
+    Arc::new(
+        StreamingTableExec::try_new(schema.clone(), vec![], None, sort, true).unwrap(),
+    )
+}
+
+pub fn streaming_table_exec_v2(
+    schema: &SchemaRef,
+    sort: Vec<LexOrdering>,
 ) -> Arc<dyn ExecutionPlan> {
     Arc::new(
         StreamingTableExec::try_new(schema.clone(), vec![], None, sort, true).unwrap(),

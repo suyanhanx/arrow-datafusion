@@ -103,7 +103,7 @@ pub struct AggregativeHashJoinExec {
     /// The output ordering
     output_ordering: Option<Vec<PhysicalSortExpr>>,
     /// Fetch per key
-    fetch_per_key: usize,
+    fetch_per_key: Option<usize>,
     /// Partition mode
     pub(crate) partition_mode: StreamJoinPartitionMode,
     /// Stream working mode
@@ -145,7 +145,7 @@ impl AggregativeHashJoinExec {
         null_equals_null: bool,
         left_sort_exprs: Vec<PhysicalSortExpr>,
         right_sort_exprs: Vec<PhysicalSortExpr>,
-        fetch_per_key: usize,
+        fetch_per_key: Option<usize>,
         partition_mode: StreamJoinPartitionMode,
         working_mode: SlidingWindowWorkingMode,
     ) -> Result<Self> {
@@ -271,7 +271,7 @@ impl AggregativeHashJoinExec {
     }
 
     /// Get fetch per key
-    pub fn fetch_per_key(&self) -> usize {
+    pub fn fetch_per_key(&self) -> Option<usize> {
         self.fetch_per_key
     }
 
@@ -734,6 +734,11 @@ impl ExecutionPlan for AggregativeHashJoinExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let fetch_per_key = if let Some(fetch_per_key) = self.fetch_per_key {
+            fetch_per_key
+        } else {
+            return internal_err!("AggregativeHashJoinExec must have a fetch parameter.");
+        };
         let left_partitions = self.left.output_partitioning().partition_count();
         let right_partitions = self.right.output_partitioning().partition_count();
         if left_partitions != right_partitions {
@@ -792,7 +797,7 @@ impl ExecutionPlan for AggregativeHashJoinExec {
             build_buffer: BuildBuffer::new(self.left.schema(), on_left),
             random_state: self.random_state.clone(),
             null_equals_null: self.null_equals_null,
-            fetch_per_key: self.fetch_per_key,
+            fetch_per_key,
         };
 
         let stream = if self.working_mode == SlidingWindowWorkingMode::Lazy {
@@ -1600,7 +1605,7 @@ mod fuzzy_tests {
             null_equals_null,
             left_sort_expr,
             right_sort_expr,
-            fetch_per_key,
+            Some(fetch_per_key),
             StreamJoinPartitionMode::Partitioned,
             working_mode,
         )?);

@@ -38,10 +38,13 @@ use crate::physical_plan::projection::ProjectionExec;
 use crate::physical_plan::ExecutionPlan;
 
 use arrow_schema::Schema;
-use datafusion_common::tree_node::TreeNode;
+use datafusion_common::tree_node::{TreeNode, TreeNodeVisitor, VisitRecursion};
 use datafusion_common::{internal_err, DataFusionError, JoinType};
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::PhysicalExpr;
+use datafusion_physical_plan::joins::{
+    AggregativeHashJoinExec, AggregativeNestedLoopJoinExec,
+};
 
 /// The [`JoinSelection`] rule tries to modify a given plan so that it can
 /// accommodate infinite sources and optimize joins in the plan according to
@@ -196,6 +199,34 @@ pub(crate) fn swap_reverting_projection(
     left_cols.chain(right_cols).collect()
 }
 
+#[derive(Debug, Default)]
+struct OkVisitor {
+    bump_into_placeholder: bool,
+}
+
+impl TreeNodeVisitor for OkVisitor {
+    type N = Arc<dyn ExecutionPlan>;
+
+    fn pre_visit(&mut self, plan: &Arc<dyn ExecutionPlan>) -> Result<VisitRecursion> {
+        if let Some(ahj) = plan.as_any().downcast_ref::<AggregativeHashJoinExec>() {
+            if ahj.fetch_per_key().is_none() {
+                self.bump_into_placeholder = true;
+                return Ok(VisitRecursion::Stop);
+            }
+        }
+        if let Some(ahj) = plan
+            .as_any()
+            .downcast_ref::<AggregativeNestedLoopJoinExec>()
+        {
+            if ahj.fetch_per_key().is_none() {
+                self.bump_into_placeholder = true;
+                return Ok(VisitRecursion::Stop);
+            }
+        }
+        Ok(VisitRecursion::Continue)
+    }
+}
+
 impl PhysicalOptimizerRule for JoinSelection {
     fn optimize(
         &self,
@@ -209,6 +240,11 @@ impl PhysicalOptimizerRule for JoinSelection {
             .plans
             .into_iter()
             .map(|plan_metadata| plan_metadata.plan)
+            .filter(|plan_metadata| {
+                let mut visitor = OkVisitor::default();
+                plan_metadata.visit(&mut visitor).unwrap();
+                !visitor.bump_into_placeholder
+            })
             .filter(|plan| is_plan_streaming(plan).is_ok())
             .min_by(|a, b| cost_of_the_plan(a).cmp(&cost_of_the_plan(b)))
         {

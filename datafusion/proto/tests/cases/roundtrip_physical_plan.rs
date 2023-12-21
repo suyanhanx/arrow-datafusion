@@ -879,7 +879,7 @@ fn roundtrip_aggregative_hash_join() -> Result<()> {
                             expr: col("col", &schema_left)?,
                             options: Default::default(),
                         }],
-                        fetch_per_key,
+                        Some(fetch_per_key),
                         *partition_mode,
                         working_mode,
                     )?))?;
@@ -1027,7 +1027,7 @@ fn roundtrip_aggregative_nested_loop_join() -> Result<()> {
                         expr: col("col", &schema_left)?,
                         options: Default::default(),
                     }],
-                    fetch_per_key,
+                    Some(fetch_per_key),
                     working_mode,
                 )?))?;
             }

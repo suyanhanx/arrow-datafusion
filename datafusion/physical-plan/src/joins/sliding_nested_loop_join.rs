@@ -11,8 +11,6 @@ use std::mem;
 use std::sync::Arc;
 use std::task::Poll;
 
-use crate::common::AbortOnDropMany;
-use crate::joins::nested_loop_join::distribution_from_join_type;
 use crate::joins::sliding_window_join_utils::{
     adjust_probe_side_indices_by_join_type, calculate_build_outer_indices_by_join_type,
     calculate_the_necessary_build_side_range_helper, joinable_probe_batch_helper,
@@ -33,7 +31,6 @@ use crate::joins::utils::{
 use crate::joins::SlidingWindowWorkingMode;
 use crate::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use crate::projection::ProjectionExec;
-use crate::stream::RecordBatchBroadcastStreamsBuilder;
 use crate::{
     DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning,
     RecordBatchStream, SendableRecordBatchStream,
@@ -105,26 +102,8 @@ pub struct SlidingNestedLoopJoinExec {
     right_sort_exprs: Vec<PhysicalSortExpr>,
     /// The output ordering
     output_ordering: Option<Vec<PhysicalSortExpr>>,
-    /// Inner state that is initialized when the first output stream is created.
-    /// This is kept in a `Arc<Mutex<T>>` since only one partition should be
-    /// responsible for getting the broadcast streams.
-    state: Arc<Mutex<SlidingNestedLoopJoinExecState>>,
     /// Stream working mode
     pub(crate) working_mode: SlidingWindowWorkingMode,
-}
-
-impl Debug for SlidingNestedLoopJoinExecState {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "SlidingNestedLoopJoinExecState")
-    }
-}
-
-/// Inner state of the [`SlidingNestedLoopJoinExec`].
-struct SlidingNestedLoopJoinExecState {
-    /// Replica streams:
-    channels: Vec<SendableRecordBatchStream>,
-    /// Helper that ensures background job(s) are killed once no longer needed.
-    abort_helper: Arc<AbortOnDropMany<()>>,
 }
 
 impl SlidingNestedLoopJoinExec {
@@ -165,10 +144,6 @@ impl SlidingNestedLoopJoinExec {
             output_ordering,
             left_sort_exprs,
             right_sort_exprs,
-            state: Arc::new(Mutex::new(SlidingNestedLoopJoinExecState {
-                channels: Vec::new(),
-                abort_helper: Arc::new(AbortOnDropMany::<()>(vec![])),
-            })),
             working_mode,
         })
     }
@@ -222,56 +197,14 @@ impl SlidingNestedLoopJoinExec {
         self.working_mode
     }
 
-    /// In this section, we are employing the strategy of broadcasting
-    /// single partition sides. This approach mirrors how we distribute
-    /// `OnceFut<JoinLeftData>` in `NestedLoopJoinStream`(s). Each partition
-    /// gets access to the same data with a single poll, and this data is
-    /// shared among them. As there's no mechanism to pause until a side
-    /// completes, we resort to broadcasting the data, thereby creating a
-    /// shared resource.
     fn get_streams(
         &self,
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<(SendableRecordBatchStream, SendableRecordBatchStream)> {
-        match self.required_input_distribution()[..] {
-            [Distribution::UnspecifiedDistribution, Distribution::SinglePartition] => {
-                let mut state = self.state.lock();
-                let build_stream = self.left.execute(partition, context.clone())?;
-                if state.channels.is_empty() {
-                    let num_input_partitions =
-                        self.left.output_partitioning().partition_count();
-                    let builder = RecordBatchBroadcastStreamsBuilder::new(
-                        self.right.schema(),
-                        num_input_partitions,
-                    );
-                    (state.channels, state.abort_helper) =
-                        builder.broadcast(self.right.clone(), 0, context)?;
-                }
-                Ok((build_stream, state.channels.swap_remove(0)))
-            }
-            [Distribution::SinglePartition, Distribution::UnspecifiedDistribution] => {
-                let mut state = self.state.lock();
-                let probe_stream = self.right.execute(partition, context.clone())?;
-                if state.channels.is_empty() {
-                    let num_input_partitions =
-                        self.right.output_partitioning().partition_count();
-                    let builder = RecordBatchBroadcastStreamsBuilder::new(
-                        self.left.schema(),
-                        num_input_partitions,
-                    );
-                    (state.channels, state.abort_helper) =
-                        builder.broadcast(self.left.clone(), 0, context)?;
-                }
-                Ok((state.channels.swap_remove(0), probe_stream))
-            }
-            [Distribution::SinglePartition, Distribution::SinglePartition] => {
-                let build_stream = self.left.execute(partition, context.clone())?;
-                let probe_stream = self.right.execute(partition, context)?;
-                Ok((build_stream, probe_stream))
-            }
-            _ => unreachable!(),
-        }
+        let build_stream = self.left.execute(partition, context.clone())?;
+        let probe_stream = self.right.execute(partition, context)?;
+        Ok((build_stream, probe_stream))
     }
 }
 
@@ -322,7 +255,8 @@ impl ExecutionPlan for SlidingNestedLoopJoinExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        distribution_from_join_type(&self.join_type)
+        // TODO: Will change after broadcast
+        vec![Distribution::SinglePartition, Distribution::SinglePartition]
     }
 
     fn required_input_ordering(&self) -> Vec<Option<Vec<PhysicalSortRequirement>>> {

@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::{fmt, mem};
 
-use crate::common::AbortOnDropMany;
 use crate::joins::sliding_window_join_utils::{
     adjust_probe_side_indices_by_join_type,
     calculate_the_necessary_build_side_range_helper, joinable_probe_batch_helper,
@@ -25,7 +24,6 @@ use crate::joins::utils::{
 };
 use crate::joins::SlidingWindowWorkingMode;
 use crate::metrics::{ExecutionPlanMetricsSet, MetricsSet};
-use crate::stream::RecordBatchBroadcastStreamsBuilder;
 use crate::{
     DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning,
     RecordBatchStream, SendableRecordBatchStream,
@@ -88,27 +86,9 @@ pub struct AggregativeNestedLoopJoinExec {
     /// The output ordering
     output_ordering: Option<Vec<PhysicalSortExpr>>,
     /// Fetch per key
-    fetch_per_key: usize,
+    fetch_per_key: Option<usize>,
     /// Stream working mode
     pub(crate) working_mode: SlidingWindowWorkingMode,
-    /// Inner state that is initialized when the first output stream is created.
-    /// This is kept in a `Arc<Mutex<T>>` since only one partition should be
-    /// responsible for getting the broadcast streams.
-    state: Arc<Mutex<AggregativeNestedLoopJoinExecState>>,
-}
-
-impl Debug for AggregativeNestedLoopJoinExecState {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "AggregativeNestedLoopJoinExecState")
-    }
-}
-
-/// Inner state of the [`AggregativeNestedLoopJoinExec`].
-struct AggregativeNestedLoopJoinExecState {
-    /// Replica streams:
-    channels: Vec<SendableRecordBatchStream>,
-    /// Helper that ensures background job(s) are killed once no longer needed.
-    abort_helper: Arc<AbortOnDropMany<()>>,
 }
 
 impl AggregativeNestedLoopJoinExec {
@@ -132,7 +112,7 @@ impl AggregativeNestedLoopJoinExec {
         join_type: &JoinType,
         left_sort_exprs: Vec<PhysicalSortExpr>,
         right_sort_exprs: Vec<PhysicalSortExpr>,
-        fetch_per_key: usize,
+        fetch_per_key: Option<usize>,
         working_mode: SlidingWindowWorkingMode,
     ) -> Result<Self> {
         if !matches!(join_type, JoinType::Inner | JoinType::Right) {
@@ -171,10 +151,6 @@ impl AggregativeNestedLoopJoinExec {
             output_ordering,
             fetch_per_key,
             working_mode,
-            state: Arc::new(Mutex::new(AggregativeNestedLoopJoinExecState {
-                channels: Vec::new(),
-                abort_helper: Arc::new(AbortOnDropMany::<()>(vec![])),
-            })),
         })
     }
 
@@ -204,39 +180,10 @@ impl AggregativeNestedLoopJoinExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<(SendableRecordBatchStream, SendableRecordBatchStream)> {
-        match self.required_input_distribution()[..] {
-            [Distribution::UnspecifiedDistribution, Distribution::SinglePartition] => {
-                let mut state = self.state.lock();
-                let build_stream = self.left.execute(partition, context.clone())?;
-                if state.channels.is_empty() {
-                    let num_input_partitions =
-                        self.left.output_partitioning().partition_count();
-                    let builder = RecordBatchBroadcastStreamsBuilder::new(
-                        self.right.schema(),
-                        num_input_partitions,
-                    );
-                    (state.channels, state.abort_helper) =
-                        builder.broadcast(self.right.clone(), 0, context)?;
-                }
-                Ok((build_stream, state.channels.swap_remove(0)))
-            }
-            [Distribution::SinglePartition, Distribution::UnspecifiedDistribution] => {
-                let mut state = self.state.lock();
-                let probe_stream = self.right.execute(partition, context.clone())?;
-                if state.channels.is_empty() {
-                    let num_input_partitions =
-                        self.right.output_partitioning().partition_count();
-                    let builder = RecordBatchBroadcastStreamsBuilder::new(
-                        self.left.schema(),
-                        num_input_partitions,
-                    );
-                    (state.channels, state.abort_helper) =
-                        builder.broadcast(self.left.clone(), 0, context)?;
-                }
-                Ok((state.channels.swap_remove(0), probe_stream))
-            }
-            _ => unreachable!(),
-        }
+        // TODO: Will be written again.
+        let build_stream = self.left.execute(partition, context.clone())?;
+        let probe_stream = self.right.execute(partition, context)?;
+        Ok((build_stream, probe_stream))
     }
 
     /// left (build) side which gets hashed
@@ -270,7 +217,7 @@ impl AggregativeNestedLoopJoinExec {
     }
 
     /// Get fetch per key
-    pub fn fetch_per_key(&self) -> usize {
+    pub fn fetch_per_key(&self) -> Option<usize> {
         self.fetch_per_key
     }
 
@@ -409,7 +356,7 @@ impl DisplayAs for AggregativeNestedLoopJoinExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                let display_filter = format!(", filter={}", self.filter.expression());
+                let display_filter = format!("filter={}", self.filter.expression());
                 write!(
                     f,
                     "AggregativeNestedLoopJoinExec: join_type={:?}, {}",
@@ -448,7 +395,8 @@ impl ExecutionPlan for AggregativeNestedLoopJoinExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        distribution_from_join_type(&self.join_type)
+        // TODO: Currently, broadcast support is halted and this line will be replaced.
+        vec![Distribution::SinglePartition, Distribution::SinglePartition]
     }
 
     fn required_input_ordering(&self) -> Vec<Option<Vec<PhysicalSortRequirement>>> {
@@ -510,6 +458,14 @@ impl ExecutionPlan for AggregativeNestedLoopJoinExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let fetch_per_key = if let Some(fetch_per_key) = self.fetch_per_key {
+            fetch_per_key
+        } else {
+            return internal_err!(
+                "AggregativeNestedLoopJoinExec must have a fetch parameter."
+            );
+        };
+
         let (left_sorted_filter_expr, right_sorted_filter_expr, graph) = if let Some((
             left_sorted_filter_expr,
             right_sorted_filter_expr,
@@ -553,7 +509,7 @@ impl ExecutionPlan for AggregativeNestedLoopJoinExec {
                 metrics,
             },
             build_buffer: BuildBuffer::new(self.left.schema()),
-            fetch_per_key: self.fetch_per_key,
+            fetch_per_key,
         };
 
         let stream = if self.working_mode == SlidingWindowWorkingMode::Lazy {
@@ -585,28 +541,6 @@ impl ExecutionPlan for AggregativeNestedLoopJoinExec {
 
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
-    }
-}
-
-// For the nested loop join, different join type need the different distribution for
-// left and right node.
-pub fn distribution_from_join_type(join_type: &JoinType) -> Vec<Distribution> {
-    match join_type {
-        JoinType::Inner => {
-            // need the left data, and the right should be one partition
-            vec![
-                Distribution::UnspecifiedDistribution,
-                Distribution::SinglePartition,
-            ]
-        }
-        JoinType::Right => {
-            // need the right data, and the left should be one partition
-            vec![
-                Distribution::SinglePartition,
-                Distribution::UnspecifiedDistribution,
-            ]
-        }
-        _ => unreachable!(),
     }
 }
 
@@ -1241,7 +1175,7 @@ mod fuzzy_tests {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn partitioned_aggragotor_nl_with_filter_group_by(
+    async fn partitioned_aggregator_nl_with_filter_group_by(
         left: Arc<dyn ExecutionPlan>,
         right: Arc<dyn ExecutionPlan>,
         filter: JoinFilter,
@@ -1250,7 +1184,8 @@ mod fuzzy_tests {
         fetch_per_key: usize,
         working_mode: SlidingWindowWorkingMode,
     ) -> Result<Vec<RecordBatch>> {
-        let partition_count = 2;
+        // TODO: Will change after broadcast implementation.
+        let partition_count = 1;
         let distribution = distribution_from_join_type(join_type);
         // left
         let left = if matches!(distribution[0], Distribution::SinglePartition) {
@@ -1289,7 +1224,7 @@ mod fuzzy_tests {
             join_type,
             left_sort_expr,
             right_sort_expr,
-            fetch_per_key,
+            Some(fetch_per_key),
             working_mode,
         )?);
 
@@ -1355,7 +1290,7 @@ mod fuzzy_tests {
         fetch_per_key: usize,
         working_mode: SlidingWindowWorkingMode,
     ) -> Result<()> {
-        let first_batches = partitioned_aggragotor_nl_with_filter_group_by(
+        let first_batches = partitioned_aggregator_nl_with_filter_group_by(
             left.clone(),
             right.clone(),
             filter.clone(),

@@ -605,13 +605,11 @@ fn transform_orders(
         .take_while(|order| {
             let columns = collect_columns(&order.expr);
             let columns = columns.iter().collect::<Vec<_>>();
-            columns
-                .iter()
-                .any(|c| {
-                    indices
-                        .iter()
-                        .any(|(_ind, col_ind)| col_ind.index == c.index())
-                })
+            columns.iter().any(|c| {
+                indices
+                    .iter()
+                    .any(|(_ind, col_ind)| col_ind.index == c.index())
+            })
         })
         .filter_map(|order| {
             let mut order = order.clone();
