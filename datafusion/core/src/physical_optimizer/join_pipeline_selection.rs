@@ -1001,10 +1001,8 @@ fn direct_state_parameters_to_children(
             .iter()
             .map(|expr| update_expr(expr, proj_exec.expr(), true))
             .collect::<Result<Vec<_>>>()?;
-        let prevent_intermediate_expr = prevent_intermediate_expr
-            .into_iter()
-            .filter_map(|e| e)
-            .collect();
+        let prevent_intermediate_expr =
+            prevent_intermediate_expr.into_iter().flatten().collect();
         Ok(vec![(aggr_exprs, groupby_exprs, prevent_intermediate_expr)])
     } else if is_executor_trivial(plan) {
         // Operators that do not change the schema and have a single child can
@@ -1030,7 +1028,7 @@ fn direct_state_parameters_to_children(
             );
         let res = aggregate_state
             .into_iter()
-            .zip(preventing_to_be_intermediate.into_iter())
+            .zip(preventing_to_be_intermediate)
             .map(
                 |((aggregate_exprs, group_by_exprs), preventing_to_be_intermediate)| {
                     (
@@ -1185,7 +1183,7 @@ fn find_placeholder_joins_and_change(
     group_by_exprs: &[Arc<dyn PhysicalExpr>],
     prevent_intermediate_expr: &[Arc<dyn PhysicalExpr>],
     plan: &Arc<dyn ExecutionPlan>,
-    config_options: &ConfigOptions,
+    _config_options: &ConfigOptions,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     // Check if the plan has no children or is already an aggregation, and return early if so.
     if plan.children().is_empty()
@@ -1267,7 +1265,7 @@ fn find_placeholder_joins_and_change(
                         &group_by_exprs,
                         &prevent_exprs,
                         child,
-                        config_options,
+                        _config_options,
                     )
                 }
                 _ => {
@@ -1703,7 +1701,7 @@ fn create_left_equijoin_prunable_plan(
             hash_join.right.clone(),
             hash_join.left.clone(),
             swap_join_on(hash_join.on()),
-            swap_filter(&filter),
+            swap_filter(filter),
             &swap_join_type(*hash_join.join_type()),
             hash_join.null_equals_null(),
             right_order.to_vec(),
@@ -2150,7 +2148,7 @@ fn create_left_prunable_nested_loop_plan(
         let join = Arc::new(AggregativeNestedLoopJoinExec::try_new(
             nested_loop_join.right().clone(),
             nested_loop_join.left().clone(),
-            swap_filter(&filter),
+            swap_filter(filter),
             &swap_join_type(*nested_loop_join.join_type()),
             right_order.to_vec(),
             left_order.to_vec(),
