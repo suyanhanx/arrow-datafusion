@@ -388,10 +388,9 @@ SlidingNestedLoopJoinExec: join_type=Inner, filter=n_nationkey@1 > c_custkey@0 A
 --------CoalesceBatchesExec: target_batch_size=8192
 ----------FilterExec: l_returnflag@1 = R
 ------------StreamingTableExec: partition_sizes=1, projection=[l_orderkey, l_returnflag, l_shipdate], infinite_source=true, output_ordering=[l_orderkey@0 ASC NULLS LAST]
-------ProjectionExec: expr=[c_custkey@2 as c_custkey, c_nationkey@3 as c_nationkey, o_orderkey@0 as o_orderkey, o_orderdate@1 as o_orderdate]
---------SortMergeJoin: join_type=Inner, on=[(o_orderkey@0, c_custkey@0)]
-----------StreamingTableExec: partition_sizes=1, projection=[o_orderkey, o_orderdate], infinite_source=true, output_ordering=[o_orderkey@0 ASC NULLS LAST]
-----------StreamingTableExec: partition_sizes=1, projection=[c_custkey, c_nationkey], infinite_source=true, output_ordering=[c_custkey@0 ASC NULLS LAST]
+------SortMergeJoin: join_type=Inner, on=[(c_custkey@0, o_orderkey@0)]
+--------StreamingTableExec: partition_sizes=1, projection=[c_custkey, c_nationkey], infinite_source=true, output_ordering=[c_custkey@0 ASC NULLS LAST]
+--------StreamingTableExec: partition_sizes=1, projection=[o_orderkey, o_orderdate], infinite_source=true, output_ordering=[o_orderkey@0 ASC NULLS LAST]
 --StreamingTableExec: partition_sizes=1, projection=[n_nationkey, n_name, n_regionkey, n_comment, n_rev], infinite_source=true, output_ordering=[n_nationkey@0 ASC NULLS LAST]
 
 query TT

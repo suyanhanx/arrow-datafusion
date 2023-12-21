@@ -481,10 +481,10 @@ Sort: s.sn ASC NULLS LAST
 physical_plan
 SortPreservingMergeExec: [ts@0 ASC NULLS LAST,sn@1 ASC NULLS LAST]
 --ProjectionExec: expr=[ts@1 as ts, sn@0 as sn, amount@2 as amount, currency@3 as currency, CAST(amount@2 AS Float32) * FIRST_VALUE(e.rate) ORDER BY [e.sn DESC NULLS FIRST]@4 as amount_usd]
-----AggregateExec: mode=FinalPartitioned, gby=[sn@0 as sn, ts@1 as ts, amount@2 as amount, currency@3 as currency], aggr=[LAST_VALUE(e.rate)], ordering_mode=PartiallySorted([0, 1])
+----AggregateExec: mode=FinalPartitioned, gby=[sn@0 as sn, ts@1 as ts, amount@2 as amount, currency@3 as currency], aggr=[FIRST_VALUE(e.rate)], ordering_mode=PartiallySorted([0, 1])
 ------CoalesceBatchesExec: target_batch_size=8192
 --------RepartitionExec: partitioning=Hash([sn@0, ts@1, amount@2, currency@3], 4), input_partitions=4, preserve_order=true, sort_exprs=sn@0 ASC NULLS LAST,ts@1 ASC NULLS LAST
-----------AggregateExec: mode=Partial, gby=[sn@1 as sn, ts@0 as ts, amount@2 as amount, currency@3 as currency], aggr=[LAST_VALUE(e.rate)], ordering_mode=PartiallySorted([0, 1])
+----------AggregateExec: mode=Partial, gby=[sn@1 as sn, ts@0 as ts, amount@2 as amount, currency@3 as currency], aggr=[FIRST_VALUE(e.rate)], ordering_mode=PartiallySorted([0, 1])
 ------------ProjectionExec: expr=[ts@4 as ts, sn@5 as sn, amount@6 as amount, currency@7 as currency, sn@1 as sn, rate@3 as rate]
 --------------AggregativeHashJoinExec: join_type=Inner, on=[(currency_from@2, currency@3)], filter=ts@0 >= ts@1
 ----------------CoalesceBatchesExec: target_batch_size=8192

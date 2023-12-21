@@ -32,7 +32,6 @@ use crate::{
 
 use arrow::datatypes::{DataType, TimeUnit};
 use datafusion_common::tree_node::{TreeNode, VisitRecursion};
-use datafusion_common::utils::get_at_indices;
 use datafusion_common::{
     internal_err, plan_datafusion_err, plan_err, Column, DFField, DFSchema, DFSchemaRef,
     DataFusionError, Result, ScalarValue, TableReference,

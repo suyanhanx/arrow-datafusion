@@ -38,7 +38,10 @@ use datafusion_physical_expr::expressions::{Column, FirstValue, LastValue};
 use datafusion_physical_expr::utils::{
     collect_columns, get_indices_of_matching_sort_exprs_with_order_eq,
 };
-use datafusion_physical_expr::{reverse_order_bys, split_conjunction, AggregateExpr, PhysicalExpr, PhysicalSortExpr, PhysicalSortRequirement, EquivalenceProperties, physical_exprs_contains};
+use datafusion_physical_expr::{
+    physical_exprs_contains, reverse_order_bys, split_conjunction, AggregateExpr,
+    EquivalenceProperties, PhysicalExpr, PhysicalSortExpr, PhysicalSortRequirement,
+};
 use datafusion_physical_plan::joins::prunability::{
     is_filter_expr_prunable, separate_columns_of_filter_expression,
 };
@@ -1049,12 +1052,15 @@ fn direct_state_parameters_to_children(
     }
 }
 
-fn decide_fetch(left_child_aggregate_exprs: &AggregateExprs, left_eq_properties: &EquivalenceProperties) -> Option<usize> {
+fn decide_fetch(
+    left_child_aggregate_exprs: &AggregateExprs,
+    left_eq_properties: &EquivalenceProperties,
+) -> Option<usize> {
     if left_child_aggregate_exprs.iter().all(|expr| {
         let req = expr.order_bys().unwrap_or_default();
         (expr.as_any().is::<LastValue>() && left_eq_properties.ordering_satisfy(req))
             || (expr.as_any().is::<FirstValue>()
-            && left_eq_properties.ordering_satisfy(&reverse_order_bys(req)))
+                && left_eq_properties.ordering_satisfy(&reverse_order_bys(req)))
     }) {
         Some(1)
     } else {
@@ -1070,12 +1076,16 @@ fn decide_fetch_on_aggregative_hash_join(
     if let [(Some(left_child_aggregate_exprs), Some(left_groupbys), left_prevent), (_, Some(right_groupbys), _)] =
         state_parameters
     {
-        let on_exprs = placeholder_ahj.on().iter().map(|(l,_)| {
-            Arc::new(l.clone()) as _
-        }).collect::<Vec<_>>();
+        let on_exprs = placeholder_ahj
+            .on()
+            .iter()
+            .map(|(l, _)| Arc::new(l.clone()) as _)
+            .collect::<Vec<_>>();
 
         let normalized_on_exprs = left_eq_properties.eq_group().normalize_exprs(on_exprs);
-        let normalized_left_prevent = left_eq_properties.eq_group().normalize_exprs(left_prevent.clone());
+        let normalized_left_prevent = left_eq_properties
+            .eq_group()
+            .normalize_exprs(left_prevent.clone());
 
         // GROUP BY expression should be empty for the build side.
         // GROUP BY expression must be available for the probe side.
@@ -1085,18 +1095,23 @@ fn decide_fetch_on_aggregative_hash_join(
         if right_groupbys.is_empty()
             || !left_groupbys.is_empty()
             || left_child_aggregate_exprs.is_empty()
-            || !normalized_left_prevent.iter().all(|expr| physical_exprs_contains(&normalized_on_exprs, expr))
+            || !normalized_left_prevent
+                .iter()
+                .all(|expr| physical_exprs_contains(&normalized_on_exprs, expr))
         {
             return Ok(None);
         }
 
-        let fetch_per_key = if let Some(fetch_per_key) = decide_fetch(left_child_aggregate_exprs, &left_eq_properties){
+        let fetch_per_key = if let Some(fetch_per_key) =
+            decide_fetch(left_child_aggregate_exprs, &left_eq_properties)
+        {
             fetch_per_key
-        }else {
-            return Ok(None)
+        } else {
+            return Ok(None);
         };
 
-        return Some(replace_placeholder_with_ahj(placeholder_ahj, fetch_per_key)).transpose();
+        return Some(replace_placeholder_with_ahj(placeholder_ahj, fetch_per_key))
+            .transpose();
     }
     Ok(None)
 }
@@ -1122,13 +1137,19 @@ fn decide_fetch_on_aggregative_nested_loop_join(
             return Ok(None);
         }
 
-        let fetch_per_key = if let Some(fetch_per_key) = decide_fetch(left_child_aggregate_exprs, &left_eq_properties){
+        let fetch_per_key = if let Some(fetch_per_key) =
+            decide_fetch(left_child_aggregate_exprs, &left_eq_properties)
+        {
             fetch_per_key
-        }else {
-            return Ok(None)
+        } else {
+            return Ok(None);
         };
 
-        return Some(replace_placeholder_with_anlj(placeholder_anlj, fetch_per_key)).transpose();
+        return Some(replace_placeholder_with_anlj(
+            placeholder_anlj,
+            fetch_per_key,
+        ))
+        .transpose();
     }
     Ok(None)
 }
@@ -1181,22 +1202,30 @@ fn find_placeholder_joins_and_change(
     )?;
 
     // Modify the plan if it's an aggregative hash join or nested loop join.
-    let plan = if let Some(placeholder_ahj) = plan.as_any().downcast_ref::<AggregativeHashJoinExec>()
+    let plan = if let Some(placeholder_ahj) =
+        plan.as_any().downcast_ref::<AggregativeHashJoinExec>()
     {
-        if let Some(converted_plan) = decide_fetch_on_aggregative_hash_join(placeholder_ahj, &state_parameters)?{
+        if let Some(converted_plan) =
+            decide_fetch_on_aggregative_hash_join(placeholder_ahj, &state_parameters)?
+        {
             Cow::Owned(converted_plan)
-        }else {
+        } else {
             Cow::Borrowed(plan)
         }
     } else {
         Cow::Borrowed(plan)
     };
 
-    let plan = if let Some(placeholder_anlj) = plan.as_any().downcast_ref::<AggregativeNestedLoopJoinExec>()
+    let plan = if let Some(placeholder_anlj) = plan
+        .as_any()
+        .downcast_ref::<AggregativeNestedLoopJoinExec>()
     {
-        if let Some(converted_plan) = decide_fetch_on_aggregative_nested_loop_join(placeholder_anlj, &state_parameters)?{
+        if let Some(converted_plan) = decide_fetch_on_aggregative_nested_loop_join(
+            placeholder_anlj,
+            &state_parameters,
+        )? {
             Cow::Owned(converted_plan)
-        }else {
+        } else {
             plan
         }
     } else {
@@ -1537,8 +1566,6 @@ fn handle_streamable_hash_join_conversion(
 ) -> Result<Vec<Arc<dyn ExecutionPlan>>> {
     let (left_prunable, right_prunable) = is_filter_expr_prunable(
         filter,
-        Some(left_order[0].clone()),
-        Some(right_order[0].clone()),
         &hash_join.left().equivalence_properties(),
         &hash_join.right().equivalence_properties(),
     )?;
@@ -1662,8 +1689,6 @@ fn create_left_equijoin_prunable_plan(
     let prunable = new_filters.iter().all(|f| {
         let (left_prunable, _) = is_filter_expr_prunable(
             f,
-            Some(left_order[0].clone()),
-            Some(right_order[0].clone()),
             &hash_join.left().equivalence_properties(),
             &hash_join.right().equivalence_properties(),
         )
@@ -1748,8 +1773,6 @@ fn create_right_equijoin_prunable_plan(
     let prunable = new_filters.iter().all(|f| {
         let (_, right_prunable) = is_filter_expr_prunable(
             f,
-            Some(left_order[0].clone()),
-            Some(right_order[0].clone()),
             &hash_join.left().equivalence_properties(),
             &hash_join.right().equivalence_properties(),
         )
@@ -2003,8 +2026,6 @@ fn handle_streamable_nested_loop_conversion(
 ) -> Result<Vec<Arc<dyn ExecutionPlan>>> {
     let (left_prunable, right_prunable) = is_filter_expr_prunable(
         filter,
-        Some(left_order[0].clone()),
-        Some(right_order[0].clone()),
         &nested_loop_join.left().equivalence_properties(),
         &nested_loop_join.right().equivalence_properties(),
     )?;
@@ -2124,8 +2145,6 @@ fn create_left_prunable_nested_loop_plan(
     let prunable = new_filters.iter().all(|f| {
         let (left_prunable, _) = is_filter_expr_prunable(
             f,
-            Some(left_order[0].clone()),
-            Some(right_order[0].clone()),
             &nested_loop_join.left().equivalence_properties(),
             &nested_loop_join.right().equivalence_properties(),
         )
@@ -2190,8 +2209,6 @@ fn create_right_prunable_nested_loop_plan(
     let prunable = new_filters.iter().all(|f| {
         let (_, right_prunable) = is_filter_expr_prunable(
             f,
-            Some(left_order[0].clone()),
-            Some(right_order[0].clone()),
             &nested_loop_join.left().equivalence_properties(),
             &nested_loop_join.right().equivalence_properties(),
         )

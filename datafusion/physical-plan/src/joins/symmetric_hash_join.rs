@@ -73,7 +73,6 @@ use datafusion_execution::TaskContext;
 use datafusion_physical_expr::equivalence::join_equivalence_properties;
 use datafusion_physical_expr::intervals::cp_solver::ExprIntervalGraph;
 
-use crate::joins::stream_join_utils::StreamJoinMetrics;
 use ahash::RandomState;
 use futures::Stream;
 use hashbrown::HashSet;

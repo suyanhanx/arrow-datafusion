@@ -335,6 +335,35 @@ impl AggregateExec {
             group_by.contains_null(),
             mode,
         )?;
+        let schema = Arc::new(materialize_dict_group_keys(
+            &original_schema,
+            group_by.expr.len(),
+        ));
+        let original_schema = Arc::new(original_schema);
+
+        AggregateExec::try_new_with_schema(
+            mode,
+            group_by,
+            aggr_expr,
+            filter_expr,
+            input,
+            input_schema,
+            schema,
+            original_schema,
+        )
+    }
+
+    /// Create a new hash aggregate execution plan
+    pub fn try_new_with_schema(
+        mode: AggregateMode,
+        group_by: PhysicalGroupBy,
+        mut aggr_expr: Vec<Arc<dyn AggregateExpr>>,
+        filter_expr: Vec<Option<Arc<dyn PhysicalExpr>>>,
+        input: Arc<dyn ExecutionPlan>,
+        input_schema: SchemaRef,
+        schema: SchemaRef,
+        original_schema: SchemaRef,
+    ) -> Result<Self> {
         let input_eq_properties = input.equivalence_properties();
         let aggregate_groups = get_aggregate_expr_groups(
             &mut aggr_expr,
@@ -342,11 +371,6 @@ impl AggregateExec {
             &input_eq_properties,
             &mode,
         )?;
-        let schema = Arc::new(materialize_dict_group_keys(
-            &original_schema,
-            group_by.expr.len(),
-        ));
-        let original_schema = Arc::new(original_schema);
 
         // Get GROUP BY expressions:
         let groupby_exprs = group_by.input_exprs();

@@ -54,8 +54,6 @@ pub fn is_filter_expr_prunable(
         right_equal_properties,
     );
 
-    // println!("new_eq {:?}", new_eq);
-
     let initial_expr = ExprPrunability::new(filter.expression.clone());
     let transformed_expr = initial_expr.transform_up(&|expr| {
         update_prunability(
@@ -477,9 +475,6 @@ fn transform_orders(
                         .unwrap();
                     order
                 })
-                .unwrap();
-            Some(eq.eq_group().normalize_sort_exprs(&[order])[0].clone())
-            // normalize_sort_expr_with_equivalence_properties(order, eq.classes())
         })
         .collect()
 }
