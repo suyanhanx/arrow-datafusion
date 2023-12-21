@@ -105,7 +105,7 @@ use crate::catalog::listing_schema::ListingSchemaProvider;
 use crate::datasource::object_store::ObjectStoreUrl;
 use datafusion_optimizer::{
     analyzer::{Analyzer, AnalyzerRule},
-    generate_possible_join_orders, OptimizerConfig,
+    OptimizerConfig,
 };
 use datafusion_sql::planner::object_name_to_table_reference;
 use uuid::Uuid;
@@ -115,6 +115,7 @@ use crate::datasource::provider::DefaultTableFactory;
 use crate::execution::options::ArrowReadOptions;
 pub use datafusion_execution::config::SessionConfig;
 pub use datafusion_execution::TaskContext;
+use datafusion_optimizer::generate_join_orders::generate_possible_join_orders;
 
 use super::options::ReadOptions;
 

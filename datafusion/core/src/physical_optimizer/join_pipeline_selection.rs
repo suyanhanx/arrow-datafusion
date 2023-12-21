@@ -977,12 +977,14 @@ fn is_executor_trivial(plan: &Arc<dyn ExecutionPlan>) -> bool {
         || plan.as_any().is::<RepartitionExec>()
 }
 
+type StateParameters = (Option<AggregateExprs>, Option<PhysicalExprs>, PhysicalExprs);
+
 fn direct_state_parameters_to_children(
     plan: &Arc<dyn ExecutionPlan>,
     aggregate_exprs: &[Arc<dyn AggregateExpr>],
     group_by_exprs: &[Arc<dyn PhysicalExpr>],
     prevent_intermediate_expr: &[Arc<dyn PhysicalExpr>],
-) -> Result<Vec<(Option<AggregateExprs>, Option<PhysicalExprs>, PhysicalExprs)>> {
+) -> Result<Vec<StateParameters>> {
     if let Some(proj_exec) = plan.as_any().downcast_ref::<ProjectionExec>() {
         // Rewrite aggregate expressions in terms of input of the projection:
         let aggr_exprs = aggregate_exprs
@@ -5875,7 +5877,7 @@ mod sql_fuzzy_tests {
     use datafusion_execution::config::SessionConfig;
     use datafusion_expr::expr::Sort;
     use datafusion_expr::{col, Expr};
-    use itertools::{izip, Itertools};
+    use itertools::izip;
     use std::path::PathBuf;
     use std::sync::{Arc, OnceLock};
 

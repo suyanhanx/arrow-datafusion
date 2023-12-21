@@ -72,14 +72,13 @@ Limit: skip=0, fetch=10
 ------------Projection: part.p_partkey, part.p_mfgr, supplier.s_name, supplier.s_address, supplier.s_phone, supplier.s_acctbal, supplier.s_comment, partsupp.ps_supplycost, nation.n_name, nation.n_regionkey
 --------------Inner Join: supplier.s_nationkey = nation.n_nationkey
 ----------------Projection: part.p_partkey, part.p_mfgr, supplier.s_name, supplier.s_address, supplier.s_nationkey, supplier.s_phone, supplier.s_acctbal, supplier.s_comment, partsupp.ps_supplycost
-------------------Inner Join: partsupp.ps_suppkey = supplier.s_suppkey
---------------------Projection: part.p_partkey, part.p_mfgr, partsupp.ps_suppkey, partsupp.ps_supplycost
-----------------------Inner Join: part.p_partkey = partsupp.ps_partkey
-------------------------Projection: part.p_partkey, part.p_mfgr
---------------------------Filter: part.p_size = Int32(15) AND part.p_type LIKE Utf8("%BRASS")
-----------------------------TableScan: part projection=[p_partkey, p_mfgr, p_type, p_size], partial_filters=[part.p_size = Int32(15), part.p_type LIKE Utf8("%BRASS")]
-------------------------TableScan: partsupp projection=[ps_partkey, ps_suppkey, ps_supplycost]
---------------------TableScan: supplier projection=[s_suppkey, s_name, s_address, s_nationkey, s_phone, s_acctbal, s_comment]
+------------------Inner Join: part.p_partkey = partsupp.ps_partkey, supplier.s_suppkey = partsupp.ps_suppkey
+--------------------CrossJoin:
+----------------------Projection: part.p_partkey, part.p_mfgr
+------------------------Filter: part.p_size = Int32(15) AND part.p_type LIKE Utf8("%BRASS")
+--------------------------TableScan: part projection=[p_partkey, p_mfgr, p_type, p_size], partial_filters=[part.p_size = Int32(15), part.p_type LIKE Utf8("%BRASS")]
+----------------------TableScan: supplier projection=[s_suppkey, s_name, s_address, s_nationkey, s_phone, s_acctbal, s_comment]
+--------------------TableScan: partsupp projection=[ps_partkey, ps_suppkey, ps_supplycost]
 ----------------TableScan: nation projection=[n_nationkey, n_name, n_regionkey]
 ------------Projection: region.r_regionkey
 --------------Filter: region.r_name = Utf8("EUROPE")
