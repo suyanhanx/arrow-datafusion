@@ -6214,7 +6214,33 @@ mod sql_fuzzy_tests {
     #[tokio::test]
     async fn test_partitioned_swap() -> Result<()> {
         let sql = "SELECT
-            o_orderkey, LAST_VALUE(l_suppkey ORDER BY l_orderkey) AS amount_usd
+            o_orderkey, LAST_VALUE(l_suppkey ORDER BY l_orderkey, l_partkey) AS amount_usd
+        FROM
+            orders,
+            lineitem
+        WHERE
+            o_orderdate = l_shipdate
+            AND l_orderkey < o_orderkey - 10
+        GROUP BY o_orderkey";
+
+        let expected_plan = [
+            "ProjectionExec: expr=[o_orderkey@0 as o_orderkey, LAST_VALUE(lineitem.l_suppkey) ORDER BY [lineitem.l_orderkey ASC NULLS LAST, lineitem.l_partkey ASC NULLS LAST]@1 as amount_usd]",
+            "  AggregateExec: mode=Single, gby=[o_orderkey@0 as o_orderkey], aggr=[LAST_VALUE(lineitem.l_suppkey)], ordering_mode=Sorted",
+            "    ProjectionExec: expr=[o_orderkey@4 as o_orderkey, l_orderkey@0 as l_orderkey, l_partkey@1 as l_partkey, l_suppkey@2 as l_suppkey]",
+            "      AggregativeHashJoinExec: join_type=Inner, on=[(l_shipdate@3, o_orderdate@1)], filter=l_orderkey@1 < o_orderkey@0 - 10",
+            "        CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/lineitem.csv]]}, projection=[l_orderkey, l_partkey, l_suppkey, l_shipdate], infinite_source=true, output_orderings=[[l_orderkey@0 ASC NULLS LAST], [l_partkey@1 ASC NULLS LAST]], has_header=true",
+            "        CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/orders.csv]]}, projection=[o_orderkey, o_orderdate], infinite_source=true, output_ordering=[o_orderkey@0 ASC NULLS LAST], has_header=true",
+        ]
+            ;
+
+        experiment(&expected_plan, sql).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_partitioned_swap_with_filter() -> Result<()> {
+        let sql = "SELECT
+            o_orderkey, LAST_VALUE(l_suppkey ORDER BY l_orderkey, l_partkey) AS amount_usd
         FROM
             orders,
             lineitem
@@ -6225,14 +6251,14 @@ mod sql_fuzzy_tests {
         GROUP BY o_orderkey";
 
         let expected_plan = [
-            "ProjectionExec: expr=[o_orderkey@0 as o_orderkey, LAST_VALUE(lineitem.l_suppkey) ORDER BY [lineitem.l_orderkey ASC NULLS LAST]@1 as amount_usd]",
+            "ProjectionExec: expr=[o_orderkey@0 as o_orderkey, LAST_VALUE(lineitem.l_suppkey) ORDER BY [lineitem.l_orderkey ASC NULLS LAST, lineitem.l_partkey ASC NULLS LAST]@1 as amount_usd]",
             "  AggregateExec: mode=Single, gby=[o_orderkey@0 as o_orderkey], aggr=[LAST_VALUE(lineitem.l_suppkey)], ordering_mode=Sorted",
-            "    ProjectionExec: expr=[o_orderkey@3 as o_orderkey, l_orderkey@0 as l_orderkey, l_suppkey@1 as l_suppkey]",
-            "      AggregativeHashJoinExec: join_type=Inner, on=[(l_shipdate@2, o_orderdate@1)], filter=l_orderkey@1 < o_orderkey@0 - 10",
-            "        ProjectionExec: expr=[l_orderkey@0 as l_orderkey, l_suppkey@1 as l_suppkey, l_shipdate@3 as l_shipdate]",
+            "    ProjectionExec: expr=[o_orderkey@4 as o_orderkey, l_orderkey@0 as l_orderkey, l_partkey@1 as l_partkey, l_suppkey@2 as l_suppkey]",
+            "      AggregativeHashJoinExec: join_type=Inner, on=[(l_shipdate@3, o_orderdate@1)], filter=l_orderkey@1 < o_orderkey@0 - 10",
+            "        ProjectionExec: expr=[l_orderkey@0 as l_orderkey, l_partkey@1 as l_partkey, l_suppkey@2 as l_suppkey, l_shipdate@4 as l_shipdate]",
             "          CoalesceBatchesExec: target_batch_size=8192",
-            "            FilterExec: l_returnflag@2 = R",
-            "              CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/lineitem.csv]]}, projection=[l_orderkey, l_suppkey, l_returnflag, l_shipdate], infinite_source=true, output_ordering=[l_orderkey@0 ASC NULLS LAST], has_header=true",
+            "            FilterExec: l_returnflag@3 = R",
+            "              CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/lineitem.csv]]}, projection=[l_orderkey, l_partkey, l_suppkey, l_returnflag, l_shipdate], infinite_source=true, output_orderings=[[l_orderkey@0 ASC NULLS LAST], [l_partkey@1 ASC NULLS LAST]], has_header=true",
             "        CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/orders.csv]]}, projection=[o_orderkey, o_orderdate], infinite_source=true, output_ordering=[o_orderkey@0 ASC NULLS LAST], has_header=true",
         ];
 
