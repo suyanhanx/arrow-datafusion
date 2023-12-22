@@ -779,7 +779,9 @@ impl LogicalPlan {
             }
             LogicalPlan::CrossJoin(_) => {
                 let left = inputs[0].clone();
+                let left_schema = left.schema();
                 let right = inputs[1].clone();
+                let right_schema = right.schema();
                 if expr.is_empty() {
                     // If expr is empty, construct cross join from children
                     LogicalPlanBuilder::from(left).cross_join(right)?.build()
@@ -799,7 +801,32 @@ impl LogicalPlan {
                             right,
                         }) = unalias_expr
                         {
-                            new_on.push((*left, *right));
+                            let left_cols = left.to_columns()?;
+                            let right_cols = right.to_columns()?;
+                            // columns of the left side of the binary expression comes from the right child.
+                            // and columns of the right side of the binary expression comes from the left child.
+                            let should_swap =
+                                left_cols.iter().all(|col| right_schema.has_column(col))
+                                    && right_cols
+                                        .iter()
+                                        .all(|col| left_schema.has_column(col));
+
+                            // columns of the left side of the binary expression comes from the left child.
+                            // and columns of the right side of the binary expression comes from the right child.
+                            let shouldnt_swap =
+                                left_cols.iter().all(|col| left_schema.has_column(col))
+                                    && right_cols
+                                        .iter()
+                                        .all(|col| right_schema.has_column(col));
+                            // TODO: Add consistency check
+                            if shouldnt_swap {
+                                new_on.push((*left, *right));
+                            } else if should_swap {
+                                new_on.push((*right, *left));
+                            } else {
+                                // Equality expression should come from different sides;
+                                unreachable!();
+                            }
                         } else {
                             new_filters.push(expr.clone());
                         }

@@ -38,7 +38,6 @@ use datafusion_common::{
     DataFusionError, Result, ScalarValue, TableReference,
 };
 
-use datafusion_common::utils::get_at_indices;
 use sqlparser::ast::{ExceptSelectItem, ExcludeSelectItem, WildcardAdditionalOptions};
 
 ///  The value to which `COUNT(*)` is expanded to in

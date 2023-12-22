@@ -348,7 +348,7 @@ fn try_collect_left(
     }
 }
 
-fn aggregative_hash_join(hash_join: &HashJoinExec) -> Result<Arc<dyn ExecutionPlan>> {
+fn partitioned_hash_join(hash_join: &HashJoinExec) -> Result<Arc<dyn ExecutionPlan>> {
     let left = hash_join.left();
     let right = hash_join.right();
     if should_swap_join_order(&**left, &**right)? && supports_swap(*hash_join.join_type())
@@ -385,11 +385,11 @@ pub(crate) fn statistical_join_selection_hash_join(
     let new_plan = match hash_join.partition_mode() {
         PartitionMode::Auto => try_collect_left(hash_join, Some(collect_left_threshold))?
             .map_or_else(
-                || aggregative_hash_join(hash_join).map(Some),
+                || partitioned_hash_join(hash_join).map(Some),
                 |v| Ok(Some(v)),
             )?,
         PartitionMode::CollectLeft => try_collect_left(hash_join, None)?.map_or_else(
-            || aggregative_hash_join(hash_join).map(Some),
+            || partitioned_hash_join(hash_join).map(Some),
             |v| Ok(Some(v)),
         )?,
         PartitionMode::Partitioned => {
