@@ -43,8 +43,9 @@ pub fn is_filter_expr_prunable(
     left_equal_properties: &EquivalenceProperties,
     right_equal_properties: &EquivalenceProperties,
 ) -> Result<(bool, bool)> {
-    let left_indices = collect_one_side_columns(&filter.column_indices, JoinSide::Left);
-    let right_indices = collect_one_side_columns(&filter.column_indices, JoinSide::Right);
+    let left_indices = collect_one_side_columns(filter.column_indices(), JoinSide::Left);
+    let right_indices =
+        collect_one_side_columns(filter.column_indices(), JoinSide::Right);
 
     let new_eq = merge_equivalence_classes_for_intermediate_schema(
         &left_indices,
@@ -54,7 +55,7 @@ pub fn is_filter_expr_prunable(
         right_equal_properties,
     );
 
-    let initial_expr = ExprPrunability::new(filter.expression.clone());
+    let initial_expr = ExprPrunability::new(filter.expression().clone());
     let transformed_expr = initial_expr.transform_up(&|expr| {
         update_prunability(
             expr,
@@ -674,8 +675,11 @@ fn get_pruneside_at_and(left: &PrunabilityState, right: &PrunabilityState) -> Ta
 /// it belongs to. After all vectors have been rearranged in this way, [`BinaryExpr`]
 /// trees are created for the left and right sides.
 pub fn separate_columns_of_filter_expression(mut filter: JoinFilter) -> JoinFilter {
-    filter.expression =
-        separate_expr(filter.expression, &filter.column_indices, &filter.schema);
+    filter.expression = separate_expr(
+        filter.expression.clone(),
+        filter.column_indices(),
+        filter.schema(),
+    );
     filter
 }
 

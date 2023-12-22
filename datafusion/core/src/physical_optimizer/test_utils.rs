@@ -56,6 +56,7 @@ use datafusion_physical_expr::expressions::{col, BinaryExpr, Literal};
 use datafusion_physical_expr::intervals::test_utils::gen_conjunctive_numerical_expr;
 use datafusion_physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
 
+use crate::datasource::stream::{StreamConfig, StreamTable};
 use async_trait::async_trait;
 
 async fn register_current_csv(
@@ -65,14 +66,19 @@ async fn register_current_csv(
 ) -> Result<()> {
     let testdata = crate::test_util::arrow_test_data();
     let schema = crate::test_util::aggr_test_schema();
-    ctx.register_csv(
-        table_name,
-        &format!("{testdata}/csv/aggregate_test_100.csv"),
-        CsvReadOptions::new()
-            .schema(&schema)
-            .mark_infinite(infinite),
-    )
-    .await?;
+    let path = format!("{testdata}/csv/aggregate_test_100.csv");
+
+    match infinite {
+        true => {
+            let config = StreamConfig::new_file(schema, path.into());
+            ctx.register_table(table_name, Arc::new(StreamTable::new(Arc::new(config))))?;
+        }
+        false => {
+            ctx.register_csv(table_name, &path, CsvReadOptions::new().schema(&schema))
+                .await?;
+        }
+    }
+
     Ok(())
 }
 
@@ -294,7 +300,6 @@ pub fn parquet_exec(schema: &SchemaRef) -> Arc<ParquetExec> {
             limit: None,
             table_partition_cols: vec![],
             output_ordering: vec![],
-            infinite_source: false,
         },
         None,
         None,
@@ -318,7 +323,6 @@ pub fn parquet_exec_sorted(
             limit: None,
             table_partition_cols: vec![],
             output_ordering: vec![sort_exprs],
-            infinite_source: false,
         },
         None,
         None,

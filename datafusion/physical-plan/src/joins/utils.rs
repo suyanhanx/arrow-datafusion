@@ -853,6 +853,22 @@ impl<T: 'static> OnceFut<T> {
             ),
         }
     }
+
+    /// Get shared reference to the result of the computation if it is ready, without consuming it
+    pub(crate) fn get_shared(&mut self, cx: &mut Context<'_>) -> Poll<Result<Arc<T>>> {
+        if let OnceFutState::Pending(fut) = &mut self.state {
+            let r = ready!(fut.poll_unpin(cx));
+            self.state = OnceFutState::Ready(r);
+        }
+
+        match &self.state {
+            OnceFutState::Pending(_) => unreachable!(),
+            OnceFutState::Ready(r) => Poll::Ready(
+                r.clone()
+                    .map_err(|e| DataFusionError::External(Box::new(e))),
+            ),
+        }
+    }
 }
 
 /// Some type `join_type` of join need to maintain the matched indices bit map for the left side, and

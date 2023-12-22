@@ -266,7 +266,6 @@ impl RecordBatchBroadcastStreamsBuilder {
         while let Some(item) = stream.next().await {
             // Clone the item for each broadcast channel
             if let Ok(item) = &item {
-                println!("item bastim");
                 for channel in txs.iter_mut() {
                     channel
                         .send(Ok(item.clone()))
@@ -275,7 +274,6 @@ impl RecordBatchBroadcastStreamsBuilder {
                 }
             }
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
         Ok(())
     }
 

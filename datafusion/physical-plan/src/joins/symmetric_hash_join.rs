@@ -45,10 +45,9 @@ use crate::{
     joins::StreamJoinPartitionMode,
     joins::{
         stream_join_utils::{
-            build_filter_input_order, calculate_side_prune_length_helper,
-            combine_two_batches, get_pruning_anti_indices, get_pruning_semi_indices,
-            prepare_sorted_exprs, record_visited_indices, EagerJoinStream,
-            EagerJoinStreamState, PruningJoinHashMap, SortedFilterExpr,
+            build_filter_input_order, combine_two_batches, get_pruning_anti_indices,
+            get_pruning_semi_indices, prepare_sorted_exprs, record_visited_indices,
+            EagerJoinStream, EagerJoinStreamState, PruningJoinHashMap, SortedFilterExpr,
             StreamJoinMetrics, StreamJoinStateResult,
         },
         utils::{
@@ -73,6 +72,7 @@ use datafusion_execution::TaskContext;
 use datafusion_physical_expr::equivalence::join_equivalence_properties;
 use datafusion_physical_expr::intervals::cp_solver::ExprIntervalGraph;
 
+use crate::joins::stream_join_utils::calculate_side_prune_length_helper;
 use ahash::RandomState;
 use futures::Stream;
 use hashbrown::HashSet;
