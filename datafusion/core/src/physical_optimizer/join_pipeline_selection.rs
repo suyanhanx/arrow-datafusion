@@ -6625,8 +6625,10 @@ mod sql_fuzzy_tests {
     }
 
     #[tokio::test]
-    #[ignore]
-    async fn test_unbounded_hash_selection_disjoint_filter() -> Result<()> {
+    #[should_panic(
+    expected = "called `Result::unwrap()` on an `Err` value: Context(\"PipelineChecker\", Plan(\"Cross Join Error: Cross join is not supported for the unbounded inputs.\"))"
+    )]
+    async fn test_unbounded_hash_selection_disjoint_filter() {
         let sql = "SELECT
             n_nationkey
         FROM
@@ -6655,8 +6657,7 @@ mod sql_fuzzy_tests {
             "      CsvExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/core/tests/tpch-csv/nation.csv]]}, projection=[n_nationkey], infinite_source=true, output_ordering=[n_nationkey@0 ASC NULLS LAST], has_header=true",
         ];
 
-        experiment(&expected_plan, sql).await?;
-        Ok(())
+        experiment(&expected_plan, sql).await.unwrap();
     }
 
     #[tokio::test]
